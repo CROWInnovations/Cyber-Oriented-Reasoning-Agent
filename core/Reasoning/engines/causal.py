@@ -87,11 +87,18 @@ DEFAULT_CAUSAL_DAGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+_DEFAULT_DAGS_INITIALIZED: bool = False
+
+
 def ensure_default_dags() -> None:
+    global _DEFAULT_DAGS_INITIALIZED
+    if _DEFAULT_DAGS_INITIALIZED:
+        return
     for name, dag_data in DEFAULT_CAUSAL_DAGS.items():
         existing = load_json_data("causal_dags", name)
         if existing is None or "172.24." in str(existing.get("description", "")):
             save_json_data("causal_dags", name, dag_data)
+    _DEFAULT_DAGS_INITIALIZED = True
 
 
 def _propagate_scm_probabilities(
@@ -133,7 +140,8 @@ def _propagate_scm_probabilities(
 
         if oob_or_bypass_preds:
             # Noisy-OR boost from out-of-band / alternative causal mechanisms
-            noisy_or_fail = 1.0 - (and_factor if standard_preds else (1.0 - base_probs.get(node, 0.5)))
+            base_leak = and_factor if standard_preds else (float(base_probs.get(node, 0.1)) * 0.2)
+            noisy_or_fail = 1.0 - min(1.0, max(0.0, base_leak))
             for p in oob_or_bypass_preds:
                 w = float(G[p][node].get("weight", 0.9))
                 p_val = probs.get(p, 0.0)
@@ -201,7 +209,23 @@ def run_causal_reasoning(
 
     if not nx.is_directed_acyclic_graph(G):
         cycles = list(nx.simple_cycles(G))
-        return {"error": f"Graph contains cycles and is not a valid Causal DAG: {cycles}"}
+        err_msg = f"Graph contains cycles and is not a valid Causal DAG: {cycles}"
+        return {
+            "engine": "causal_reasoning",
+            "dag_name": dag_name,
+            "outcome_node": outcome_node or "unknown",
+            "error": err_msg,
+            "baseline_outcome_prob": 0.0,
+            "intervened_outcome_prob": 0.0,
+            "causal_lift_delta": 0.0,
+            "root_causes": [],
+            "choke_points": [],
+            "confounders": [],
+            "highest_leverage_interventions": [],
+            "node_probabilities": {},
+            "vault_note": "",
+            "markdown_report": f"Causal Engine Error: {err_msg}",
+        }
 
     if save_custom_dag and custom_edges:
         save_json_data(
@@ -242,10 +266,10 @@ def run_causal_reasoning(
         if candidate == outcome_node:
             continue
         p_do_1 = _propagate_scm_probabilities(
-            G, base_probs, interventions={**do_interventions, candidate: 1.0}, observations=observations
+            G, base_probs, interventions={candidate: 1.0}, observations=observations
         )[outcome_node]
         p_do_0 = _propagate_scm_probabilities(
-            G, base_probs, interventions={**do_interventions, candidate: 0.0}, observations=observations
+            G, base_probs, interventions={candidate: 0.0}, observations=observations
         )[outcome_node]
         ace = round(p_do_1 - p_do_0, 4)
         causal_leverage_ranking.append(

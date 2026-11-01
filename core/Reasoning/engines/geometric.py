@@ -13,6 +13,7 @@ Modes:
 """
 import ipaddress
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .vault_bridge import get_hardware_reasoning_limits, save_json_data, save_reasoning_to_vault, slugify
@@ -91,7 +92,8 @@ def _solve_network_geometry(spec: Dict[str, Any]) -> Dict[str, Any]:
                 if n["netobj"].version == ip_Host.version:
                     xor_val = int(ip_Host) ^ int(n["netobj"].network_address)
                     max_bits = 32 if ip_Host.version == 4 else 128
-                    common_bits = max_bits if xor_val == 0 else (max_bits - xor_val.bit_length())
+                    raw_common_bits = max_bits if xor_val == 0 else (max_bits - xor_val.bit_length())
+                    common_bits = min(raw_common_bits, int(n["netobj"].prefixlen))
                     if common_bits >= best_prefix_bits:
                         best_prefix_bits = common_bits
                         closest_subnet = n["cidr"]
@@ -189,6 +191,9 @@ def _try_fast_linear_solve(var_names: List[str], raw_exprs: List[str]) -> Option
         n = len(var_names)
         A = np.zeros((n, n), dtype=np.float64)
         b = np.zeros(n, dtype=np.float64)
+        parsed_pairs: List[Tuple[str, str]] = []
+        zero_env = {v: 0.0 for v in var_names}
+        ones_env = {v: 1.0 for v in var_names}
         for row_idx, expr_str in enumerate(raw_exprs):
             s = expr_str.strip()
             if any(op in s for op in ("<=", ">=", "!=", "<", ">", "**", "^")):
@@ -199,11 +204,11 @@ def _try_fast_linear_solve(var_names: List[str], raw_exprs: List[str]) -> Option
                 lhs_s, rhs_s = s.split("=", 1)
             else:
                 lhs_s, rhs_s = s, "0"
+            parsed_pairs.append((lhs_s, rhs_s))
 
-            def eval_diff(env: Dict[str, float]) -> float:
-                return float(eval(lhs_s, {"__builtins__": {}}, env)) - float(eval(rhs_s, {"__builtins__": {}}, env))
+            def eval_diff(env: Dict[str, float], _l: str = lhs_s, _r: str = rhs_s) -> float:
+                return float(eval(_l, {"__builtins__": {}}, env)) - float(eval(_r, {"__builtins__": {}}, env))
 
-            zero_env = {v: 0.0 for v in var_names}
             f0 = eval_diff(zero_env)
             b[row_idx] = -f0
             for col_idx, vname in enumerate(var_names):
@@ -217,7 +222,17 @@ def _try_fast_linear_solve(var_names: List[str], raw_exprs: List[str]) -> Option
                     return None
                 A[row_idx, col_idx] = df1
 
+            # Reject bilinear cross-terms (e.g. x * y) by verifying additivity at the all-ones point
+            f_ones = eval_diff(ones_env)
+            if abs((f_ones - f0) - float(np.sum(A[row_idx, :]))) > 1e-6:
+                return None
+
         x_sol = np.linalg.solve(A, b)
+        sol_env = {vname: float(val) for vname, val in zip(var_names, x_sol)}
+        for lhs_s, rhs_s in parsed_pairs:
+            diff_val = float(eval(lhs_s, {"__builtins__": {}}, sol_env)) - float(eval(rhs_s, {"__builtins__": {}}, sol_env))
+            if abs(diff_val) > 1e-5:
+                return None
         sol_dict: Dict[str, str] = {}
         for vname, val in zip(var_names, x_sol):
             if abs(val - round(val)) < 1e-7:
@@ -286,20 +301,34 @@ def _solve_symbolic_constraints(spec: Dict[str, Any]) -> Dict[str, Any]:
         else:
             solutions_formatted.append({"solution": str(sol)})
 
+    def _expand_chained_comparisons(expr_str: str) -> List[str]:
+        """Split chained comparisons like `0 < x <= 10` into `['(0) < (x)', '(x) <= (10)']` for Z3."""
+        s = expr_str.strip()
+        if "=" in s and not any(op in s for op in ("==", "<=", ">=", "!=", "<", ">")):
+            lhs, rhs = s.split("=", 1)
+            return [f"({lhs.strip()}) == ({rhs.strip()})"]
+        parts = re.split(r"\s*(<=|>=|!=|==|<|>)\s*", s)
+        if len(parts) >= 5 and len(parts) % 2 == 1:
+            out = []
+            for i in range(0, len(parts) - 2, 2):
+                out.append(f"({parts[i].strip()}) {parts[i + 1]} ({parts[i + 2].strip()})")
+            return out
+        return [s]
+
     # If inequalities are present, Z3 SMT verification is requested, or SymPy returned empty, also solve with Z3
     z3_status = "sat" if solutions_formatted else None
     if inequalities or not solutions_formatted or spec.get("require_z3"):
         try:
             import z3
 
+            hw = get_hardware_reasoning_limits()
+            z3_timeout_ms = int(hw.get("z3_timeout_ms", 2500))
             z3_vars = {name: z3.Real(name) for name in var_names}
             s_z3 = z3.Solver()
+            s_z3.set("timeout", z3_timeout_ms)
             for eq_str in list(raw_exprs) + list(inequalities):
-                clean_eq = eq_str.strip()
-                if "=" in clean_eq and not any(op in clean_eq for op in ("==", "<=", ">=", "!=")):
-                    lhs, rhs = clean_eq.split("=", 1)
-                    clean_eq = f"({lhs}) == ({rhs})"
-                s_z3.add(eval(clean_eq, {"__builtins__": {}}, z3_vars))
+                for sub_eq in _expand_chained_comparisons(eq_str):
+                    s_z3.add(eval(sub_eq, {"__builtins__": {}}, z3_vars))
             chk = s_z3.check()
             z3_status = str(chk)
             if chk == z3.sat:

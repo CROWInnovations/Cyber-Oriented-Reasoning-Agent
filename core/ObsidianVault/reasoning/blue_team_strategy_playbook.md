@@ -78,3 +78,19 @@ Activate `[[reasoning/blue_team_strategy_playbook]]` whenever the query, goal, o
 | **Terminate Malicious Process Tree** | `taskkill /F /T /PID <MALICIOUS_PID>` | `sudo kill -9 <MALICIOUS_PID>` | Stop active C2 beacon or unauthorized child process tree immediately. |
 | **Disable Rogue Service or Scheduled Task** | `sc.exe stop "<SVC>" && sc.exe config "<SVC>" start= disabled` *(or)* `schtasks /Change /TN "<TASK>" /Disable` | `sudo systemctl disable --now <rogue.service> && sudo rm -f /etc/systemd/system/<rogue.service> && sudo systemctl daemon-reload` | Prevent persistence mechanism from respawning after process termination. |
 | **Verify Containment & Clean State** | `netstat -ano \| findstr <PORT_OR_IP>` | `ss -tanp \| grep <PORT_OR_IP>` | Confirm zero remaining active sockets to the threat actor endpoint (`s_goal_verified_complete`). |
+
+---
+
+## 4. Verified Live CVE, Patch Advisory & Defensive Tooling Intelligence (`fetch_webpage`, `web_search` & `curl`)
+> **Master Hub:** [[reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook]] | **HTTP/API Reference:** [[commands/curl_playbook]]
+
+When hardening systems, prioritizing patches, or verifying vendor advisories during Phases 1–5, query these verified primary sources via `fetch_webpage` / `web_search` (easiest) or `curl -sSL ... | jq`:
+
+| Defensive Objective | Easiest CORA Tool (`fetch_webpage` / `web_search`) | Shell CLI Alternative (`curl` / `jq` / `PowerShell`) |
+| :--- | :--- | :--- |
+| **CISA Known Exploited Vulnerabilities (KEV) Catalog** | `fetch_webpage(url="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", query_filter="CVE-YYYY-NNNN")` | `curl -sSL --max-time 15 "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json" \| jq '.vulnerabilities[] \| select(.cveID=="CVE-YYYY-NNNN")'` |
+| **NIST NVD Official CVE & Remediation References** | `fetch_webpage(url="https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN", query_filter="descriptions")` | `curl -sSL --max-time 15 "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN" \| jq '.vulnerabilities[0].cve'` |
+| **FIRST EPSS 30-Day Exploitation Probability** | `fetch_webpage(url="https://api.first.org/data/v1/epss?cve=CVE-YYYY-NNNN")` | `curl -sSL --max-time 15 "https://api.first.org/data/v1/epss?cve=CVE-YYYY-NNNN" \| jq '.data[0]'` |
+| **Vendor PSIRT Advisories (Microsoft, Fortinet, Cisco, Palo Alto, Linux)** | `fetch_webpage(url="https://ubuntu.com/security/cves/CVE-YYYY-NNNN.json")` *(or)* `web_search(query="CVE-YYYY-NNNN", site="msrc.microsoft.com")` | `curl -sSL --max-time 15 "https://access.redhat.com/hydra/rest/securitydata/cve/CVE-YYYY-NNNN.json" \| jq '{name, threat_severity, details}'` |
+| **MITRE ATT&CK Mitigation & Detection Guidance** | `fetch_webpage(url="https://attack.mitre.org/techniques/T1059/", query_filter="Mitigations")` | `curl -sSL --max-time 15 "https://attack.mitre.org/techniques/T1059/" \| grep -i -A 10 "Mitigations"` |
+| **Windows Sysinternals & Sigma Detection Rules** | `fetch_webpage(url="https://learn.microsoft.com/en-us/sysinternals/downloads/autoruns", query_filter="Usage")` | `curl.exe -sSL --max-time 15 "https://live.sysinternals.com/autorunsc64.exe" -o C:\Temp\autorunsc64.exe` |

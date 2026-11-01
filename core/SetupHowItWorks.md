@@ -1,6 +1,6 @@
-# C.O.R.A. Setup & Operations Reference (`core/SetupHowItWorks.md`) — `v5.14.11` (Linux & Windows)
+# C.O.R.A. Setup & Operations Reference (`core/SetupHowItWorks.md`) — `v5.20.18` (Linux & Windows)
 
-**Version:** `5.14.11` (tracked in [`Log/cora_version.json`](./Log/cora_version.json))  
+**Version:** `5.20.18` (tracked in [`Log/cora_version.json`](./Log/cora_version.json))  
 **Developed by:** https://CROWinnovations.com  
 
 > **OPEN-SOURCE NOTICE, ATTRIBUTION & LIMITATION OF LIABILITY:**  
@@ -8,11 +8,11 @@
 
 ![C.O.R.A. Real CROW Logo & Login Banner (Explained/assets/CROW_Logo-NoWords_Transparent_Glow-NoBackground.png)](Explained/assets/cora_splash_and_versioning_guide.svg)
 
-### How C.O.R.A.'s 3-Section Semantic Version (`5.14.11`) Works
-Displayed directly above `Author: https://CROWinnovations.com` on the CLI startup splash screen as `Version: 5.14.11` and persisted in [`Log/cora_version.json`](./Log/cora_version.json):
+### How C.O.R.A.'s 3-Section Semantic Version (`5.20.18`) Works
+Displayed directly above `Author: https://CROWinnovations.com` on the CLI startup splash screen as `Version: 5.20.18` and persisted in [`Log/cora_version.json`](./Log/cora_version.json):
 - **1st Decimal (`5` — Major CLI Overhauls):** Increments on major CLI or architectural overhauls (such as the `v5` C.O.R.A. splash screen, root `run_cora_NIX.sh` / `run_cora_WIN.ps1` and `setup_cora_NIX.sh` / `setup_cora_WIN.ps1` launchers, clean `CORA/` root layout, 4-Mode Session Personality & Logic Enforcement (`Default`, `Analyst`, `Berserker`, `Ninja`), mandatory `/Projects` selection/rename/create menu, `-c` session continuation, Red/White/Blue `-netiso` isolation, quoted goals `"..."` + `-<param>:<value>` syntax, and legal disclaimer).
-- **2nd Decimal (`14` — Reasoning & Logic Engine Updates):** Automatically increments via SHA-256 file-tree fingerprinting whenever any of the reasoning or logic engines in `core/Reasoning/engines/*.py` are updated or modified.
-- **3rd Decimal (`11` — Documentation, Tools & System Retraining):** Automatically increments whenever documentation (`*.md`), CLI/management tools (`agent-cli.py`, `run_cora_NIX.sh`, `run_cora_WIN.ps1`, `report_generator.py`, `train_llm.py`), or system retraining (`/train` / `./run_cora_NIX.sh -train` / `.\run_cora_WIN.ps1 -train`) are updated.
+- **2nd Decimal (`20` — Reasoning & Logic Engine Updates):** Automatically increments via SHA-256 file-tree fingerprinting whenever any of the reasoning or logic engines in `core/Reasoning/engines/*.py` are updated or modified.
+- **3rd Decimal (`18` — Documentation, Tools & System Retraining):** Automatically increments whenever documentation (`*.md`), CLI/management tools (`agent-cli.py`, `run_cora_NIX.sh`, `run_cora_WIN.ps1`, `report_generator.py`, `train_llm.py`), or system retraining (`/train` / `./run_cora_NIX.sh -train` / `.\run_cora_WIN.ps1 -train`) are updated.
 
 A complete architectural and operational guide describing how **C.O.R.A. (`Cyber Oriented Reasoning Agent`) + Root Launchers (`run_cora_NIX.sh` / `run_cora_WIN.ps1`) + Two-Tier Memory & Project Workspace Isolation (`core/ObsidianVault/` + `Projects/<name>/`) + 15-Engine 5-Layer Lexical Priority CPU Neuro-Symbolic, Somatic, Optimal-Stopping Forecasting, Continual, Meta-Learning, Dual-Mode Pessimistic $Q_{\text{LCB}}$ Trajectory RL & Prototype-Anchored Spectral PCA/K-Means++ Reasoning Suite + Multi-Modal/OCR Training Pipeline (`Training/`)** is installed, configured, tuned, and operated across both **Linux (`./setup_cora_NIX.sh` / `./run_cora_NIX.sh`)** and **Windows (`.\setup_cora_WIN.ps1` / `.\run_cora_WIN.ps1`)** workstations, portable laptops, and GPU servers.
 

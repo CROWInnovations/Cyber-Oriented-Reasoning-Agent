@@ -180,7 +180,7 @@ def audit_layer_a_runtime(api_base: str = "http://127.0.0.1:8080") -> Dict[str, 
         with urllib.request.urlopen("http://127.0.0.1:1337/api/bootstrap", timeout=2.0) as w_resp:
             w_data = json.loads(w_resp.read().decode("utf-8", errors="replace"))
             webui_online = True
-            w_llm_ok = bool(w_data.get("models", {}).get("llama_server", {}).get("online") or w_data.get("models", {}).get("ollama", {}).get("online"))
+            w_llm_ok = bool(w_data.get("models", {}).get("llama_server", {}).get("online"))
             w_proj = w_data.get("settings", {}).get("active_project") or w_data.get("active_project")
             print(
                 ok_tag(

@@ -41,18 +41,42 @@ _PARAM_IPV4_RE = re.compile(
     r"\b(?!127\.0\.0\.1\b|0\.0\.0\.0\b|255\.255\.255\.\d+\b)"
     r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b"
 )
+_PARAM_ROUTE_VIA_RE = re.compile(
+    r"\b((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}/\d{1,2})"
+    r"(\s+via\s+)"
+    r"((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})\b",
+    re.I,
+)
+_PARAM_WIN_ROUTE_RE = re.compile(
+    r"(\broute\s+(?:-p\s+)?(?:add|change)\s+)"
+    r"((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?:/\d{1,2})?)"
+    r"(\s+(?:mask\s+\S+\s+)?)"
+    r"((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})\b",
+    re.I,
+)
 
 
 def parameterize_tactical_template(text: str) -> str:
     """
-    Replace concrete target IPv4 addresses (`-> <TARGET_IP>`) and local user/project directory paths
+    Replace concrete target IPv4 addresses (`-> <TARGET_IP>`), route subnets/gateways
+    (`<cidr> via <gw_ip> -> <REMOTE_SUBNET> via <GATEWAY_IP>`), and local user/project directory paths
     (`-> $PROJECT_DIR`) so online tactical stores (`somatic_markers.json`, `rl_policy_table.json`,
     `learned_cbr_cases.json`, `cbr_library.json`) learn reusable tactical patterns without storing
     dirty local IPs, usernames, or paths.
     """
     if not text:
         return ""
-    s = _PARAM_IPV4_RE.sub("<TARGET_IP>", str(text))
+    s = str(text)
+    s = _PARAM_ROUTE_VIA_RE.sub(r"<REMOTE_SUBNET>\2<GATEWAY_IP>", s)
+    s = _PARAM_WIN_ROUTE_RE.sub(r"\1<REMOTE_SUBNET>\3<GATEWAY_IP>", s)
+    s = re.sub(
+        r"(\bvia\s+)(?!127\.0\.0\.1\b|0\.0\.0\.0\b)"
+        r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b",
+        r"\1<GATEWAY_IP>",
+        s,
+        flags=re.I,
+    )
+    s = _PARAM_IPV4_RE.sub("<TARGET_IP>", s)
     s = re.sub(r"(?:~|/home/[^/\s'\"]+|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s'\"]+)[\\/]+Projects[\\/]+CORA[\\/]+Projects[\\/]+[^\\/\s'\"]+", "$PROJECT_DIR", s)
     s = re.sub(r"(?:~|/home/[^/\s'\"]+|[A-Za-z]:[\\/]+[^\s'\"]+)[\\/]+Projects[\\/]+[^\\/\s'\"]+", "$PROJECT_DIR", s)
     s = re.sub(r"/home/[^/\s'\"]+", "~", s)
@@ -381,6 +405,8 @@ def get_hardware_reasoning_limits(force_recompute: bool = False) -> Dict[str, An
                 and "rl_train_episodes" in cached
                 and "kmeans_n_init" in cached
                 and "z3_timeout_ms" in cached
+                and "max_full_gpu_model_size_mib" in cached
+                and "reasoning_gpu_vram_mb" in cached
             ):
                 if "tier" not in cached and "hardware_tier" in cached:
                     cached["tier"] = cached["hardware_tier"]
@@ -491,9 +517,9 @@ def get_hardware_reasoning_limits(force_recompute: bool = False) -> Dict[str, An
         kmeans_max_iter = 200
         pca_buffer_size = 1000
         shadow_max_files = 100
-        raw_preserve_chars = 2500
-        max_tool_chars = 3500
-        max_history_chars = 24000
+        raw_preserve_chars = 5000
+        max_tool_chars = 7000
+        max_history_chars = 48000
     elif total_ram_mib >= 12000 and cpu_threads >= 8:
         tier = "HIGH_PERFORMANCE"
         vsa_dim = 1024
@@ -618,7 +644,8 @@ def get_hardware_reasoning_limits(force_recompute: bool = False) -> Dict[str, An
 
     rec_llm_threads = max(2, min(cpu_physical_cores - 2 if cpu_physical_cores >= 6 else max(1, cpu_physical_cores - 1), 12))
     rec_llm_threads_batch = max(rec_llm_threads, min(cpu_physical_cores, 16))
-    max_safe_model_mib = int(max(6000, (total_ram_mib * 0.65) + (detected_gpu_vram_mib * 0.85)))
+    max_safe_model_mib = int(max(4096, (total_ram_mib * 0.50) + (detected_gpu_vram_mib * 0.80)))
+    max_full_gpu_model_mib = int(max(0, detected_gpu_vram_mib - 1400))
 
     _cached_max_files = shadow_max_files
     profile = {
@@ -639,6 +666,7 @@ def get_hardware_reasoning_limits(force_recompute: bool = False) -> Dict[str, An
         "recommended_llm_poll": 0,
         "recommended_kv_cache_type": rec_kv_type,
         "max_safe_model_size_mib": max_safe_model_mib,
+        "max_full_gpu_model_size_mib": max_full_gpu_model_mib,
         # Engine 1: Associative Graph & PageRank
         "pagerank_max_iter": pagerank_max_iter,
         "spreading_activation_hops": spreading_hops,
@@ -710,7 +738,8 @@ def get_hardware_reasoning_limits(force_recompute: bool = False) -> Dict[str, An
         "raw_preserve_threshold_chars": raw_preserve_chars,
         "max_tool_output_chars": max_tool_chars,
         "max_history_chars": max_history_chars,
-        "gpu_vram_mb": 0,
+        "gpu_vram_mb": int(detected_gpu_vram_mib),
+        "reasoning_gpu_vram_mb": 0,
     }
     try:
         _atomic_write_text(prof_path, json.dumps(profile, indent=2) + "\n")
@@ -837,7 +866,9 @@ def _rotate_reasoning_vault_notes(max_hot_notes: int = 60) -> int:
             (
                 f
                 for f in reasoning_dir.glob("*.md")
-                if not f.name.startswith(".") and f.stem not in protected_stems
+                if not f.name.startswith(".")
+                and f.stem not in protected_stems
+                and not f.stem.endswith("_strategy_playbook")
             ),
             key=lambda p: p.stat().st_mtime,
         )
@@ -880,12 +911,16 @@ def save_reasoning_to_vault(
         "spectral_pca_kmeans_manifold",
         "meta_learning_audit",
     }
-    is_long_term = persist_long_term or (slug in canonical_long_term_stems)
+    is_long_term = persist_long_term or (slug in canonical_long_term_stems) or slug.endswith("_strategy_playbook")
     if is_long_term:
         summary = parameterize_tactical_template(summary)
+        summary = re.sub(r"(\bip\s+route\s+(?:add|replace|change)\s+)<TARGET_IP>/\d{1,2}", r"\1<REMOTE_SUBNET>", summary, flags=re.I)
         summary = re.sub(r"<TARGET_IP>/\d{1,2}", "<LOCAL_SUBNET>", summary)
+        summary = re.sub(r"\bNIC:[A-Za-z0-9_.\-]+", "NIC:<PRIMARY_NIC>", summary)
         markdown_body = parameterize_tactical_template(markdown_body)
+        markdown_body = re.sub(r"(\bip\s+route\s+(?:add|replace|change)\s+)<TARGET_IP>/\d{1,2}", r"\1<REMOTE_SUBNET>", markdown_body, flags=re.I)
         markdown_body = re.sub(r"<TARGET_IP>/\d{1,2}", "<LOCAL_SUBNET>", markdown_body)
+        markdown_body = re.sub(r"\bNIC:[A-Za-z0-9_.\-]+", "NIC:<PRIMARY_NIC>", markdown_body)
 
     all_tags = ["reasoning", engine_type.lower()] + (tags or [])
     clean_tags = []
@@ -1253,7 +1288,7 @@ def resolve_problem_targets(
     host_ctx = detect_host_network_context()
     os_family = host_ctx["os_family"]
     prob_low = (problem_text or "").lower()
-    if any(
+    explicit_windows_shell = any(
         w in prob_low
         for w in (
             "powershell",
@@ -1263,14 +1298,20 @@ def resolve_problem_targets(
             "netsh",
             "cmd.exe",
             "c:\\",
-            "active directory",
-            "impacket",
             "wmic",
             "tasklist",
             "reg query",
+        )
+    )
+    windows_remote_or_shell = explicit_windows_shell or any(
+        w in prob_low
+        for w in (
+            "active directory",
+            "impacket",
             "winrm",
         )
-    ):
+    )
+    if explicit_windows_shell or (os_family == "windows" and windows_remote_or_shell):
         target_os = "windows"
     elif any(
         w in prob_low
@@ -1475,11 +1516,18 @@ def resolve_problem_targets(
     local_subnet_str = eff_local_subnets[0] if eff_local_subnets else "<LOCAL_SUBNET>"
     serial_match = re.search(r"(/dev/tty(?:USB|ACM|S)\d+|\bCOM\d+\b)", problem_text or "", re.I)
     serial_port = serial_match.group(1) if serial_match else host_ctx["primary_serial"]
-    explicit_serial_intent = bool(
+    has_serial_keywords = bool(
         serial_match
         or re.search(
-            r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|out-of-band|baud|console)\b|exit 7|connection refused",
+            r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|out-of-band|baud|console)\b",
             prob_low,
+        )
+    )
+    explicit_serial_intent = bool(
+        has_serial_keywords
+        or (
+            bool(host_ctx["serial_ports"])
+            and bool(re.search(r"exit 7|connection refused", prob_low))
         )
     )
     non_serial_domain_intent = bool(

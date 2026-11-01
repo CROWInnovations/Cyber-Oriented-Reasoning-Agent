@@ -5,12 +5,12 @@
 
   # C.O.R.A. — Cyber Oriented Reasoning Agent
 
-  **Version:** `5.15.12` ([`core/Log/cora_version.json`](./core/Log/cora_version.json)) &nbsp;|&nbsp; **Developed by:** [CROWinnovations.com](https://CROWinnovations.com) &nbsp;|&nbsp; **License:** [GNU GPL v3.0 (`core/LICENSE`)](./core/LICENSE)
+  **Version:** `5.20.18` ([`core/Log/cora_version.json`](./core/Log/cora_version.json)) &nbsp;|&nbsp; **Developed by:** [CROWinnovations.com](https://CROWinnovations.com) &nbsp;|&nbsp; **License:** [GNU GPL v3.0 (`core/LICENSE`)](./core/LICENSE)
 </div>
 
 ![C.O.R.A. Splash & Architecture Banner](core/Explained/assets/cora_splash_and_versioning_guide.svg)
 
-**C.O.R.A. (`Cyber Oriented Reasoning Agent`)** is a local, hardware-tuned AI and neuro-symbolic reasoning workstation built for Red, Blue, and Hunt Teams. It pairs local uncensored GGUF LLMs (`Qwen3.8-27B` default, `Qwen3.5-9B` fast, and `Qwen3.8-27B Turbo MTP`) via `llama-server` (CUDA/CPU) or `Ollama` with a **Custom Svelte + TypeScript + Tailwind CSS + FastAPI WebUI Dashboard** ([`core/webui/`](./core/webui)), a **15-Engine CPU Neuro-Symbolic Reasoning Suite** (`0 MB GPU VRAM`, `~9.1 ms` pipeline), **Two-Tier Memory Isolation** ([`core/ObsidianVault/`](./core/ObsidianVault) + per-project [`Projects/`](./Projects)), **Red/White/Blue Network Isolation**, and a **4-Mode Session Personality & Logic Enforcer** (`Default`, `Analyst`, `Berserker`, `Ninja`).
+**C.O.R.A. (`Cyber Oriented Reasoning Agent`)** is a local, hardware-tuned AI and neuro-symbolic reasoning workstation built for Red, Blue, and Hunt Teams. It pairs local uncensored GGUF LLMs (`Qwen3.8-27B` default, `Qwen3.5-9B` fast, and `Qwen3.8-27B Turbo MTP`) via `llama-server` (CUDA/CPU) with a **Custom Svelte + TypeScript + Tailwind CSS + FastAPI WebUI Dashboard** ([`core/webui/`](./core/webui)), a **15-Engine CPU Neuro-Symbolic Reasoning Suite** (`0 MB GPU VRAM`, `~9.1 ms` pipeline), **Two-Tier Memory Isolation** ([`core/ObsidianVault/`](./core/ObsidianVault) + per-project [`Projects/`](./Projects)), **Red/White/Blue Network Isolation**, and a **4-Mode Session Personality & Logic Enforcer** (`Default`, `Analyst`, `Berserker`, `Ninja`).
 
 ---
 
@@ -20,7 +20,7 @@ Clone the repository and run the automated 7-phase installer for your operating 
 
 ### Linux (`setup_cora_NIX.sh`)
 ```bash
-git clone https://github.com/B0b-Skull/Cyber-Oriented-Reasoning-Agent.git CORA
+git clone https://github.com/CROWInnovations/Cyber-Oriented-Reasoning-Agent.git CORA
 cd CORA
 
 # Full automatic setup (detects GPU/RAM and downloads matching models + 15-Engine suite):
@@ -36,7 +36,7 @@ bash setup_cora_NIX.sh --skip-models      # Install binaries, Python deps & 15-E
 
 ### Windows PowerShell (`setup_cora_WIN.ps1`)
 ```powershell
-git clone https://github.com/B0b-Skull/Cyber-Oriented-Reasoning-Agent.git CORA
+git clone https://github.com/CROWInnovations/Cyber-Oriented-Reasoning-Agent.git CORA
 cd CORA
 
 # Full automatic setup (detects GPU/RAM and downloads Windows CUDA/CPU binaries + models):

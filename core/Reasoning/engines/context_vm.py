@@ -43,6 +43,7 @@ RAW_PRESERVE_THRESHOLD_CHARS = 2500
 
 _SPECULATIVE_BRANCH_CACHE: Dict[str, Any] = {}
 _PENDING_CBR_MATCH_CACHE: Dict[str, Any] = {}
+_SEEN_SYGUS_FACTS_SET: set[str] = set()
 
 
 def update_speculative_branch_cache(branch_forecast: Dict[str, Any]) -> None:
@@ -193,13 +194,15 @@ def process_tool_output_zero_loss(
             if exp_res.get("mdp_updated") is not None:
                 mdp_u = exp_res["mdp_updated"]
                 mdp_prob = float(mdp_u.get("transition_prob_success", 0.80))
-                record_engine_forecast_outcome("mdp_tactical", eff_ok, predicted_prob=mdp_prob)
                 if str(mdp_u.get("tool", "")).lower() in (
                     "ip", "ping", "arping", "nmap", "curl", "ss", "netstat", "tio", "traceroute", "tcpdump",
                 ):
-                    record_engine_forecast_outcome("bayesian_eig", eff_ok, predicted_prob=0.78)
+                    record_engine_forecast_outcome("bayesian_eig", eff_ok, predicted_prob=max(0.55, min(0.95, mdp_prob)))
             if exp_res.get("somatic_updated"):
-                record_engine_forecast_outcome("vsa_somatic", eff_ok, predicted_prob=0.78)
+                som_u = exp_res["somatic_updated"] if isinstance(exp_res.get("somatic_updated"), dict) else {}
+                som_val = float(som_u.get("new_valence", som_u.get("valence", 0.0)))
+                som_prob = max(0.50, min(0.95, 0.75 + 0.20 * som_val))
+                record_engine_forecast_outcome("vsa_somatic", eff_ok, predicted_prob=som_prob)
             if _PENDING_CBR_MATCH_CACHE and exp_res.get("mdp_updated") is not None:
                 cbr_conf = float(_PENDING_CBR_MATCH_CACHE.get("match_confidence", 0.80))
                 record_engine_forecast_outcome("cbr_fingerprints", eff_ok, predicted_prob=cbr_conf)
@@ -241,23 +244,38 @@ def process_tool_output_zero_loss(
             from .rl_network_policy import record_rl_step_transition
 
             if str(get_continual_learning_state().get("mode", "AUTO")).upper() != "STOP":
-                facts_cnt = (
-                    len(sygus.get("arp_neighbors", []))
-                    + len(sygus.get("open_ports", []))
-                    + len(sygus.get("routes", []))
-                    + (1 if sygus.get("summary_header") else 0)
-                )
+                current_fact_sigs: List[str] = []
+                for nb in sygus.get("arp_neighbors", []):
+                    current_fact_sigs.append(f"arp:{nb.get('ip')}:{nb.get('mac')}:{nb.get('state')}")
+                for op in sygus.get("open_ports", []):
+                    if op.get("state", "open") == "open":
+                        current_fact_sigs.append(f"port:{op.get('port')}:{op.get('proto', 'tcp')}:{op.get('service', '')}")
+                for rt in sygus.get("routes", []):
+                    current_fact_sigs.append(f"route:{rt if isinstance(rt, str) else json.dumps(rt, sort_keys=True)}")
+                for hr in sygus.get("http_responses", []):
+                    current_fact_sigs.append(f"http:{hr if isinstance(hr, str) else json.dumps(hr, sort_keys=True)}")
+                if sygus.get("summary_header") and not current_fact_sigs:
+                    current_fact_sigs.append(f"hdr:{sygus['summary_header']}")
+                novel_facts = [fs for fs in current_fact_sigs if fs not in _SEEN_SYGUS_FACTS_SET]
+                for fs in novel_facts:
+                    _SEEN_SYGUS_FACTS_SET.add(fs)
+                if len(_SEEN_SYGUS_FACTS_SET) > 2000:
+                    _SEEN_SYGUS_FACTS_SET.clear()
+                facts_cnt = len(novel_facts)
+                eff_exit_code = 0 if eff_ok else (exit_code if exit_code != 0 else 1)
                 rl_upd = record_rl_step_transition(
                     command=command_or_key,
-                    exit_code=exit_code,
+                    exit_code=eff_exit_code,
                     new_facts_count=facts_cnt,
+                    problem_context=text[:300],
                 )
                 if not rl_upd.get("skipped"):
                     from .meta_learner import record_engine_forecast_outcome
 
-                    rl_ok = bool(exit_code == 0 and rl_upd.get("reward", 0.0) >= 0.0)
-                    record_engine_forecast_outcome("rl_network_policy", rl_ok, predicted_prob=0.78)
-                    record_engine_forecast_outcome("spectral_manifold_pca", exit_code == 0, predicted_prob=0.78)
+                    rl_ok = bool(eff_ok and rl_upd.get("reward", 0.0) >= 0.0)
+                    rl_prob = max(0.50, min(0.96, 0.55 + (float(rl_upd.get("updated_q", 15.0)) / 45.0) * 0.40))
+                    record_engine_forecast_outcome("rl_network_policy", rl_ok, predicted_prob=rl_prob)
+                    record_engine_forecast_outcome("spectral_manifold_pca", eff_ok, predicted_prob=max(0.55, min(0.95, rl_prob)))
                 if rl_upd.get("reward", 0.0) <= -3.0:
                     header_blocks.append(
                         f"[Engine 19 RL Policy Warning]: Redundant/no-progress action `{rl_upd['action_id']}` "
@@ -405,9 +423,13 @@ class SpeculativeLookaheadCache:
                 if not self._active_event.is_set():
                     return
                 l1_block = build_dynamic_l1_state_block(context_hint)
+                if not self._active_event.is_set():
+                    return
                 with self._lock:
-                    self._cache["last_l1_block"] = l1_block
-                    self._cache["timestamp"] = time.time()
+                    if self._active_event.is_set():
+                        self._cache["last_l1_block"] = l1_block
+                        self._cache["context_hint"] = context_hint
+                        self._cache["timestamp"] = time.time()
             except Exception:
                 pass
             finally:
@@ -422,11 +444,20 @@ class SpeculativeLookaheadCache:
         self._active_event.clear()
         with self._lock:
             cached = self._cache.get("last_l1_block")
+            cached_hint = str(self._cache.get("context_hint", ""))
             ts = float(self._cache.get("timestamp", 0.0))
-        if cached and (time.time() - ts) < 30.0 and not user_query:
-            return str(cached)
+        if cached and (time.time() - ts) < 30.0:
+            if not user_query or user_query.strip() == cached_hint.strip():
+                return str(cached)
+            import re as _re
+
+            q_ips = set(_re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", user_query))
+            h_ips = set(_re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cached_hint))
+            if not (q_ips - h_ips) and len(user_query) < 24:
+                return str(cached)
         fresh = build_dynamic_l1_state_block(user_query)
         with self._lock:
             self._cache["last_l1_block"] = fresh
+            self._cache["context_hint"] = user_query
             self._cache["timestamp"] = time.time()
         return fresh

@@ -122,6 +122,26 @@ def _auto_infer_observed_evidence(
     if any(k in p_low for k in ("privesc", "privilege escalation", "suid", "sudoers", "capabilities", "www-data", "active directory", "ldap", "smb")):
         ev.setdefault("post_exploitation_shell_active", True)
 
+    # Evidence keys for l2_l3_routing_blackhole profile
+    if "default via" in p_low or "uses default" in p_low or (not primary_in_local and "no route" in p_low):
+        ev.setdefault("ip_route_get_uses_default_wan", True)
+    if "ip_forward = 0" in p_low or "ip_forward=0" in p_low or "forwarding disabled" in p_low:
+        ev.setdefault("sysctl_ip_forward_is_zero", True)
+    if "syn" in p_low and any(k in p_low for k in ("no syn", "no return", "asymmetric", "syn_sent")):
+        ev.setdefault("tcpdump_sees_syn_out_no_synack_back", True)
+    if any(k in p_low for k in ("prohibited", "packet filtered", "admin prohibited")):
+        ev.setdefault("icmp_host_prohibited_or_filtered", True)
+
+    # Evidence keys for api_auth_rejection profile
+    if "www-authenticate" in p_low or "bearer" in p_low:
+        ev.setdefault("www_authenticate_header_present", True)
+    if any(k in p_low for k in ("405", "415", "method not allowed", "unsupported media")):
+        ev.setdefault("http_405_or_415_status", True)
+    if "x-forwarded-for" in p_low or "x-real-ip" in p_low:
+        ev.setdefault("xff_127_0_0_1_changes_status", True)
+    if "set-cookie" in p_low or "csrf" in p_low:
+        ev.setdefault("set_cookie_csrf_on_root", True)
+
     for p_stat in sygus_extracted.get("ping_stats") or []:
         loss_val = float(p_stat.get("loss_pct", 100.0))
         if loss_val < 100.0:
@@ -137,7 +157,8 @@ def _auto_infer_observed_evidence(
             ev.setdefault("arp_resolved_mac_present", True)
         elif st in ("INCOMPLETE", "FAILED"):
             ev.setdefault("arp_incomplete_or_missing", True)
-    if sygus_extracted.get("open_ports"):
+    truly_open_ports = [p for p in (sygus_extracted.get("open_ports") or []) if p.get("state") == "open"]
+    if truly_open_ports:
         ev.setdefault("alt_port_open_in_scan", True)
         ev.setdefault("icmp_ping_responds", True)
         ev.setdefault("arp_resolved_mac_present", True)
@@ -290,8 +311,15 @@ def run_neuro_symbolic_pipeline(
 
     auto_interventions = dict(do_interventions or {})
     if not auto_interventions:
-        if causal_dag == "network_api_reachability" and has_serial_oob:
-            auto_interventions = {"Serial_Console_OOB": 1.0, "Local_Subnet_IP_Route": 1.0}
+        if causal_dag == "network_api_reachability":
+            if has_serial_oob:
+                auto_interventions = {"Serial_Console_OOB": 1.0, "Local_Subnet_IP_Route": 1.0}
+            else:
+                auto_interventions = {
+                    "Local_Subnet_IP_Route": 1.0,
+                    "Target_Firewall_Allows_Port": 1.0,
+                    "Target_Firewall_Allow": 1.0,
+                }
         elif causal_dag == "l2_l3_cross_subnet_routing":
             auto_interventions = {
                 "Local_Static_Route": 1.0,
@@ -301,16 +329,41 @@ def run_neuro_symbolic_pipeline(
         else:
             auto_interventions = {"Valid_Auth_Context": 1.0}
 
+    def _invoke_bayesian() -> Dict[str, Any]:
+        try:
+            return run_bayesian_abduction(
+                problem=problem,
+                profile=bayesian_profile,
+                observed_evidence=observed_evidence,
+                target=resolved_target,
+                target_ip=resolved_target,
+                secondary_target_ip=resolved_secondary,
+                save_to_vault=False,
+            )
+        except TypeError:
+            return run_bayesian_abduction(
+                problem=problem,
+                profile=bayesian_profile,
+                observed_evidence=observed_evidence,
+                target=resolved_target,
+                save_to_vault=False,
+            )
+
+    def _invoke_cbr() -> Dict[str, Any]:
+        try:
+            return run_cbr_reasoning(
+                problem=problem,
+                target_ip=resolved_target,
+                secondary_target_ip=resolved_secondary,
+                export_to_vault=False,
+            )
+        except TypeError:
+            return run_cbr_reasoning(problem=problem, export_to_vault=False)
+
     # LAYER 2 EPISTEMIC & DIAGNOSTIC ENGINES (executed deterministically without thread-lock contention on _VAULT_IO_LOCK):
     bayes_res = _safe_stage(
         "bayesian",
-        lambda: run_bayesian_abduction(
-            problem=problem,
-            profile=bayesian_profile,
-            observed_evidence=observed_evidence,
-            target=resolved_target,
-            save_to_vault=False,
-        ),
+        _invoke_bayesian,
         {
             "top_hypothesis": "Unknown",
             "top_probability": 0.5,
@@ -352,7 +405,7 @@ def run_neuro_symbolic_pipeline(
     )
     cbr_res = _safe_stage(
         "cbr_fingerprints",
-        lambda: run_cbr_reasoning(problem=problem, export_to_vault=False),
+        _invoke_cbr,
         {"library_size": 0, "matched_cases": [], "markdown": ""},
     )
     vsa_res = _safe_stage(
@@ -535,26 +588,30 @@ def run_neuro_symbolic_pipeline(
             for v in cegar_res.get("verifications", [])
             if not v.get("blocked") and v.get("command")
         }
-        mdp_q = float(mdp_res.get("optimal_q_star", 0.0)) * float(meta_weights.get("mdp_tactical", 1.0))
-        rl_q_lcb = float(rl_imm_dict.get("q_lcb", rl_imm_dict.get("q_star", 15.0))) * 6.5 * float(meta_weights.get("rl_network_policy", 1.0))
-        eig_score = float(top_probe.get("eig_bits", 0.0)) * 180.0 * float(meta_weights.get("bayesian_eig", 1.0))
+        # Normalize mdp_q, rl_q_lcb, and eig_score onto a common [0, 100] scale before applying Hedge weights
+        raw_mdp_q = float(mdp_res.get("optimal_q_star", 0.0))
+        raw_rl_q_lcb = float(rl_imm_dict.get("q_lcb", rl_imm_dict.get("q_star", 15.0)))
+        raw_eig_bits = float(top_probe.get("eig_bits", 0.0))
+        mdp_q = min(100.0, max(0.0, (raw_mdp_q / 150.0) * 100.0)) * float(meta_weights.get("mdp_tactical", 1.0))
+        rl_q_lcb = min(100.0, max(0.0, (raw_rl_q_lcb / 25.0) * 100.0)) * float(meta_weights.get("rl_network_policy", 1.0))
+        eig_score = min(100.0, max(0.0, (raw_eig_bits / 1.0) * 100.0)) * float(meta_weights.get("bayesian_eig", 1.0))
         cbr_hint_suffix = (
             f" | [CBR Hint {cbr_matches[0]['case_id']}: `{cbr_top_cmd}`]"
             if (cbr_matches and cbr_top_cmd)
             else ""
         )
-        if mdp_cmd and mdp_cmd in verified_set and mdp_q >= max(95.0, eig_score):
+        if mdp_cmd and mdp_cmd in verified_set and mdp_q >= max(55.0, rl_q_lcb, eig_score):
             verified_cmd = mdp_cmd
             consensus_rationale = (
                 f"Preconditions satisfied & CEGAR-verified; Hedge-weighted H-MDP Bellman policy `{mdp_res.get('optimal_tactic')}` "
-                f"($Q^*(s,a)={mdp_res.get('optimal_q_star', 0.0):.1f}$, $w={meta_weights.get('mdp_tactical', 1.0):.2f}$) & RL $Q_{{\\text{{LCB}}}}={rl_imm_dict.get('q_lcb', rl_imm_dict.get('q_star', 15.0)):+.1f}$ align with top cause "
+                f"($Q^*(s,a)={mdp_res.get('optimal_q_star', 0.0):.1f}$, norm={mdp_q:.1f}, $w={meta_weights.get('mdp_tactical', 1.0):.2f}$) & RL $Q_{{\\text{{LCB}}}}={rl_imm_dict.get('q_lcb', rl_imm_dict.get('q_star', 15.0)):+.1f}$ align with top cause "
                 f"`{bayes_res.get('top_hypothesis')}` ({bayes_res.get('top_probability', 0.0):.0%}){cbr_hint_suffix}."
             )
-        elif rl_cmd_cand and rl_cmd_cand in verified_set and rl_q_lcb >= max(95.0, eig_score):
+        elif rl_cmd_cand and rl_cmd_cand in verified_set and rl_q_lcb >= max(55.0, mdp_q, eig_score):
             verified_cmd = rl_cmd_cand
             consensus_rationale = (
                 f"Preconditions satisfied & CEGAR-verified; Pessimistic $Q_{{\\text{{LCB}}}}$ RL policy `{rl_imm_dict.get('action_id', 'A0')}` "
-                f"($Q_{{\\text{{LCB}}}}={rl_imm_dict.get('q_lcb', 15.0):+.2f}$, exploration=0.0) aligns with top cause "
+                f"($Q_{{\\text{{LCB}}}}={rl_imm_dict.get('q_lcb', 15.0):+.2f}$, norm={rl_q_lcb:.1f}, exploration=0.0) aligns with top cause "
                 f"`{bayes_res.get('top_hypothesis')}` ({bayes_res.get('top_probability', 0.0):.0%}){cbr_hint_suffix}."
             )
         else:
@@ -577,6 +634,7 @@ def run_neuro_symbolic_pipeline(
             "somatic_gut_valence": somatic_valence,
             "optimal_stopping": mdp_res.get("optimal_stopping", {}),
             "speculative_branch_forecast": mdp_res.get("speculative_branch_forecast", {}),
+            "highest_eig_next_probe": top_probe,
         },
         problem=problem,
         target_ip=resolved_target,
@@ -584,6 +642,9 @@ def run_neuro_symbolic_pipeline(
     if refinement_state.get("refinement_applied"):
         consensus_action = str(refinement_state.get("consensus_immediate_action", consensus_action))
         consensus_rationale = f"{consensus_rationale} | {refinement_state.get('refinement_rationale')}"
+
+    # META-MIND Hardware UART Pacing Transform: apply BEFORE Layer 1 Post-Arbiter CEGAR verification
+    consensus_action, pacing_note = apply_serial_pacing_transform(consensus_action)
 
     # Layer 1 Post-Arbiter Hard CEGAR Safety Gate: ensure final consensus command cannot bypass CEGAR
     active_p_mode = os.environ.get("CORA_PERSONALITY_MODE", "DEFAULT").strip().upper() or "DEFAULT"
@@ -595,10 +656,9 @@ def run_neuro_symbolic_pipeline(
         fallback_safe = ("dir /b %PROJECT_DIR%" if is_windows else "ls -la $PROJECT_DIR") if active_p_mode == "ANALYST" else default_probe_cmd
         repaired_c = post_cegar.get("repaired_command") or fallback_safe
         consensus_action = render_command_template(repaired_c, ctx)
+        consensus_action, _ = apply_serial_pacing_transform(consensus_action)
         consensus_rationale = f"[Layer 1 CEGAR & {active_p_mode} Mode Safety Repair Applied] {consensus_rationale}"
 
-    # META-MIND Hardware UART Pacing Transform: ensure any `tio` consensus command includes `-o 15 -O 120` pacing
-    consensus_action, pacing_note = apply_serial_pacing_transform(consensus_action)
     if has_serial_oob and meta_res.get("meta_pacing_directive"):
         consensus_rationale = f"{consensus_rationale} | {meta_res.get('meta_pacing_directive')}"
     elif pacing_note:
@@ -613,6 +673,7 @@ def run_neuro_symbolic_pipeline(
         elif env_mode == "analyst":
             active_team_role = "hunt_team"
     _role_pb_map = {
+        "cyber_threat_intel": "reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook",
         "windows_internals": "reasoning/windows_kernel_and_userspace_enumeration_strategy_playbook",
         "windows_forensics": "reasoning/windows_digital_forensics_strategy_playbook",
         "linux_forensics": "reasoning/linux_digital_forensics_strategy_playbook",
@@ -629,7 +690,8 @@ def run_neuro_symbolic_pipeline(
 
     rl_imm = rl_res.get("immediate_action") or {}
     rl_rollout = rl_res.get("rollout_steps") or []
-    pca_cluster = pca_res.get("cluster_assignment") or {}
+    pca_cluster = dict(pca_res.get("cluster_assignment") or {})
+    pca_cluster.setdefault("silhouette_score", pca_res.get("silhouette_score", 0.0))
     pca_lap = pca_res.get("spectral_laplacian") or {}
 
     tier_badge = f"STREAMLINED_15_ENGINE_CORE | MODE:{active_p_mode}"
@@ -834,6 +896,7 @@ def run_neuro_symbolic_pipeline(
         "rl_immediate_action": rl_imm,
         "rl_rollout_steps": rl_rollout,
         "pca_cluster_assignment": pca_cluster,
+        "silhouette_score": pca_res.get("silhouette_score", 0.0),
         "pca_cumulative_variance_pct": pca_res.get("cumulative_top3_variance_pct", 0.0),
         "spectral_laplacian": pca_lap,
         "associative_top_notes": [n["wiki_link"] for n in assoc_res.get("activated_notes", [])[:3]],

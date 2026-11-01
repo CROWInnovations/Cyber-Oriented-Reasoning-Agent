@@ -15,6 +15,7 @@ Enforces Guardrail 1 (Strict Non-Blocking CEGAR Mode for semantic routes, Hard-B
      configured, NEVER trapping the LLM in a rejection loop.
 """
 
+import copy
 import ipaddress
 import os
 from pathlib import Path
@@ -27,7 +28,7 @@ from .vault_bridge import get_hardware_reasoning_limits, resolve_problem_targets
 
 _BASH_N_AVAILABLE: Optional[bool] = None
 _LOCAL_NETS_CACHE: Tuple[float, List[ipaddress.IPv4Network]] = (0.0, [])
-_CEGAR_CMD_CACHE: Dict[str, Dict[str, Any]] = {}
+_CEGAR_CMD_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 
 def _is_bash_n_available() -> bool:
@@ -135,13 +136,17 @@ def _find_truncated_or_malformed_ipv4(text: str) -> Optional[str]:
         s,
     ):
         cand = m_part.group(1)
+        # Skip text filter / print commands (`grep "192.168.1."`, `echo`, `awk`, `sed`, `findstr`)
+        seg_prefix = re.split(r"(?:&&|\|\||;|\|)", s[: m_part.start()])[-1].strip()
+        if re.match(r"^(?:sudo\s+)?(?:grep|egrep|fgrep|rg|awk|sed|findstr|echo|printf)\b", seg_prefix, re.I):
+            continue
         # Make sure it's not a valid 4-octet IP
         parts = cand.split(".")
         if len(parts) != 4 or any(not p.isdigit() or int(p) > 255 for p in parts):
             return f"Truncated IPv4 address `{cand}` detected (fewer than 4 octets)."
 
-    # 4. Any 4-octet IP with an octet > 255
-    for m_ip4 in re.finditer(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b", s):
+    # 4. Any 4-octet IP with an octet > 255 (excluding longer OID/version sequences like 1.3.6.1.4.1.311.1)
+    for m_ip4 in re.finditer(r"(?<![0-9.])\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b(?![0-9.])", s):
         octets = [int(m_ip4.group(i)) for i in range(1, 5)]
         if any(o > 255 for o in octets):
             return f"Invalid IPv4 address `{m_ip4.group(0)}` (octet > 255)."
@@ -376,6 +381,11 @@ def _check_network_isolation_policy(cmd_or_target: str, is_target_only: bool = F
                 ),
             }
     return None
+
+
+def is_analyst_mode() -> bool:
+    """Return True when the active session personality mode is ANALYST (read-only WHITE air-gap)."""
+    return os.environ.get("CORA_PERSONALITY_MODE", "DEFAULT").strip().upper() == "ANALYST"
 
 
 def _check_personality_mode_policy(cmd_or_target: str, is_target_only: bool = False) -> Optional[Dict[str, Any]]:
@@ -645,8 +655,10 @@ def verify_command_cegar(command: str) -> Dict[str, Any]:
     iso_level, blue_ifaces = _get_isolation_filter()
     personality_mode = os.environ.get("CORA_PERSONALITY_MODE", "DEFAULT").strip().upper() or "DEFAULT"
     cache_key = f"{personality_mode}:{iso_level}:{','.join(blue_ifaces)}::{cmd}"
-    if cache_key in _CEGAR_CMD_CACHE:
-        return dict(_CEGAR_CMD_CACHE[cache_key])
+    now_mono = time.monotonic()
+    cached_entry = _CEGAR_CMD_CACHE.get(cache_key)
+    if cached_entry is not None and (now_mono - cached_entry[0]) < 5.0:
+        return copy.deepcopy(cached_entry[1])
     advisories: List[str] = []
 
     if not cmd:
@@ -740,8 +752,13 @@ def verify_command_cegar(command: str) -> Dict[str, Any]:
             )
 
     # --- HARD-BLOCK 3: Unbounded `ping` without `-c`, `-w`, or `-n` ---
-    if re.search(r"(?:^|&&|\|\||;|\bsudo\s+)\bping\b", cmd):
-        if not re.search(r"\bping\b[^;&|]*\s[-/](?:[a-zA-Z]*[cwn])\b", cmd):
+    if re.search(r"(?:^|&&|\|\||;|\||\bsudo\s+)\s*\bping\b", cmd):
+        has_timeout_wrap = bool(re.search(r"\btimeout\s+\d+\s+ping\b", cmd))
+        if os.name == "nt" or is_win_ps:
+            bounded_ping = bool(re.search(r"\bping\b[^;&|]*\s[-/](?:[a-zA-Z]*[cwn])\b", cmd))
+        else:
+            bounded_ping = bool(re.search(r"\bping\b[^;&|]*\s-(?:[a-zA-Z]*[cwW])\b", cmd))
+        if not (bounded_ping or has_timeout_wrap):
             ping_rep = "ping -n 3 -w 2000" if (os.name == "nt" or is_win_ps) else "ping -c 3 -W 2"
             return {
                 "blocked": True,
@@ -753,7 +770,7 @@ def verify_command_cegar(command: str) -> Dict[str, Any]:
             }
 
     # --- HARD-BLOCK 3b: Unbounded `tcpdump` / `tshark` live capture without `-c <count>`, `-r <file>`, or `timeout` ---
-    if re.search(r"(?:^|&&|\|\||;|\bsudo\s+)\b(?:tcpdump|tshark)\b", cmd):
+    if re.search(r"(?:^|&&|\|\||;|\||\bsudo\s+)\s*\b(?:tcpdump|tshark)\b", cmd):
         if not re.search(r"\btimeout\s+\d+|\s-(?:[a-zA-Z]*[cr]|G|W)\b", cmd):
             repaired_cap = re.sub(r"\b(tcpdump|tshark)\b", r"\1 -c 15", cmd, count=1)
             return {
@@ -813,8 +830,9 @@ def verify_command_cegar(command: str) -> Dict[str, Any]:
         "suggested_fix": "",
         "advisories": advisories,
     }
-    if len(_CEGAR_CMD_CACHE) < 1024:
-        _CEGAR_CMD_CACHE[cache_key] = dict(res_ok)
+    if len(_CEGAR_CMD_CACHE) >= 1024:
+        _CEGAR_CMD_CACHE.clear()
+    _CEGAR_CMD_CACHE[cache_key] = (now_mono, copy.deepcopy(res_ok))
     return res_ok
 
 

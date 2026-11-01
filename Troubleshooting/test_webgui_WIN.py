@@ -731,13 +731,13 @@ def run_live_webgui_api_and_logic_tests(h: TestHarness, base_url: str) -> None:
 
         sample_msgs = [
             {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "Scan 192.168.1.99 and identify firmware"},
+            {"role": "user", "content": "Scan 198.51.100.10 and identify firmware"},
             {"role": "assistant", "content": "<think>long internal thought</think>", "tool_calls": [{"id": "c1", "function": {"name": "scan_target", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "c1", "name": "scan_target", "content": "Port 443 open: FortiGate-50E"},
         ]
         compacted = webui_srv._compact_messages_for_llama_context(sample_msgs, max_chars=4000, force_flatten=True)
         assert any(
-            m.get("role") == "user" and "192.168.1.99" in str(m.get("content", "")) and "FortiGate-50E" in str(m.get("content", ""))
+            m.get("role") == "user" and "198.51.100.10" in str(m.get("content", "")) and "FortiGate-50E" in str(m.get("content", ""))
             for m in compacted
         ), f"Compacted messages lost user query or tool output: {compacted}"
 

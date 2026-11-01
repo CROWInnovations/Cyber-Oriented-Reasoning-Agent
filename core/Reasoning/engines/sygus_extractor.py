@@ -15,10 +15,22 @@ Enforces Guardrail 2 (Additive SyGuS Extraction + High Compression Threshold):
   `[SyGuS Structured Summary]` block above the untouched raw output.
 """
 
+import ipaddress
 import re
 from typing import Any, Dict, List
 
 from .vault_bridge import get_hardware_reasoning_limits, write_reasoning_note
+
+
+def _mask_to_prefixlen(mask_str: str) -> int:
+    try:
+        ms = mask_str.strip()
+        if ms.startswith(("0x", "0X")) and len(ms) == 10:
+            val = int(ms, 16)
+            return bin(val).count("1")
+        return ipaddress.IPv4Network(f"0.0.0.0/{ms}", strict=False).prefixlen
+    except Exception:
+        return 24
 
 
 def extract_structured_facts(command: str, raw_output: str) -> Dict[str, Any]:
@@ -33,18 +45,27 @@ def extract_structured_facts(command: str, raw_output: str) -> Dict[str, Any]:
         "routes": [],
         "arp_neighbors": [],
         "open_ports": [],
+        "closed_or_filtered_ports": [],
         "ping_stats": [],
         "http_responses": [],
     }
     summary_lines: List[str] = []
 
-    # 1. `ip addr` interface blocks
-    if re.search(r"\bip\s+(?:-[0-9a-zA-Z]+\s+)*(?:addr|a|address)\b", cmd) or re.search(
-        r"^\d+:\s+[a-zA-Z0-9_.-]+:\s+<", text, re.MULTILINE
+    # 1. `ip addr`, `ip -br addr`, and `ifconfig` interface blocks
+    if (
+        re.search(r"\bip\s+(?:-[0-9a-zA-Z]+\s+)*(?:addr|a|address)\b|\bifconfig\b", cmd)
+        or re.search(r"^\d+:\s+[a-zA-Z0-9_.-]+:\s+<", text, re.MULTILINE)
+        or re.search(r"^[a-zA-Z0-9_.-]+(?:@\S+)?\s+(?:UP|DOWN|UNKNOWN)\s+\d+\.\d+\.\d+\.\d+/\d+", text, re.MULTILINE)
+        or re.search(r"^[a-zA-Z0-9_.-]+:?\s+(?:flags=\d+<|Link encap:)", text, re.MULTILINE)
     ):
         current_iface = None
         for line in text.splitlines():
             m_hdr = re.match(r"^\d+:\s+([a-zA-Z0-9_.-]+)(?:@\S+)?:\s+<([^>]*)>.*state\s+(\S+)", line)
+            m_br = re.match(
+                r"^([a-zA-Z0-9_.-]+)(?:@\S+)?\s+(UP|DOWN|UNKNOWN|LOWERLAYERDOWN|DORMANT)(?:\s+(.*))?$",
+                line.strip(),
+            )
+            m_ifc = re.match(r"^([a-zA-Z0-9_.-]+):?\s+(?:flags=\d+<([^>]*)>|Link encap:(\S+))", line)
             if m_hdr:
                 current_iface = {
                     "iface": m_hdr.group(1),
@@ -54,13 +75,43 @@ def extract_structured_facts(command: str, raw_output: str) -> Dict[str, Any]:
                     "mac": None,
                 }
                 facts["interfaces"].append(current_iface)
+            elif m_br and not line.startswith(" "):
+                tail_addrs = m_br.group(3) or ""
+                ipv4_list = re.findall(r"\b(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\b", tail_addrs)
+                facts["interfaces"].append(
+                    {
+                        "iface": m_br.group(1),
+                        "flags": m_br.group(2),
+                        "state": m_br.group(2),
+                        "ipv4": ipv4_list,
+                        "mac": None,
+                    }
+                )
+                current_iface = None
+            elif m_ifc:
+                flags_str = m_ifc.group(2) or m_ifc.group(3) or ""
+                st_str = "UP" if "UP" in flags_str.upper() else "UNKNOWN"
+                current_iface = {
+                    "iface": m_ifc.group(1),
+                    "flags": flags_str,
+                    "state": st_str,
+                    "ipv4": [],
+                    "mac": None,
+                }
+                facts["interfaces"].append(current_iface)
             elif current_iface is not None:
-                m_mac = re.search(r"link/(?:ether|loopback)\s+([0-9a-fA-F:]{17})", line)
+                m_mac = re.search(r"(?:link/(?:ether|loopback)|ether|HWaddr)\s+([0-9a-fA-F:]{17})", line)
                 if m_mac:
                     current_iface["mac"] = m_mac.group(1)
-                m_ip = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+(?:/\d+)?)", line)
+                m_ip = re.search(
+                    r"\binet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+(?:/\d+)?)(?:.*?(?:netmask|Mask:)\s*(\d+\.\d+\.\d+\.\d+|0x[0-9a-fA-F]{8}))?",
+                    line,
+                )
                 if m_ip:
-                    current_iface["ipv4"].append(m_ip.group(1))
+                    ip_tok = m_ip.group(1)
+                    if "/" not in ip_tok and m_ip.group(2):
+                        ip_tok = f"{ip_tok}/{_mask_to_prefixlen(m_ip.group(2))}"
+                    current_iface["ipv4"].append(ip_tok)
         if facts["interfaces"]:
             compact_ifaces = [
                 f"{i['iface']}({i['state']}): {','.join(i['ipv4']) or 'no-ipv4'}"
@@ -85,9 +136,13 @@ def extract_structured_facts(command: str, raw_output: str) -> Dict[str, Any]:
             elif win_iface is not None:
                 if "Media disconnected" in s:
                     win_iface["state"] = "DOWN"
-                m_wip = re.search(r"(?:IPv4 Address|IP Address)[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", s, re.I)
+                m_wip = re.search(r"(?:IPv4 Address|IP Address)[^:]*:\s*(\d+\.\d+\.\d+\.\d+(?:/\d+)?)", s, re.I)
                 if m_wip:
                     win_iface["ipv4"].append(m_wip.group(1))
+                m_wmask = re.search(r"Subnet Mask[^:]*:\s*(\d+\.\d+\.\d+\.\d+)", s, re.I)
+                if m_wmask and win_iface["ipv4"] and "/" not in win_iface["ipv4"][-1]:
+                    plen = _mask_to_prefixlen(m_wmask.group(1))
+                    win_iface["ipv4"][-1] = f"{win_iface['ipv4'][-1]}/{plen}"
                 m_wmac = re.search(r"Physical Address[^:]*:\s*([0-9A-Fa-f-]{17})", s, re.I)
                 if m_wmac:
                     win_iface["mac"] = m_wmac.group(1).replace("-", ":").lower()
@@ -146,42 +201,49 @@ def extract_structured_facts(command: str, raw_output: str) -> Dict[str, Any]:
         summary_lines.append(f"ARP Neighbors: {arp_str}")
 
     # 4. `nmap`, `ss -tulpn`, Windows `netstat -ano`, `Test-NetConnection`, or `scan_target` open ports
-    for m_nmap in re.finditer(r"^(\d+)/(tcp|udp)\s+(open|filtered|closed)\s+(\S+)", text, re.MULTILINE):
-        facts["open_ports"].append(
-            {
-                "port": int(m_nmap.group(1)),
-                "proto": m_nmap.group(2),
-                "state": m_nmap.group(3),
-                "service": m_nmap.group(4),
-            }
-        )
+    for m_nmap in re.finditer(
+        r"^(\d+)/(tcp|udp)\s+(open|filtered|closed|open\|filtered|closed\|filtered)\s+(\S+)",
+        text,
+        re.MULTILINE,
+    ):
+        p_entry = {
+            "port": int(m_nmap.group(1)),
+            "proto": m_nmap.group(2),
+            "state": m_nmap.group(3),
+            "service": m_nmap.group(4),
+        }
+        if m_nmap.group(3) == "open":
+            facts["open_ports"].append(p_entry)
+        else:
+            facts["closed_or_filtered_ports"].append(p_entry)
     for m_scan in re.finditer(
         r"^PORT\s+(\d+)/(tcp|udp):\s*(OPEN|closed/filtered)(?:\s*\|\s*Banner:\s*([^\r\n]+))?",
         text,
         re.MULTILINE | re.IGNORECASE,
     ):
         st_raw = m_scan.group(3).upper()
+        p_entry = {
+            "port": int(m_scan.group(1)),
+            "proto": m_scan.group(2).lower(),
+            "state": "open" if st_raw == "OPEN" else "closed/filtered",
+            "service": (m_scan.group(4) or "scan_target").strip(),
+        }
         if st_raw == "OPEN":
-            facts["open_ports"].append(
-                {
-                    "port": int(m_scan.group(1)),
-                    "proto": m_scan.group(2).lower(),
-                    "state": "open",
-                    "service": (m_scan.group(4) or "scan_target").strip(),
-                }
-            )
+            facts["open_ports"].append(p_entry)
+        else:
+            facts["closed_or_filtered_ports"].append(p_entry)
     for m_ss in re.finditer(
-        r"^(tcp|udp)\s+LISTEN\s+\d+\s+\d+\s+(\S+):(\d+)\s+\S+(?:\s+users:\(\(\"([^\"]+)\")?",
+        r"^(tcp|udp)\s+(LISTEN|UNCONN)\s+\d+\s+\d+\s+(\S+):(\d+)\s+\S+(?:\s+users:\(\(\"([^\"]+)\")?",
         text,
         re.MULTILINE,
     ):
         facts["open_ports"].append(
             {
-                "port": int(m_ss.group(3)),
+                "port": int(m_ss.group(4)),
                 "proto": m_ss.group(1),
-                "state": "LISTEN",
-                "bind": m_ss.group(2),
-                "service": m_ss.group(4) or "local",
+                "state": m_ss.group(2),
+                "bind": m_ss.group(3),
+                "service": m_ss.group(5) or "local",
             }
         )
     for m_wnet in re.finditer(
@@ -198,22 +260,23 @@ def extract_structured_facts(command: str, raw_output: str) -> Dict[str, Any]:
                 "service": f"pid:{m_wnet.group(5)}" if m_wnet.group(5) else "local",
             }
         )
-    m_tnc = re.search(
-        r"RemoteAddress\s*:\s*(\S+).*?RemotePort\s*:\s*(\d+).*?TcpTestSucceeded\s*:\s*(True|False)",
+    for m_tnc in re.finditer(
+        r"RemoteAddress\s*:\s*(\S+)(?:(?!RemoteAddress).)*?RemotePort\s*:\s*(\d+)(?:(?!RemoteAddress).)*?TcpTestSucceeded\s*:\s*(True|False)",
         text,
         re.DOTALL | re.IGNORECASE,
-    )
-    if m_tnc:
+    ):
         t_ok = m_tnc.group(3).lower() == "true"
-        facts["open_ports"].append(
-            {
-                "port": int(m_tnc.group(2)),
-                "proto": "tcp",
-                "state": "open" if t_ok else "closed",
-                "bind": m_tnc.group(1),
-                "service": "Test-NetConnection",
-            }
-        )
+        p_entry = {
+            "port": int(m_tnc.group(2)),
+            "proto": "tcp",
+            "state": "open" if t_ok else "closed",
+            "bind": m_tnc.group(1),
+            "service": "Test-NetConnection",
+        }
+        if t_ok:
+            facts["open_ports"].append(p_entry)
+        else:
+            facts["closed_or_filtered_ports"].append(p_entry)
     if facts["open_ports"]:
         ports_str = ", ".join(
             f"{p['port']}/{p['proto']}({p['state']}:{p['service']})" for p in facts["open_ports"][:8]

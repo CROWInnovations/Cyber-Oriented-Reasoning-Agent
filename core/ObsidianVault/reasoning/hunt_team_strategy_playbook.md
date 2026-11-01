@@ -75,3 +75,19 @@ Activate `[[reasoning/hunt_team_strategy_playbook]]` whenever the query, goal, o
 | **Outbound C2 Connections & Kernel Socket Cross-Check** | `powershell -NoProfile -Command "Get-NetTCPConnection -State Established,SynSent \| Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess,@{N='ProcName';E={(Get-Process -Id $_.OwningProcess).ProcessName}}"` | `ss -tanpi state established && wc -l /proc/net/tcp` | Non-browser processes (`svchost`, `rundll32`, `python3`, `cron`) holding persistent outbound connections; mismatch between `ss` and `/proc/net/tcp`. |
 | **BPF Packet Capture for C2 Beaconing & DNS Tunneling** | `pktmon start --etw -p 0 -f C:\Temp\hunt.etl && timeout /t 30 && pktmon stop && pktmon etl2pcap C:\Temp\hunt.etl -o C:\Temp\hunt.pcapng` | `sudo tcpdump -nn -i any -s 0 -c 500 -w /tmp/hunt.pcap 'tcp or udp port 53 or icmp'` | Periodic fixed-interval or low-jitter HTTPS/DNS beacons, high-entropy TXT/CNAME DNS queries, or ICMP payload tunneling. |
 | **Deep PCAP Inspection (`tshark`) & OS Spoofing (`p0f`)** | `tshark -r C:\Temp\hunt.pcapng -Y "http.request or tls.handshake.type == 1 or dns.qry.name" -T fields -e ip.src -e ip.dst -e tls.handshake.extensions_server_name -e http.user_agent -e dns.qry.name` | `tshark -r /tmp/hunt.pcap -Y "http.request or tls.handshake.type == 1 or dns.qry.name" -T fields -e ip.src -e ip.dst -e tls.handshake.extensions_server_name -e http.user_agent && p0f -r /tmp/hunt.pcap` | Suspicious SNI/User-Agent strings, direct-to-IP TLS handshakes (no SNI), or `p0f` TCP SYN TTL/Window fingerprint contradicting HTTP `User-Agent` OS. |
+
+---
+
+## 4. Verified Live Threat Intelligence, IoC, LOLBin & DFIR Tool Sources (`fetch_webpage`, `web_search` & `curl`)
+> **Master Hub:** [[reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook]] | **HTTP/API Reference:** [[commands/curl_playbook]]
+
+When enriching suspicious external IPs, hashes, drivers, or LOLBins discovered during Phases 1–5, use `fetch_webpage` / `web_search` (easiest, works in `Analyst` mode) or `curl` (`GET`/`POST`) via `run_shell`:
+
+| Threat Hunting Objective | Easiest CORA Tool (`fetch_webpage` / `web_search`) | Shell CLI Alternative (`curl` `GET`/`POST` + `jq`) |
+| :--- | :--- | :--- |
+| **External IP Open Ports, Hostnames & CVEs (`Shodan InternetDB`)** | `fetch_webpage(url="https://internetdb.shodan.io/<EXTERNAL_IPV4>")` | `curl -sSL --max-time 15 "https://internetdb.shodan.io/<EXTERNAL_IPV4>" \| jq '.'` |
+| **SANS ISC & GreyNoise Scanner vs. Targeted Threat Triage** | `fetch_webpage(url="https://api.greynoise.io/v3/community/<EXTERNAL_IPV4>")` | `curl -sSL --max-time 15 "https://isc.sans.edu/api/ip/<EXTERNAL_IPV4>?json" \| jq '.ip'` |
+| **Malware Hash & C2 IoC Lookup (`MalwareBazaar`, `ThreatFox`, `Feodo`)** | `fetch_webpage(url="https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json", query_filter="<IP>")` | `curl -sSL --max-time 15 -X POST "https://mb-api.abuse.ch/api/v1/" -d "query=get_info&hash=<SHA256>" \| jq '.data[0]'` |
+| **Windows LOLBins (`LOLBAS`) & Vulnerable Drivers (`LOLDrivers`)** | `fetch_webpage(url="https://lolbas-project.github.io/api/lolbas.json", query_filter="<binary.exe>")` | `curl -sSL --max-time 15 "https://www.loldrivers.io/api/drivers.json" \| jq '.[] \| select(.Tags[]? == "<driver.sys>")'` |
+| **Linux SUID / Sudo / Capability Abuse (`GTFOBins`)** | `fetch_webpage(url="https://gtfobins.github.io/gtfobins/<binary>/")` | `curl -sSL --max-time 15 "https://raw.githubusercontent.com/GTFOBins/GTFOBins.github.io/master/_gtfobins/<binary>.md"` |
+| **DFIR & Sigma/YARA Threat Hunting Tools (`Hayabusa`, `Chainsaw`, `Volatility3`)** | `fetch_webpage(url="https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest", query_filter="browser_download_url")` | `curl -sSL --max-time 15 "https://api.github.com/repos/Yamato-Security/hayabusa/releases/latest" \| jq -r '.assets[].browser_download_url'` |

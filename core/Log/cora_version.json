@@ -1,10 +1,10 @@
 {
   "major_cli": 5,
-  "engine_rev": 19,
-  "patch_rev": 14,
-  "version": "5.19.14",
-  "updated_at": "2026-10-31 01:54:25",
-  "engine_tree_sha256": "7c3af10419f382da18044b193032a65e531feaeb8682289cbc2436059c4ee196",
-  "patch_tree_sha256": "3e2185b14f80cf892423b15bbd178a9326a03769cff3f86d5ba1a66f6258bef5",
-  "last_update_reason": "Documentation, tools, or training corpus updated"
+  "engine_rev": 20,
+  "patch_rev": 18,
+  "version": "5.20.18",
+  "updated_at": "2026-11-01 01:08:16",
+  "engine_tree_sha256": "c79abb692a4f647592b98960ff2bab3b9ea4741359eaf22aec02490352c67ec4",
+  "patch_tree_sha256": "08e1ae3abac9a7f0616de777e9772cc3667f110e7b05c99f1205e556664d7395",
+  "last_update_reason": "End-to-end 15-Engine reasoning/logic audit fixes, LLM KV-cache reuse, and CPU/GPU resource balance"
 }

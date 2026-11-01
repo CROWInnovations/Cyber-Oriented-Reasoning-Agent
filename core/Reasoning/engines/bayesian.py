@@ -10,6 +10,7 @@ Capabilities:
 - Persists and updates domain priors in `Reasoning/data/bayesian_priors.json` and logs
   reports to `ObsidianVault/reasoning/`.
 """
+import copy
 import json
 import math
 import re
@@ -17,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .vault_bridge import (
     DATA_DIR,
+    _atomic_write_text,
     ensure_directories,
     get_hardware_reasoning_limits,
     render_command_template,
@@ -349,37 +351,40 @@ def load_or_init_profiles() -> Dict[str, Any]:
         try:
             mtime = PRIORS_FILE.stat().st_mtime
             if _PRIORS_RAM_CACHE["mtime"] == mtime and _PRIORS_RAM_CACHE["data"] is not None:
-                return _PRIORS_RAM_CACHE["data"]
+                return copy.deepcopy(_PRIORS_RAM_CACHE["data"])
             raw_txt = PRIORS_FILE.read_text(encoding="utf-8")
+            dirty = False
+            if "172.24." in raw_txt:
+                raw_txt = re.sub(r"\b172\.24\.\d{1,3}\.\d{1,3}/\d{1,2}\b", "{remote_subnet}", raw_txt)
+                raw_txt = re.sub(r"\b172\.24\.\d{1,3}\.\d{1,3}\b", "{target_ip}", raw_txt)
+                dirty = True
             data = json.loads(raw_txt)
-            # If legacy hardcoded IPs exist in the persisted priors file, migrate to parameterized templates
-            if isinstance(data, dict) and data and "172.24." not in raw_txt:
-                dirty = False
+            if isinstance(data, dict) and data:
                 for prof_k, def_prof in DEFAULT_CYBER_PROFILES.items():
                     if prof_k not in data:
-                        data[prof_k] = json.loads(json.dumps(def_prof))
+                        data[prof_k] = copy.deepcopy(def_prof)
                         dirty = True
                     else:
                         ev_map = data[prof_k].setdefault("evidence_likelihoods", {})
                         for ek, ev_def in def_prof.get("evidence_likelihoods", {}).items():
                             if ek not in ev_map:
-                                ev_map[ek] = json.loads(json.dumps(ev_def))
+                                ev_map[ek] = copy.deepcopy(ev_def)
                                 dirty = True
                 if dirty:
-                    PRIORS_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                    _atomic_write_text(PRIORS_FILE, json.dumps(data, indent=2) + "\n")
                     mtime = PRIORS_FILE.stat().st_mtime
                 _PRIORS_RAM_CACHE["mtime"] = mtime
-                _PRIORS_RAM_CACHE["data"] = data
+                _PRIORS_RAM_CACHE["data"] = copy.deepcopy(data)
                 return data
         except Exception:
             pass
-    PRIORS_FILE.write_text(json.dumps(DEFAULT_CYBER_PROFILES, indent=2) + "\n", encoding="utf-8")
-    data = json.loads(json.dumps(DEFAULT_CYBER_PROFILES))
+    _atomic_write_text(PRIORS_FILE, json.dumps(DEFAULT_CYBER_PROFILES, indent=2) + "\n")
+    data = copy.deepcopy(DEFAULT_CYBER_PROFILES)
     try:
         _PRIORS_RAM_CACHE["mtime"] = PRIORS_FILE.stat().st_mtime
     except Exception:
         pass
-    _PRIORS_RAM_CACHE["data"] = data
+    _PRIORS_RAM_CACHE["data"] = copy.deepcopy(data)
     return data
 
 
@@ -474,11 +479,29 @@ def update_learned_prior(profile_name: str, confirmed_hypothesis: str) -> str:
     for h_key, h_obj in hyps.items():
         h_obj["prior"] = round(float(h_obj.get("alpha_count", 3.0)) / total_alpha, 4)
 
-    PRIORS_FILE.write_text(json.dumps(profiles, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(PRIORS_FILE, json.dumps(profiles, indent=2) + "\n")
+    try:
+        _PRIORS_RAM_CACHE["mtime"] = PRIORS_FILE.stat().st_mtime
+        _PRIORS_RAM_CACHE["data"] = copy.deepcopy(profiles)
+    except Exception:
+        pass
     return (
         f"Updated Bayesian prior for `{confirmed_hypothesis}` in profile `{profile_name}` "
         f"(new prior: {hyps[confirmed_hypothesis]['prior']:.1%})."
     )
+
+
+def _render_bayesian_text(raw_tpl: str, ctx: Dict[str, Any]) -> str:
+    if not raw_tpl:
+        return ""
+    norm = (
+        raw_tpl.replace("<target>", "{target_ip}")
+        .replace("<target_ip>", "{target_ip}")
+        .replace("<gateway_ip>", "{gateway_ip}")
+        .replace("<iface>", "{iface}")
+        .replace("<remote_subnet>", "{remote_subnet}")
+    )
+    return render_command_template(norm, ctx)
 
 
 def run_bayesian_abduction(
@@ -489,13 +512,17 @@ def run_bayesian_abduction(
     custom_likelihoods: Optional[Dict[str, Dict[str, float]]] = None,
     confirmed_cause: Optional[str] = None,
     target: Optional[str] = None,
+    secondary_target_ip: Optional[str] = None,
+    local_subnets: Optional[List[str]] = None,
     save_to_vault: bool = True,
 ) -> Dict[str, Any]:
     """
     Execute Bayesian Abductive Reasoning and optionally save to ObsidianVault.
     """
     profiles = load_or_init_profiles()
-    if not isinstance(observed_evidence, dict):
+    if isinstance(observed_evidence, (list, tuple, set)):
+        observed_evidence = {str(k): True for k in observed_evidence if k}
+    elif not isinstance(observed_evidence, dict):
         observed_evidence = {}
     else:
         alias_map = {
@@ -538,12 +565,15 @@ def run_bayesian_abduction(
     ranked_hyps: List[Tuple[str, float]] = sorted(posteriors.items(), key=lambda x: -x[1])
     next_probes = rank_next_probes_by_eig(posteriors, ev_map, observed_evidence)
 
-    ctx = resolve_problem_targets(problem, target_ip=target or "")
+    ctx = resolve_problem_targets(
+        problem,
+        target_ip=target or "",
+        secondary_ip=secondary_target_ip or "",
+        local_subnets=local_subnets,
+    )
     target_str = ctx["primary_ip"] if ctx["has_concrete_primary_ip"] else (target or "<TARGET_IP>")
     for p in next_probes:
-        cmd_tpl = p.get("probe_cmd", "")
-        cmd_tpl = cmd_tpl.replace("<target>", "{target_ip}").replace("<target_ip>", "{target_ip}").replace("<gateway_ip>", "{gateway_ip}").replace("<iface>", "{iface}")
-        rendered_cmd = render_command_template(cmd_tpl, ctx)
+        rendered_cmd = _render_bayesian_text(p.get("probe_cmd", ""), ctx)
         if ctx["target_os"] == "windows":
             if rendered_cmd.startswith("ip neigh show"):
                 rendered_cmd = f"arp -a {ctx['primary_ip']}" if ctx["has_concrete_primary_ip"] else "arp -a"
@@ -552,7 +582,7 @@ def run_bayesian_abduction(
             elif rendered_cmd.startswith("ping -c "):
                 rendered_cmd = re.sub(r"^ping\s+-c\s+(\d+)(?:\s+-W\s+\d+)?", r"ping -n \1 -w 1000", rendered_cmd)
         p["probe_cmd"] = rendered_cmd
-        p["description"] = render_command_template(p.get("description", ""), ctx)
+        p["description"] = _render_bayesian_text(p.get("description", ""), ctx)
 
     top_h, top_p = ranked_hyps[0]
     md_lines = [
@@ -573,7 +603,7 @@ def run_bayesian_abduction(
     md_lines.append("| :--- | :--- | :--- | :--- | :--- |")
     for idx, (h_key, post_p) in enumerate(ranked_hyps, 1):
         prior_p = priors.get(h_key, 0.0)
-        rem = render_command_template(hyp_meta.get(h_key, {}).get("remediation", ""), ctx)
+        rem = _render_bayesian_text(hyp_meta.get(h_key, {}).get("remediation", ""), ctx)
         md_lines.append(f"| **{idx}** | `{h_key}` | **{post_p:.1%}** | {prior_p:.1%} | {rem} |")
 
     if next_probes:
@@ -617,7 +647,7 @@ def run_bayesian_abduction(
                 "hypothesis": h,
                 "posterior": round(p, 4),
                 "prior": round(priors.get(h, 0.0), 4),
-                "remediation": hyp_meta.get(h, {}).get("remediation", ""),
+                "remediation": _render_bayesian_text(hyp_meta.get(h, {}).get("remediation", ""), ctx),
             }
             for h, p in ranked_hyps[:max_hyps]
         ],

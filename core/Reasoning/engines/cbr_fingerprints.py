@@ -35,7 +35,7 @@ CBR_LIBRARY_FILE = os.path.join(CBR_DIR, "cbr_library.json")
 TRAINED_RULES_FILE = os.path.join(str(DATA_DIR), "trained_rules.json")
 LEARNED_CBR_FILE = os.path.join(str(DATA_DIR), "learned_cbr_cases.json")
 
-_CBR_RAM_CACHE: Dict[str, Any] = {"mtimes": (-1.0, -1.0, -1.0), "data": None, "compiled": []}
+_CBR_RAM_CACHE: Dict[str, Any] = {"mtimes": (-1.0, -1.0, -1.0), "data": None, "compiled": [], "last_write_ts": 0.0}
 _TRAINED_CBR_CACHE: Dict[str, Any] = {"mtime": -1.0, "fingerprints": []}
 _WORD_TOK_RE = re.compile(r"[a-z0-9_.-]{4,}")
 _BACKTICK_CMD_RE = re.compile(r"`([^`]{4,220})`")
@@ -288,6 +288,30 @@ def seed_default_cbr_library() -> None:
     save_json_state(CBR_LIBRARY_FILE, data)
 
 
+def _save_base_cbr_library(lib: Dict[str, Any]) -> None:
+    """Persist `cbr_library.json` without permanently baking in dynamically merged CBR-TRN-* or CBR-AUTO-* cases."""
+    base_cases = [
+        c
+        for c in lib.get("cases", [])
+        if isinstance(c, dict)
+        and not str(c.get("case_id", "")).startswith(("CBR-TRN-", "CBR-AUTO-"))
+    ]
+    disk_payload = {
+        "cases": base_cases,
+        "recent_failures": lib.get("recent_failures", [])[-40:],
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_json_state(CBR_LIBRARY_FILE, disk_payload)
+    try:
+        mt1_new = os.path.getmtime(CBR_LIBRARY_FILE) if os.path.exists(CBR_LIBRARY_FILE) else 0.0
+        old_mtimes = _CBR_RAM_CACHE.get("mtimes") or (0.0, 0.0, 0.0)
+        _CBR_RAM_CACHE["mtimes"] = (mt1_new, old_mtimes[1], old_mtimes[2])
+        _CBR_RAM_CACHE["data"] = lib
+        _CBR_RAM_CACHE["last_write_ts"] = time.monotonic()
+    except OSError:
+        pass
+
+
 def load_cbr_library() -> Dict[str, Any]:
     ensure_directories()
     try:
@@ -309,9 +333,17 @@ def load_cbr_library() -> Dict[str, Any]:
         }
         save_json_state(CBR_LIBRARY_FILE, data)
     else:
+        raw_cases = data.get("cases", [])
+        clean_base_cases = [
+            c
+            for c in raw_cases
+            if isinstance(c, dict)
+            and not str(c.get("case_id", "")).startswith(("CBR-TRN-", "CBR-AUTO-"))
+        ]
+        seed_added = len(clean_base_cases) != len(raw_cases)
+        data["cases"] = clean_base_cases
         seed_by_id = {sc["case_id"]: sc for sc in DEFAULT_SEED_CASES}
         existing_seed_ids = set()
-        seed_added = False
         for c in data.get("cases", []):
             if isinstance(c, dict) and c.get("case_id") in seed_by_id:
                 sc_ref = seed_by_id[c["case_id"]]
@@ -469,10 +501,10 @@ def match_failure_fingerprint(
     cmd_low = (command or "").lower()
 
     compiled_cases = _CBR_RAM_CACHE.get("compiled") or []
-    for case, pat_re, _bin_re, _case_words in compiled_cases:
+    for case, pat_re, bin_re, _case_words in compiled_cases:
         score = 0.0
         case_bin = str(case.get("binary", "any")).lower()
-        if case_bin == binary or (case_bin != "any" and re.search(rf"\b{re.escape(case_bin)}\b", cmd_low)):
+        if case_bin == binary or (bin_re is not None and bin_re.search(cmd_low)):
             score += 0.45
         elif case_bin == "any":
             score += 0.15
@@ -483,8 +515,12 @@ def match_failure_fingerprint(
         if case.get("exit_code") == exit_code:
             score += 0.20
 
-        if pat_re is not None and pat_re.search(out_txt):
+        if pat_re is not None:
+            if not pat_re.search(out_txt):
+                continue
             score += 0.65
+        elif case.get("exit_code") != exit_code or case_bin == "any":
+            continue
 
         if score > best_score and score >= 0.55:
             best_score = score
@@ -492,27 +528,23 @@ def match_failure_fingerprint(
             best_case["match_confidence"] = round(min(1.0, score), 3)
 
     # Record in recent_failures (parameterized so concrete local IPs/paths never pollute CBR stores)
-    recent = lib.get("recent_failures", [])
-    recent.append(
-        {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "command": parameterize_tactical_template(command[:240]),
-            "binary": binary,
-            "exit_code": exit_code,
-            "error_excerpt": parameterize_tactical_template((output_text or "").strip()[:240]),
-            "matched_case_id": best_case["case_id"] if best_case else None,
-        }
-    )
-    lib["recent_failures"] = recent[-40:]
-    lib["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_json_state(CBR_LIBRARY_FILE, lib)
-    try:
-        mt1_new = os.path.getmtime(CBR_LIBRARY_FILE) if os.path.exists(CBR_LIBRARY_FILE) else 0.0
-        old_mtimes = _CBR_RAM_CACHE.get("mtimes") or (0.0, 0.0, 0.0)
-        _CBR_RAM_CACHE["mtimes"] = (mt1_new, old_mtimes[1], old_mtimes[2])
-        _CBR_RAM_CACHE["data"] = lib
-    except OSError:
-        pass
+    if best_case is not None or exit_code != 0:
+        recent = lib.get("recent_failures", [])
+        recent.append(
+            {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "command": parameterize_tactical_template(command[:240]),
+                "binary": binary,
+                "exit_code": exit_code,
+                "error_excerpt": parameterize_tactical_template((output_text or "").strip()[:240]),
+                "matched_case_id": best_case["case_id"] if best_case else None,
+            }
+        )
+        lib["recent_failures"] = recent[-40:]
+        lib["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        now_m = time.monotonic()
+        if best_case is not None or (now_m - float(_CBR_RAM_CACHE.get("last_write_ts", 0.0))) >= 2.0:
+            _save_base_cbr_library(lib)
     return best_case
 
 
@@ -526,8 +558,14 @@ def record_cbr_resolution(
     """Allows dynamically adding a newly discovered failure->resolution case to the library."""
     lib = load_cbr_library()
     cases = lib.get("cases", [])
+    base_cases = [
+        c
+        for c in cases
+        if isinstance(c, dict)
+        and not str(c.get("case_id", "")).startswith(("CBR-TRN-", "CBR-AUTO-"))
+    ]
     new_case = {
-        "case_id": f"CBR-{len(cases) + 1:03d}",
+        "case_id": f"CBR-{len(base_cases) + 1:03d}",
         "binary": _extract_binary(command),
         "exit_code": int(exit_code),
         "error_pattern": error_pattern,
@@ -538,13 +576,16 @@ def record_cbr_resolution(
     }
     cases.append(new_case)
     lib["cases"] = cases
-    save_json_state(CBR_LIBRARY_FILE, lib)
+    _save_base_cbr_library(lib)
+    _CBR_RAM_CACHE["mtimes"] = (-1.0, -1.0, -1.0)
     return new_case
 
 
 def run_cbr_reasoning(
     problem: str,
     context_text: str = "",
+    target_ip: str = "",
+    secondary_target_ip: str = "",
     export_to_vault: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -554,7 +595,11 @@ def run_cbr_reasoning(
     lib = load_cbr_library()
     combined = f"{problem}\n{context_text}"
     words = set(_WORD_TOK_RE.findall(combined.lower()))
-    ctx = resolve_problem_targets(problem=problem)
+    ctx = resolve_problem_targets(
+        problem=problem,
+        target_ip=target_ip,
+        secondary_ip=secondary_target_ip,
+    )
     matched_cases: List[Dict[str, Any]] = []
 
     compiled_cases = _CBR_RAM_CACHE.get("compiled") or []

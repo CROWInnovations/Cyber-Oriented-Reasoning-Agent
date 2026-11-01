@@ -1132,7 +1132,8 @@ def solve_bellman_mdp(
         states.add(tr.get("post_state_success", "s_l2_l3_verified"))
         states.add(tr.get("post_state_fail", "s_command_blocked_or_failed"))
 
-    V: Dict[str, float] = {s: float(state_rewards.get(s, 0.0)) for s in states}
+    V: Dict[str, float] = {s: 0.0 for s in states}
+    V["s_goal_verified_complete"] = float(state_rewards.get("s_goal_verified_complete", 100.0))
     # Precompute static transition parameters once so Bellman Value Iteration scales to 10,000+ transitions in < 2 ms
     by_state_compiled: Dict[str, List[Tuple[float, float, float, float, str, str]]] = {s: [] for s in states}
     compiled_all: List[Tuple[Dict[str, Any], str, float, float, float, float, str, str]] = []
@@ -1148,7 +1149,8 @@ def solve_bellman_mdp(
         phi_s = float(state_rewards.get(s, 0.0))
         phi_succ = float(state_rewards.get(s_succ, 20.0))
         term_bonus = 60.0 if s_succ == "s_goal_verified_complete" else 0.0
-        r_succ = max(4.0, phi_succ - phi_s) + term_bonus - cost
+        potential_diff = max(1.0, phi_succ - phi_s) if phi_succ > phi_s else (phi_succ - phi_s)
+        r_succ = potential_diff + term_bonus - cost
         r_fail = -cost
         by_state_compiled.setdefault(s, []).append((p_succ, p_fail, r_succ, r_fail, s_succ, s_fail))
         compiled_all.append((tr, s, p_succ, p_fail, r_succ, r_fail, s_succ, s_fail))
@@ -1162,13 +1164,15 @@ def solve_bellman_mdp(
             acts = by_state_compiled.get(s, [])
             if not acts or s == "s_goal_verified_complete":
                 continue
-            best_q = V[s]
+            best_q = -float("inf")
             for p_succ, p_fail, r_succ, r_fail, s_succ, s_fail in acts:
                 q_val = p_succ * (r_succ + gamma * V.get(s_succ, 0.0)) + p_fail * (
                     r_fail + gamma * V.get(s_fail, 0.0)
                 )
                 if q_val > best_q:
                     best_q = q_val
+            if best_q == -float("inf"):
+                best_q = 0.0
             delta = abs(best_q - V[s])
             if delta > max_delta:
                 max_delta = delta
@@ -1202,8 +1206,8 @@ def flush_mdp_store_if_dirty() -> bool:
             new_mt = os.path.getmtime(MDP_STORE_FILE) if os.path.exists(MDP_STORE_FILE) else 0.0
             _MDP_STORE_RAM_CACHE["mtime"] = new_mt
             _MDP_STORE_RAM_CACHE["dirty_count"] = 0
-            if _MDP_SOLVED_CACHE.get("stratified_pool") is not None:
-                _MDP_SOLVED_CACHE["mtime"] = new_mt
+            _MDP_SOLVED_CACHE["mtime"] = -1.0
+            _MDP_SOLVED_CACHE["stratified_pool"] = None
             return True
         except Exception:
             pass
@@ -1272,6 +1276,8 @@ def record_mdp_transition_outcome(
             _MDP_STORE_RAM_CACHE["data"] = store
             dirty = int(_MDP_STORE_RAM_CACHE.get("dirty_count", 0)) + 1
             _MDP_STORE_RAM_CACHE["dirty_count"] = dirty
+            _MDP_SOLVED_CACHE["mtime"] = -1.0
+            _MDP_SOLVED_CACHE["stratified_pool"] = None
             if flush or dirty >= 10:
                 flush_mdp_store_if_dirty()
             return {
@@ -1297,6 +1303,7 @@ def merge_trained_mdp_transitions(new_transitions: List[Dict[str, Any]]) -> int:
     """
     if not new_transitions:
         return 0
+    flush_mdp_store_if_dirty()
     store = load_or_init_mdp_store()
     existing: List[Dict[str, Any]] = store.get("transitions", [])
     by_sig: Dict[str, Dict[str, Any]] = {}
@@ -1322,6 +1329,14 @@ def merge_trained_mdp_transitions(new_transitions: List[Dict[str, Any]]) -> int:
     store["transitions"] = existing
     store["updated_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
     save_json_state(str(MDP_STORE_FILE), store)
+    try:
+        _MDP_STORE_RAM_CACHE["mtime"] = os.path.getmtime(MDP_STORE_FILE) if os.path.exists(MDP_STORE_FILE) else 0.0
+    except OSError:
+        _MDP_STORE_RAM_CACHE["mtime"] = 0.0
+    _MDP_STORE_RAM_CACHE["data"] = store
+    _MDP_STORE_RAM_CACHE["dirty_count"] = 0
+    _MDP_SOLVED_CACHE["mtime"] = -1.0
+    _MDP_SOLVED_CACHE["stratified_pool"] = None
     return added_or_updated
 
 
@@ -1425,11 +1440,12 @@ _WINDOWS_CMD_MARKERS = (
 )
 _LINUX_ONLY_TOOLS = {
     "ip", "ss", "iptables", "nft", "sysctl", "tio", "systemctl", "uname", "arping",
-    "tcpdump", "sudo", "chmod", "chown", "journalctl", "nmcli",
+    "tcpdump", "sudo", "chmod", "chown", "journalctl", "nmcli", "find", "id",
 }
 _LINUX_CMD_MARKERS = (
     "ip -4", "ip -br", "ip route", "ip addr", "ip neigh", "ss -", "iptables",
-    "sysctl", "tio ", "/dev/tty", "/etc/", "sudo ", "uname -a",
+    "sysctl", "tio ", "/dev/tty", "/etc/", "sudo ", "uname -a", "2>/dev/null",
+    "find ~", "find /", "id;",
 )
 
 
@@ -1482,7 +1498,7 @@ def solve_in_task_optimal_stopping_mdp(
 
     # Penalty on continuing a blocked in-band path when absorption signals or negative somatic valence appear
     absorption_penalty = (absorption_signals * 18.0) + (max(0.0, -somatic_valence) * 25.0)
-    v_continue = round(q_primary - (absorption_penalty if primary_pol.get("tactic") == "Active_Enum" else 0.0), 2)
+    v_continue = round(q_primary - absorption_penalty, 2)
     v_pivot = round(q_alt + (15.0 if absorption_signals >= 2 else 0.0) + (dempster_shafer_ignorance * 20.0), 2)
 
     if v_pivot > v_continue and absorption_signals >= 2:
@@ -1511,6 +1527,7 @@ def solve_in_task_optimal_stopping_mdp(
         )
 
     return {
+        "decision": decision,
         "stopping_decision": decision,
         "v_continue": v_continue,
         "v_pivot": v_pivot,
@@ -1708,10 +1725,7 @@ def run_mdp_tactical_reasoning(
             .replace("/dev/ttyUSB0", serial_dev)
         )
         cmd_inst = render_command_template(cmd_inst, ctx)
-        local_shell_is_windows = (os.name == "nt") or any(
-            k in prob_low for k in ("c:\\", "cmd.exe", "powershell", "ipconfig", "whoami /priv", "route print")
-        )
-        if is_windows and local_shell_is_windows and item.get("source") == "seed_core":
+        if is_windows and item.get("source") == "seed_core":
             tid = item.get("id")
             if tid == "MDP_PASSIVE_IFACE_ARP":
                 cmd_inst = "ipconfig /all & route print -4 & arp -a"
@@ -1725,13 +1739,19 @@ def run_mdp_tactical_reasoning(
             elif tid == "MDP_RECON_VERIFY_REACHABILITY":
                 cmd_inst = f"ping -n 3 -w 1500 {resolved_target}"
                 item["tool"] = "ping"
-            elif tid == "MDP_SERIAL_UART_DETECTION":
-                cmd_inst = r"reg query HKLM\HARDWARE\DEVICEMAP\SERIALCOMM"
-                item["tool"] = "reg"
+            elif tid in ("MDP_SERIAL_UART_DETECTION", "MDP_OOB_UART_SERIAL_AUDIT"):
+                cmd_inst = r'reg query HKLM\HARDWARE\DEVICEMAP\SERIALCOMM & powershell -NoProfile -Command "Get-WmiObject Win32_SerialPort | Select-Object DeviceID,Description"'
+                item["tool"] = "powershell"
+            elif tid == "MDP_DEFENSE_FIREWALL_UNLOCK":
+                cmd_inst = "netsh advfirewall show allprofiles"
+                item["tool"] = "netsh"
+            elif tid == "MDP_CRED_MTLS_CERT_DISCOVERY":
+                cmd_inst = r"dir /s /b %USERPROFILE%\Projects\*.crt %USERPROFILE%\Projects\*.pem %USERPROFILE%\Projects\*.key"
+                item["tool"] = "dir"
             elif tid == "MDP_ACTIVE_L2_L3_ROUTE_PROBE":
                 cmd_inst = f"route print -4 & ping -n 2 -w 1000 {resolved_target}"
                 item["tool"] = "ping"
-            elif tid == "MDP_PRIV_ESC_LOCAL_ENUM":
+            elif tid in ("MDP_PRIV_ESC_LOCAL_ENUM", "MDP_PRIV_ESC_TTY_AND_SUID"):
                 cmd_inst = "whoami /all & systeminfo"
                 item["tool"] = "whoami"
             elif tid == "MDP_LATERAL_CROSS_SUBNET_ROUTE":

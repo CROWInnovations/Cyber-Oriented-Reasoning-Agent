@@ -66,7 +66,7 @@ export interface ModelItem {
   id: string;
   name: string;
   filename: string;
-  provider: 'llama-server' | 'ollama';
+  provider: 'llama-server';
   role: string;
   vram_est: string;
   installed_on_disk: boolean;

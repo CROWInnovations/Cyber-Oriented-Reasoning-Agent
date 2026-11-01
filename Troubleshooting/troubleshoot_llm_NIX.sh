@@ -56,9 +56,9 @@ if [[ -f /proc/meminfo ]]; then
 fi
 
 # 3. Check NVIDIA GPU VRAM & Temperature
-if command -v nvidia-smi >/dev/null 2>&1; then
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   GPU_LINE=$(nvidia-smi --query-gpu=name,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)
-  if [[ -n "$GPU_LINE" ]]; then
+  if [[ -n "$GPU_LINE" && "${GPU_LINE,,}" != *"failed"* ]]; then
     G_NAME=$(printf '%s' "$GPU_LINE" | awk -F', ' '{print $1}')
     G_USED=$(printf '%s' "$GPU_LINE" | awk -F', ' '{print int($2)}')
     G_TOTAL=$(printf '%s' "$GPU_LINE" | awk -F', ' '{print int($3)}')
@@ -67,7 +67,7 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     printf '  \033[1;32m[OK]\033[0m      GPU Detected: %s | VRAM: %d / %d MiB (%d%%) | Temp: %dC\n' "$G_NAME" "$G_USED" "$G_TOTAL" "$G_PCT" "$G_TEMP"
   fi
 else
-  printf '  \033[1;36m[INFO]\033[0m    No `nvidia-smi` binary found (CPU-only mode).\n'
+  printf '  \033[1;36m[INFO]\033[0m    No active NVIDIA GPU driver detected (CPU-only mode).\n'
 fi
 
 # 4. Check Serial `/dev/ttyUSB*` / `dialout` group permissions if serial device exists
