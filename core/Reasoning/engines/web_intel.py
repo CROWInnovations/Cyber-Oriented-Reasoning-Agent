@@ -685,19 +685,21 @@ def _save_web_report_to_project(
     summary: str,
     report_body: str,
     tags: List[str],
+    subdir: str = "notes",
 ) -> str:
-    """Persist web search or webpage report into `Projects/<project>/targets/` and update `memory.md`."""
+    """Persist web search notes into `Projects/<project>/notes/` and fetched webpages/feeds into `Projects/<project>/downloads/`."""
     try:
         proj_dir = get_active_project_dir(project_slug)
-        targets_dir = proj_dir / "targets"
-        targets_dir.mkdir(parents=True, exist_ok=True)
+        clean_sub = subdir if subdir in ("notes", "downloads", "artifacts", "assets", "targets") else "notes"
+        out_dir = proj_dir / clean_sub
+        out_dir.mkdir(parents=True, exist_ok=True)
         safe_slug = slugify(slug_name)[:64] or "web_intel"
-        note_path = targets_dir / f"{safe_slug}.md"
+        note_path = out_dir / f"{safe_slug}.md"
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
         frontmatter = (
             "---\n"
             f"title: {title}\n"
-            "category: targets\n"
+            f"category: {clean_sub}\n"
             f"project: {proj_dir.name}\n"
             f"summary: {summary}\n"
             f"tags: [{', '.join(tags)}]\n"
@@ -708,13 +710,13 @@ def _save_web_report_to_project(
             frontmatter
             + f"# {title}\n\n"
             + f"> **Summary:** {summary}  \n"
-            + f"> **Project Workspace:** `Projects/{proj_dir.name}/` | **Updated:** `{now_str}`\n\n"
+            + f"> **Project Workspace:** `Projects/{proj_dir.name}/{clean_sub}/` | **Updated:** `{now_str}`\n\n"
             + report_body.strip()
             + "\n"
         )
         note_path.write_text(full_md, encoding="utf-8", errors="replace")
-        update_project_memory_index(proj_dir, f"targets/{safe_slug}", summary, tags)
-        return f"Projects/{proj_dir.name}/targets/{safe_slug}.md"
+        update_project_memory_index(proj_dir, f"{clean_sub}/{safe_slug}", summary, tags)
+        return f"Projects/{proj_dir.name}/{clean_sub}/{safe_slug}.md"
     except Exception:
         return ""
 
@@ -1214,13 +1216,23 @@ def execute_tier1_fetch_webpage(
                 pretty_json = json.dumps(parsed_json, indent=2)
                 report_lines.append(f"\n### JSON Payload (`{len(pretty_json)}` chars):\n```json\n{pretty_json[:max_chars]}\n```")
             full_report = "\n".join(report_lines)
+            page_slug = f"page_{slugify(host_only)}_{slugify(parsed.path or 'index')[:30]}"
+            try:
+                proj_dir_dl = get_active_project_dir(project_slug) / "downloads"
+                proj_dir_dl.mkdir(parents=True, exist_ok=True)
+                (proj_dir_dl / f"{page_slug}.json").write_text(
+                    json.dumps(parsed_json, indent=2), encoding="utf-8", errors="replace"
+                )
+            except Exception:
+                pass
             saved_p = _save_web_report_to_project(
                 project_slug=project_slug,
-                slug_name=f"page_{slugify(host_only)}_{slugify(parsed.path or 'index')[:30]}",
+                slug_name=page_slug,
                 title=f"JSON Endpoint: {final_url[:65]}",
                 summary=f"Fetched JSON from {final_url} (HTTP {status_code})",
                 report_body=full_report,
                 tags=["webpage", "json", "tier1", slugify(host_only)],
+                subdir="downloads",
             )
             if saved_p:
                 full_report += f"\n\n[Saved to Project Workspace]: `{saved_p}`"
@@ -1282,7 +1294,7 @@ def execute_tier1_fetch_webpage(
             half = max_chars // 2
             trimmed_md = (
                 md_body[: half + 800]
-                + f"\n\n... [{len(md_body) - max_chars} middle chars archived in project targets note; head+tail preserved] ...\n\n"
+                + f"\n\n... [{len(md_body) - max_chars} middle chars archived in project downloads note; head+tail preserved] ...\n\n"
                 + md_body[-(half - 800) :]
             )
         else:
@@ -1298,7 +1310,7 @@ def execute_tier1_fetch_webpage(
         for lnk in parsed_doc["links"][:15]:
             report_lines.append(f"- {lnk}")
 
-    # Save full un-truncated report to `Projects/<project>/targets/`
+    # Save full un-truncated report to `Projects/<project>/downloads/`
     full_untruncated_report = "\n".join(report_lines[:6]) + f"\n\n### Full Extracted Page Content:\n{md_body}\n"
     saved_p = _save_web_report_to_project(
         project_slug=project_slug,
@@ -1307,6 +1319,7 @@ def execute_tier1_fetch_webpage(
         summary=f"Fetched {final_url} (HTTP {status_code}, {len(md_body)} chars clean Markdown)",
         report_body=full_untruncated_report,
         tags=["webpage", "tier1", slugify(host_only)],
+        subdir="downloads",
     )
 
     llm_digest = "\n".join(report_lines)

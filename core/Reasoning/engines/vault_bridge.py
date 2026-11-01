@@ -236,7 +236,7 @@ def get_active_project_dir(project_name: str = "") -> Path:
         # No user project selected or created yet; keep scratch state outside `Projects/`
         slug = "unassigned"
         proj_dir = DATA_DIR / "sessions" / "_unassigned_workspace"
-    for sub in ("Files", "downloads", "artifacts", "targets", "notes", "reasoning", "shadow_archive"):
+    for sub in ("Files", "downloads", "artifacts", "assets", "targets", "notes", "reasoning", "reports", "shadow_archive"):
         (proj_dir / sub).mkdir(parents=True, exist_ok=True)
     mem_file = proj_dir / "memory.md"
     if not mem_file.exists():
