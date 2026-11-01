@@ -167,8 +167,8 @@ def resolve_monotonic_osi_stage(
         return candidate_stage, False
 
     cand_rank = OSI_STAGE_RANK.get(candidate_stage, 0)
-    if has_port_fluent and cand_rank < OSI_STAGE_RANK["STAGE_4_BYPASS_ICMP_PORT_SCAN"]:
-        if candidate_stage not in ("STAGE_2_OOB_SERIAL_UNLOCK", "STAGE_3_CROSS_SUBNET_L3_ROUTE"):
+    if has_port_fluent and cand_rank < OSI_STAGE_RANK["STAGE_5_L7_AUTH_OR_HEADER_BYPASS"]:
+        if candidate_stage != "STAGE_2_OOB_SERIAL_UNLOCK":
             return "STAGE_6_L7_SERVICE_GOAL_VERIFY", True
     if has_route_fluent and cand_rank < OSI_STAGE_RANK["STAGE_4_BYPASS_ICMP_PORT_SCAN"]:
         if candidate_stage != "STAGE_2_OOB_SERIAL_UNLOCK":
@@ -456,7 +456,10 @@ def encode_symbolic_rl_state(
         f_vec[5] = 1.0
     if has_port_fluent:
         f_vec[8] = 1.0
-    if topo.get("serial_devices") and ctx.get("has_serial_oob", True) and (f_vec[7] >= 0.5 or bool(re.search(r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|console)\b", p_low))):
+        if not ctx.get("has_concrete_secondary_ip") and not ev.get("icmp_ping_fails") and not ev.get("curl_exit_28_timeout"):
+            f_vec[3] = 1.0
+            f_vec[4] = 0.0
+    if topo.get("serial_devices") and ctx.get("has_serial_oob", True) and (f_vec[7] >= 0.5 or bool(re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low))):
         f_vec[9] = 1.0
 
     cluster_info = quantize_state_to_cluster(f_vec)

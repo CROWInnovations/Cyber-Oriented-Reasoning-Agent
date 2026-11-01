@@ -261,9 +261,15 @@ def run_dempster_shafer_reasoning(
             )
         ):
             ev.setdefault("http_401_or_403_or_tls_alert", True)
-        if re.search(r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|console)\b", p_low):
+        if re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low):
             ev.setdefault("serial_console_oob_available", True)
-        if any(k in p_low for k in ("privesc", "privilege escalation", "suid", "sudoers", "capabilities", "www-data", "active directory", "ldap", "smb")):
+        if any(
+            k in p_low
+            for k in (
+                "privesc", "privilege escalation", "suid", "sudoers", "getcap", "capsh", "cap_setuid",
+                "linux capabilities", "www-data", "active directory", "ldap", "smb",
+            )
+        ):
             ev.setdefault("post_exploitation_shell_active", True)
 
         # Deduplicate equivalent canonical keys so aliases are not double-counted

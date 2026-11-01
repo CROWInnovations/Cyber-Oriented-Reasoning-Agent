@@ -1,10 +1,10 @@
 {
   "major_cli": 5,
-  "engine_rev": 21,
+  "engine_rev": 22,
   "patch_rev": 19,
-  "version": "5.21.19",
-  "updated_at": "2026-11-01 02:12:01",
-  "engine_tree_sha256": "8273e7c017aeb1848888c448d535a673a55b01fee899f417bda5a7914e5f72f2",
+  "version": "5.22.19",
+  "updated_at": "2026-11-01 18:08:06",
+  "engine_tree_sha256": "34a3a5fa623e8bb7c852a11b7abbc8dd55a9ec571664143898689476e1b15ba8",
   "patch_tree_sha256": "e57b43e375a42d6bf721017abb1c39d7785f2ea3bb66af1257e2c412691d2d09",
-  "last_update_reason": "LOLBINS Reasoning Vault (CROWInnovations/LOLBAS), NIST NVD 2.0 & OpenCVE intelligence, and web_intel.py fixes"
+  "last_update_reason": "v5.22.19: Enforce AUTO-RUN & CONFIRM tool permissions, fix short-reply context truncation, add exploit_callback_or_script_failure Bayesian profile, and recover truncated write_project_file tool calls"
 }

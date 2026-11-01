@@ -134,8 +134,8 @@ _WINDOWS_INTERNALS_INTENT_RE = re.compile(
     re.I,
 )
 _CYBER_INTEL_INTENT_RE = re.compile(
-    r"\b(?:cve(?:-\d{4}-\d{4,7})?|nvd|cisa|kev|epss|cvss|osv|ghsa|exploit[\s_\-]*db|nuclei|gtfobins|"
-    r"lolbas|loldrivers|loobins|shodan|internetdb|psirt|fortiguard|msrc|malwarebazaar|threatfox|"
+    r"\b(?:cves?|cve-\d{4}-\d{4,7}|nvd|cisa|kev|epss|cvss|osv|ghsa|exploit[\s_\-]*db|nuclei|gtfobins|"
+    r"lolbas|loldrivers|loobins|shodan|internetdb|psirt|fortiguard|fortios|fortigate|msrc|malwarebazaar|threatfox|"
     r"urlhaus|feodotracker|greynoise|zero[\s_\-]*day|0day|vulnerability|vulnerabilities|advisory|advisories|"
     r"threat[\s_\-]*intel|threat[\s_\-]*intelligence|cyber[\s_\-]*security[\s_\-]*tools|web_search|fetch_webpage)\b",
     re.I,
@@ -173,7 +173,7 @@ def infer_team_role_from_query(query: str) -> str:
         hunt_hits += 4
     if any(k in q_low for k in ("lolbin", "lolbins", "lolbas", "lolscript", "lollib", "living off the land", "crowinnovations/lolbas")):
         lolbins_hits += 6
-    if any(k in q_low for k in ("cve-", "cve ", "cisa kev", "nvd", "epss", "gtfobins", "loldrivers", "shodan", "internetdb", "exploit-db", "psirt", "fortiguard")):
+    if any(k in q_low for k in ("cve-", "cve ", "cves", "cve's", "cisa kev", "nvd", "epss", "gtfobins", "loldrivers", "shodan", "internetdb", "exploit-db", "psirt", "fortiguard", "fortios")):
         intel_hits += 5
     if any(k in q_low for k in ("reverse engineer", "reverse_engineer", "revengai", "reveng.ai", "reait")):
         reveng_hits += 5
@@ -654,6 +654,20 @@ def run_associative_vault_reasoning(
         pb_slug = role_to_playbook.get(inferred_team_role, f"{inferred_team_role}_strategy_playbook")
         target_team_note = f"note:reasoning/{pb_slug}" if inferred_team_role else ""
 
+        q_low_os = query.lower()
+        explicit_win = bool(
+            re.search(
+                r"\b(?:windows|powershell|cmd\.exe|sysinternals|active\s+directory|ntfs|evtx|lsass|ntoskrnl|wmic|netsh|ipconfig|lolbas|lolbins)\b",
+                q_low_os,
+            )
+        )
+        explicit_lin = bool(
+            re.search(
+                r"\b(?:linux|bash|fortios|fortigate|iptables|nftables|iproute2|sysctl|systemd|journalctl|gtfobins|/dev/|eth\d+|wlan\d+)\b",
+                q_low_os,
+            )
+        )
+
         for idx, node, label_low, summary_low, cat_boost, label_tokens, summary_tokens in search_index:
             score = 0.0
             label_clean = label_low.lstrip("#")
@@ -675,6 +689,20 @@ def run_associative_vault_reasoning(
                     score += 18.0 * cat_boost
                 elif node.endswith("_strategy_playbook"):
                     score *= 0.05
+            if score > 0.0 and node in note_metadata:
+                note_os = str(note_metadata[node].get("os_platform") or "cross-platform").lower()
+                is_win_only_note = (
+                    ("windows" in note_os and "linux" not in note_os and "cross" not in note_os)
+                    or ("windows" in label_low and "linux" not in label_low)
+                )
+                is_lin_only_note = (
+                    ("linux" in note_os and "windows" not in note_os and "cross" not in note_os)
+                    or ("linux" in label_low and "windows" not in label_low)
+                )
+                if explicit_lin and not explicit_win and is_win_only_note:
+                    score *= 0.12
+                elif explicit_win and not explicit_lin and is_lin_only_note:
+                    score *= 0.12
             if score > 0.0:
                 pers_vec[idx] = score
                 matched_seed_nodes.append(node)

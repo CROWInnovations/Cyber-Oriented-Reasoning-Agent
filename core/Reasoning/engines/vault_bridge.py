@@ -1122,9 +1122,26 @@ def detect_host_network_context(force_refresh: bool = False) -> Dict[str, Any]:
     local_ips: List[str] = []
     interfaces: List[str] = []
     serial_ports: List[str] = []
+    default_gateway: str = ""
 
     if os_family == "linux":
         if iso_level != "white":
+            try:
+                proc_rt = subprocess.run(
+                    ["ip", "-4", "route", "show", "default"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1.2,
+                    check=False,
+                )
+                if proc_rt.returncode == 0 and proc_rt.stdout:
+                    m_gw = re.search(r"\bdefault\s+via\s+(\d+\.\d+\.\d+\.\d+)\b", proc_rt.stdout)
+                    if m_gw:
+                        default_gateway = m_gw.group(1)
+            except Exception:
+                pass
             try:
                 proc = subprocess.run(
                     ["ip", "-o", "-4", "addr", "show"],
@@ -1254,6 +1271,7 @@ def detect_host_network_context(force_refresh: bool = False) -> Dict[str, Any]:
         "os_family": os_family,
         "local_subnets": local_subnets,
         "local_ips": local_ips,
+        "default_gateway": default_gateway,
         "interfaces": interfaces,
         "primary_interface": interfaces[0] if interfaces else ("Ethernet" if os_family == "windows" else "eth0"),
         "serial_ports": serial_ports,
@@ -1416,25 +1434,28 @@ def resolve_problem_targets(
     _collect_from_text(problem_text, is_problem_body=True)
     had_explicit_or_prompt_ips = len(discovered_ips) >= 2 or bool((secondary_ip or "").strip())
 
-    # If no explicit IP was in the prompt, check Active Project memory.md and relentless_ledger.json first
+    # If no explicit IP was in the prompt, check Active Project memory.md first (and relentless_ledger.json only if matching active_proj)
     if not discovered_ips:
         active_proj = os.environ.get("CORA_ACTIVE_PROJECT", "").strip()
-        ledger_file = DATA_DIR / "sessions" / "relentless_ledger.json"
-        if ledger_file.is_file():
-            try:
-                ldata = json.loads(ledger_file.read_text(encoding="utf-8"))
-                if not active_proj:
-                    active_proj = str(ldata.get("active_project") or "").strip()
-                _collect_from_text(str(ldata.get("active_goal") or ""))
-                for att in reversed(ldata.get("attempts") or []):
-                    _collect_from_text(str(att.get("target_or_cmd") or ""))
-            except Exception:
-                pass
         if active_proj:
             proj_mem = PROJECTS_DIR / active_proj / "memory.md"
             if proj_mem.is_file():
                 try:
-                    _collect_from_text(proj_mem.read_text(encoding="utf-8", errors="replace")[:4000])
+                    mem_text = proj_mem.read_text(encoding="utf-8", errors="replace")
+                    # Scan most recent memory entries (tail) first, then header
+                    _collect_from_text(mem_text[-4000:] + "\n" + mem_text[:2000])
+                except Exception:
+                    pass
+        if not discovered_ips:
+            ledger_file = DATA_DIR / "sessions" / "relentless_ledger.json"
+            if ledger_file.is_file():
+                try:
+                    ldata = json.loads(ledger_file.read_text(encoding="utf-8"))
+                    ledger_proj = str(ldata.get("active_project") or "").strip()
+                    if not active_proj or not ledger_proj or ledger_proj.lower() == active_proj.lower():
+                        _collect_from_text(str(ldata.get("active_goal") or ""))
+                        for att in reversed(ldata.get("attempts") or []):
+                            _collect_from_text(str(att.get("target_or_cmd") or ""))
                 except Exception:
                     pass
 
@@ -1522,7 +1543,7 @@ def resolve_problem_targets(
     has_serial_keywords = bool(
         serial_match
         or re.search(
-            r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|out-of-band|baud|console)\b",
+            r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart|link))\b",
             prob_low,
         )
     )
@@ -1540,12 +1561,22 @@ def resolve_problem_targets(
                 "mtls", "client.crt", "https://", "http://", "injection", "endpoint", "rest api",
                 "graphql", "cookie", "jwt", "network is unreachable", "no route to host",
                 "cross-subnet", "active directory", "ldap", "smb", "suid", "sudoers", "capabilities",
-                "privesc", "privilege escalation", "www-data",
+                "privesc", "privilege escalation", "www-data", "cve", "fortios", "fortigate", "firewall",
+                "exploit", "callback", "call back", "reverse shell", "python script", "files directory",
             )
         )
         and not explicit_serial_intent
     )
     has_serial = bool(explicit_serial_intent or (host_ctx["serial_ports"] and not non_serial_domain_intent))
+
+    if via_gateway_ips_in_prompt:
+        resolved_gw_ip = via_gateway_ips_in_prompt[0]
+    elif secondary != "<REMOTE_HOST>" and primary != "<TARGET_IP>":
+        resolved_gw_ip = primary
+    elif host_ctx.get("default_gateway"):
+        resolved_gw_ip = str(host_ctx["default_gateway"])
+    else:
+        resolved_gw_ip = primary if (primary != "<TARGET_IP>" and remote_subnet == "<REMOTE_SUBNET>") else "<GATEWAY_IP>"
 
     return {
         "os_family": os_family,
@@ -1554,7 +1585,8 @@ def resolve_problem_targets(
         "target_ip": primary,
         "secondary_ip": secondary,
         "secondary_target_ip": secondary if secondary != "<REMOTE_HOST>" else "",
-        "gateway_ip": primary if primary != "<TARGET_IP>" else "<GATEWAY_IP>",
+        "gateway_ip": resolved_gw_ip,
+        "default_gateway": host_ctx.get("default_gateway", ""),
         "remote_subnet": remote_subnet,
         "local_subnets": eff_local_subnets,
         "local_subnet": local_subnet_str,

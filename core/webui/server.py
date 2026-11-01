@@ -2491,14 +2491,14 @@ WEBUI_AGENT_TOOLS: List[Dict[str, Any]] = [
             "name": "write_project_file",
             "description": (
                 "Create or update a script, configuration, or output file inside the active project's local `Files` directory "
-                "(`Projects/<project>/Files/<filename>`)."
+                "(`Projects/<project>/Files/<filename>`). IMPORTANT: Always place `filename` FIRST before `content` in your JSON arguments."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filename": {
                         "type": "string",
-                        "description": "File name or relative path inside `Projects/<project>/Files/` (e.g. 'helper.py' or 'Files/output.txt').",
+                        "description": "File name or relative path inside `Projects/<project>/Files/` (e.g. 'helper.py' or 'Files/output.txt'). Output this field FIRST.",
                     },
                     "content": {
                         "type": "string",
@@ -2750,7 +2750,16 @@ def _execute_webui_write_project_file(
         elif clean_name.lower().startswith("files/"):
             clean_name = clean_name[6:]
         if not clean_name or ".." in clean_name.split("/"):
-            return {"executed": False, "blocked": True, "reason": f"Invalid target filename: {filename_arg}"}
+            return {
+                "executed": False,
+                "blocked": False,
+                "exit_code": 1,
+                "output": (
+                    f"Error: Missing or invalid target filename (`{filename_arg}`). "
+                    "When calling `write_project_file`, always place `\"filename\"` FIRST in the JSON arguments "
+                    "(e.g. `{\"filename\": \"Files/CVE-2024-21762_Exploit.py\", \"content\": \"...\"}`)."
+                ),
+            }
         target = (files_dir / clean_name).resolve()
         if not str(target).startswith(str(files_dir)):
             return {"executed": False, "blocked": True, "reason": "Target file must reside inside `Projects/<project>/Files/`."}
@@ -2768,19 +2777,82 @@ def _execute_webui_write_project_file(
         return {"executed": False, "blocked": False, "exit_code": 1, "output": f"Error writing `{filename_arg}`: {exc}"}
 
 
-def _extract_xml_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """Parse `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks if emitted inline by Qwen models."""
-    calls: List[Dict[str, Any]] = []
-    for idx, m in enumerate(re.finditer(r"(?is)<tool_call>\s*(\{.*?\})\s*</tool_call>", text or "")):
-        try:
-            obj = json.loads(m.group(1))
-            fn_name = str(obj.get("name") or "")
-            fn_args = obj.get("arguments") or {}
-            if isinstance(fn_args, str):
+def _recover_tool_args(
+    fn_name: str,
+    raw_args: Any,
+    active_proj: str = "",
+    query_text: str = "",
+) -> Dict[str, Any]:
+    """
+    Robustly parse tool call arguments even when Qwen/llama-server emits slightly malformed
+    or token-truncated JSON (e.g., when writing a multi-line script via `write_project_file`).
+    """
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    raw_str = str(raw_args or "{}").strip()
+    try:
+        parsed = json.loads(raw_str)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    recovered: Dict[str, Any] = {}
+    for key in ("filename", "path", "file", "file_path", "target", "command", "query", "keyword", "url", "subdir", "note", "site", "query_filter"):
+        m = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
+        if m:
+            try:
+                recovered[key] = json.loads(f'"{m.group(1)}"')
+            except Exception:
+                recovered[key] = m.group(1)
+
+    if fn_name == "write_project_file":
+        m_content = re.search(r'"content"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
+        if m_content:
+            try:
+                recovered["content"] = json.loads(f'"{m_content.group(1)}"')
+            except Exception:
+                recovered["content"] = m_content.group(1).replace("\\n", "\n").replace('\\"', '"')
+        else:
+            # Handle truncated content string at the end of raw_str
+            m_trunc = re.search(r'"content"\s*:\s*"(.*)$', raw_str, flags=re.S)
+            if m_trunc:
+                tail = re.sub(r'"\s*\}\s*$', "", m_trunc.group(1))
+                recovered["content"] = tail.replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
+        if not (recovered.get("filename") or recovered.get("path") or recovered.get("file")):
+            # Check if a single file in Projects/<active_proj>/Files/ was referenced in query_text
+            m_qfile = re.search(r"\b([A-Za-z0-9_.\-]+\.(?:py|sh|ps1|txt|json|yaml|yml|md|c|cpp|rs))\b", query_text or "")
+            if m_qfile:
+                recovered["filename"] = m_qfile.group(1)
+            elif active_proj:
                 try:
-                    fn_args = json.loads(fn_args)
+                    files_dir = ensure_project_structure(active_proj) / "Files"
+                    py_files = [f.name for f in files_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+                    if len(py_files) == 1:
+                        recovered["filename"] = py_files[0]
                 except Exception:
-                    fn_args = {"command": fn_args}
+                    pass
+
+    if not recovered:
+        recovered = {"command": raw_str}
+    return recovered
+
+
+def _extract_xml_tool_calls(text: str) -> List[Dict[str, Any]]:
+    """Parse `<tool_call>...</tool_call>` blocks (both JSON and Qwen3.5 `<function=...><parameter=...>` XML formats)."""
+    calls: List[Dict[str, Any]] = []
+    for idx, m in enumerate(re.finditer(r"(?is)<tool_call>\s*(.*?)\s*</tool_call>", text or "")):
+        inner = m.group(1).strip()
+        if not inner:
+            continue
+        # Format A: Qwen3.5 XML `<function=name><parameter=k>v</parameter></function>`
+        fn_xml = re.search(r"(?is)<function=([a-zA-Z0-9_.\-]+)>\s*(.*?)\s*</function>", inner)
+        if fn_xml:
+            fn_name = fn_xml.group(1).strip()
+            fn_body = fn_xml.group(2)
+            fn_args: Dict[str, Any] = {}
+            for pm in re.finditer(r"(?is)<parameter=([a-zA-Z0-9_.\-]+)>\s*(.*?)\s*</parameter>", fn_body):
+                fn_args[pm.group(1).strip()] = pm.group(2)
             if fn_name:
                 calls.append(
                     {
@@ -2789,6 +2861,29 @@ def _extract_xml_tool_calls(text: str) -> List[Dict[str, Any]]:
                         "function": {
                             "name": fn_name,
                             "arguments": json.dumps(fn_args),
+                        },
+                    }
+                )
+            continue
+        # Format B: JSON `{"name": ..., "arguments": ...}`
+        try:
+            obj = json.loads(inner)
+            fn_name = str(obj.get("name") or "")
+            fn_args_raw = obj.get("arguments") or {}
+            if isinstance(fn_args_raw, str):
+                fn_args_dict = _recover_tool_args(fn_name, fn_args_raw)
+            elif isinstance(fn_args_raw, dict):
+                fn_args_dict = fn_args_raw
+            else:
+                fn_args_dict = {"command": str(fn_args_raw)}
+            if fn_name:
+                calls.append(
+                    {
+                        "id": f"call_xml_{idx}",
+                        "type": "function",
+                        "function": {
+                            "name": fn_name,
+                            "arguments": json.dumps(fn_args_dict),
                         },
                     }
                 )
@@ -2914,13 +3009,8 @@ def cancel_all_active_executions() -> Dict[str, Any]:
         except Exception:
             continue
 
-    # Disarm autonomous Relentless multi-wave pursuit if active so no further waves fire
-    try:
-        cfg_cur = get_all_settings()
-        if cfg_cur.get("relentless_mode") == "true":
-            update_settings_dict({"relentless_mode": "false"})
-    except Exception:
-        pass
+    # Note: Do NOT permanently overwrite `relentless_mode="false"` in SQLite here;
+    # incrementing `_EXEC_GENERATION` above already halts the active turn and all in-flight waves immediately.
 
     return {
         "ok": True,
@@ -2935,7 +3025,7 @@ def cancel_all_active_executions() -> Dict[str, Any]:
 def _post_json_cancellable(
     url: str,
     payload_bytes: bytes,
-    timeout: float = 240.0,
+    timeout: float = 900.0,
     exec_gen: Optional[int] = None,
 ) -> Tuple[int, bytes]:
     """
@@ -3405,7 +3495,7 @@ def _call_llm_backend(
 
     cur_messages = _compact_messages_for_llama_context(list(messages), max_chars=14000, force_flatten=False)
     include_tools_flag = bool(tools)
-    req_max_toks = 2560
+    req_max_toks = 2800 if include_tools_flag else 2800
     cur_thinking_flag = bool(thinking_enabled)
     for attempt in range(4):
         if _is_execution_cancelled(exec_gen):
@@ -3418,7 +3508,7 @@ def _call_llm_backend(
                 think_flag=cur_thinking_flag,
             )
             status_code, body_bytes = _post_json_cancellable(
-                chat_url, payload_bytes, timeout=240.0, exec_gen=exec_gen
+                chat_url, payload_bytes, timeout=900.0, exec_gen=exec_gen
             )
             body_text = body_bytes.decode("utf-8", errors="replace")
             if status_code >= 400:
@@ -3440,7 +3530,7 @@ def _call_llm_backend(
                         max_chars=target_chars,
                         force_flatten=True,
                     )
-                    req_max_toks = 1536 if attempt == 0 else 1024
+                    req_max_toks = 2048 if attempt == 0 else 1280
                     continue
                 return {
                     "online": False,
@@ -3460,13 +3550,29 @@ def _call_llm_backend(
             res = _split_thinking_and_reply(content, provider="llama-server", model=effective_alias)
             if reasoning_field and not res["thinking"]:
                 res["thinking"] = reasoning_field.strip()
+
+            def _has_truncated_tool_call(tcs: List[Dict[str, Any]]) -> bool:
+                for tc_item in tcs or []:
+                    fn_o = (tc_item or {}).get("function") or {}
+                    a_raw = fn_o.get("arguments")
+                    if isinstance(a_raw, str):
+                        try:
+                            d = json.loads(a_raw)
+                            if fn_o.get("name") == "write_project_file" and not (d.get("filename") or d.get("path")):
+                                return True
+                        except Exception:
+                            return True
+                return False
+
             # If the reasoning model exhausted `max_tokens` inside `<think>` (`reasoning_content`) before emitting
-            # its `content` or `tool_calls`, immediately re-invoke once with `enable_thinking=False` while preserving
-            # its partial thought summary so the turn never terminates early with empty content!
+            # its `content` or `tool_calls` (or truncated a tool_call mid-JSON), immediately re-invoke once with
+            # `enable_thinking=False` while preserving its partial thought summary!
             if (
                 cur_thinking_flag
-                and not res["content"].strip()
-                and not tool_calls
+                and (
+                    (not res["content"].strip() and not tool_calls)
+                    or (finish_reason == "length" and _has_truncated_tool_call(tool_calls))
+                )
                 and res.get("thinking")
                 and (finish_reason == "length" or len(res["thinking"]) > 200)
                 and not _is_execution_cancelled(exec_gen)
@@ -3479,17 +3585,17 @@ def _call_llm_backend(
                     last_u["content"] = (
                         str(last_u.get("content") or "")
                         + f"\n\n[Internal Thought Summary Already Computed]: {saved_thinking[-900:]}\n"
-                        "Now immediately emit your next tool call (`web_search`, `fetch_webpage`, `scan_target`, `run_shell_command`) or write your complete final response."
+                        "Now immediately emit your complete tool call (if calling `write_project_file`, place `\"filename\"` FIRST in JSON arguments) or write your complete final response."
                     )
                     recovery_msgs[-1] = last_u
                 rec_payload = _build_payload(
                     recovery_msgs,
-                    max_toks=2560,
+                    max_toks=3200,
                     include_tools=include_tools_flag,
                     think_flag=False,
                 )
                 r_code, r_bytes = _post_json_cancellable(
-                    chat_url, rec_payload, timeout=180.0, exec_gen=exec_gen
+                    chat_url, rec_payload, timeout=600.0, exec_gen=exec_gen
                 )
                 if r_code < 400:
                     r_raw = json.loads(r_bytes.decode("utf-8", errors="replace"))
@@ -5481,8 +5587,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         query_text = (
             f"[Relentless Autonomous Goal Pursuit (Max Waves={'UNLIMITED' if cur_rel_max == 0 else cur_rel_max})]: {active_goal}\n"
             "Execute multi-step reconnaissance and live intelligence tools (`scan_target`, `web_search`, `fetch_webpage`, `run_shell_command`), "
-            "pivot automatically across capabilities without repeating identical tool calls, and deliver a complete, verified resolution "
-            "(including exact device/firmware identification, applicable CVEs with CVSS scores, and copy-pasteable Linux CLI exploit/verification scripts) "
+            "transition automatically across tools without repeating identical calls, and deliver a complete, verified resolution "
+            "(including exact device/firmware identification, applicable CVEs with CVSS scores, and copy-pasteable Linux CLI verification scripts) "
             "for EVERY requirement of this goal."
         )
 
@@ -5746,14 +5852,132 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         if _is_execution_cancelled(exec_gen) or cmd_res.get("cancelled"):
             return _build_cancelled_response()
 
+    # Load recent conversation history FIRST (preserving both head and tail of long assistant messages
+    # so numbered options and confirmation prompts at the bottom of previous turns are never sliced off!)
+    history_msgs: List[Dict[str, str]] = []
+    last_assistant_full = ""
+    last_user_full = ""
+    try:
+        with get_db_conn() as conn:
+            recent_rows = conn.execute(
+                "SELECT role, content FROM messages WHERE project_slug = ? ORDER BY id DESC LIMIT 6",
+                (active_proj,),
+            ).fetchall()
+        for r in reversed(recent_rows):
+            r_role = str(r["role"] or "user")
+            r_content = str(r["content"] or "").strip()
+            if r_role not in ("user", "assistant") or not r_content:
+                continue
+            if r_content.upper() == "ONLINE" or r_content.startswith("Reply with the single word ONLINE"):
+                continue
+            if r_content.startswith("### 15-Engine Neuro-Symbolic Synthesis") or r_content.startswith("### C.O.R.A. Tactical Assessment"):
+                continue
+            if r_content.endswith("extract the version string:"):
+                continue
+            if r_role == "assistant":
+                last_assistant_full = r_content
+                if len(r_content) > 2800:
+                    compacted_hist = r_content[:1100] + "\n...[middle omitted]...\n" + r_content[-1700:]
+                else:
+                    compacted_hist = r_content
+            else:
+                last_user_full = r_content
+                compacted_hist = r_content[:1600]
+            # Maintain strict user/assistant alternation for Jinja chat templates
+            if history_msgs and history_msgs[-1]["role"] == r_role:
+                history_msgs[-1]["content"] = compacted_hist
+            else:
+                history_msgs.append({"role": r_role, "content": compacted_hist})
+        if history_msgs and history_msgs[0]["role"] == "assistant":
+            history_msgs = history_msgs[1:]
+        if history_msgs and history_msgs[-1]["role"] == "user":
+            history_msgs = history_msgs[:-1]
+    except Exception:
+        history_msgs = []
+
+    # Detect short confirmation replies ("yes, confirm", "yes", "proceed") or numbered option replies ("1", "2", "3")
+    q_stripped = query_text.strip()
+    is_confirm_reply = bool(
+        re.match(
+            r"^(?:yes|y|yeah|yep|sure|ok|okay|confirm|confirmed|yes[,\s]+confirm(?:ed)?|proceed|go\s+ahead|do\s+it|run\s+it|execute(?:\s+it)?|approve|approved)[.!?\s]*$",
+            q_stripped,
+            flags=re.I,
+        )
+    )
+    m_num_choice = re.match(r"^(?:option\s+|choice\s+|step\s+|item\s+|#)?([1-9])[\s.)\]:\-]*$", q_stripped, flags=re.I)
+    is_numbered_reply = bool(m_num_choice)
+    selected_option_num = int(m_num_choice.group(1)) if m_num_choice else 0
+    is_short_followup = is_confirm_reply or is_numbered_reply
+
+    pending_confirm_key = f"pending_confirm_tools_{active_proj}"
+    pending_confirm_tools: List[Dict[str, Any]] = []
+    raw_pending_json = cfg.get(pending_confirm_key) or ""
+    if raw_pending_json:
+        try:
+            loaded_p = json.loads(raw_pending_json)
+            if isinstance(loaded_p, list):
+                pending_confirm_tools = loaded_p
+        except Exception:
+            pending_confirm_tools = []
+
+    resolved_followup_action = ""
+    if is_numbered_reply and last_assistant_full:
+        # Search from the bottom of the last assistant message for the matching numbered item (e.g. "1. Execute...")
+        tail_search = last_assistant_full[-2200:]
+        pat_num = re.compile(
+            rf"(?:^|\n)\s*(?:\*\*|__)?{selected_option_num}[.)\]:]\s*(?:\*\*|__)?\s*([^\n]+(?:\n(?![ \t]*(?:\*\*|__)?[1-9][.)\]:]|\n)[^\n]+)*)",
+            flags=re.I,
+        )
+        matches_num = list(pat_num.finditer(tail_search))
+        if matches_num:
+            resolved_followup_action = re.sub(r"\s+", " ", matches_num[-1].group(1)).strip()
+    elif is_confirm_reply and last_assistant_full:
+        tail_lines = [ln.strip() for ln in last_assistant_full[-1400:].splitlines() if ln.strip()]
+        if tail_lines:
+            resolved_followup_action = " ".join(tail_lines[-4:])[:600]
+
+    effective_query_text = query_text
+    if is_short_followup:
+        context_parts = []
+        if last_user_full and len(last_user_full) > 6:
+            context_parts.append(f"Previous Operator Request: {last_user_full[:500]}")
+        if resolved_followup_action:
+            context_parts.append(f"Confirmed Action / Option #{selected_option_num or 1}: {resolved_followup_action}")
+        elif last_assistant_full:
+            context_parts.append(f"Previous Assistant Proposal: {last_assistant_full[-600:]}")
+        joined_ctx = " | ".join(context_parts)
+        effective_query_text = (
+            f"Operator replied `{query_text}` to confirm and execute: {joined_ctx}. "
+            "Execute this action immediately using the appropriate tools (`read_project_file`, `write_project_file`, `run_shell_command`, `scan_target`, `web_search`, `fetch_webpage`) "
+            "and return the live execution results without asking for confirmation again."
+        )
+
+    user_confirmed_this_turn = bool(
+        is_short_followup
+        or is_goal_pursuit
+        or relentless_waves_requested
+        or bool(req.execute_command)
+    )
+    effective_auto_run = bool(
+        str(perm_mode).lower() == "auto"
+        or mode_key == "berserker"
+        or user_confirmed_this_turn
+    )
+
     # Run 15-Engine Neuro-Symbolic Reasoning Pipeline
     reasoning_res: Dict[str, Any] = {}
     reasoning_guidance_block = ""
     if req.run_reasoning:
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
+        os.environ["CORA_ACTIVE_PROJECT"] = active_proj
         t_pipe = time.perf_counter()
-        problem_input = query_text or req.execute_command or active_goal or "System check"
+        problem_input = (
+            (active_goal if (is_goal_pursuit or relentless_waves_requested) and active_goal else effective_query_text)
+            or req.execute_command
+            or active_goal
+            or "System check"
+        )
         if cmd_res.get("output"):
             problem_input += "\n" + str(cmd_res.get("output"))[:1500]
         reasoning_res = await asyncio.to_thread(
@@ -5809,9 +6033,23 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     host_os_label = "Windows (PowerShell / CMD / Sysinternals)" if os.name == "nt" else "Linux (Bash / iproute2)"
     project_files_block = get_project_files_context_block(
         proj_dir=proj_dir,
-        query_text=query_text,
+        query_text=effective_query_text,
         attached_files=req.attached_files,
     )
+
+    if effective_auto_run:
+        perm_directive_line = (
+            "- Permission Policy: `AUTO-RUN` (Autonomous Tool Execution Active) — You are authorized and required to execute tools "
+            "(`read_project_file`, `write_project_file`, `run_shell_command`, `scan_target`, `web_search`, `fetch_webpage`) directly and autonomously "
+            "to fulfill the operator's request. NEVER stop to ask 'Would you like me to...', 'Please confirm if you want to proceed', or present a numbered "
+            "menu asking for permission to run a tool or script—call the tool yourself immediately!\n\n"
+        )
+    else:
+        perm_directive_line = (
+            "- Permission Policy: `CONFIRM` (Operator Confirmation Required for Active/Mutating Tools) — Passive local read tools "
+            "(`read_project_file`, `list_project_files_tool`, `vault_search`, `vault_read_note`) execute immediately; when an active/mutating tool "
+            "(`run_shell_command`, `write_project_file`, `scan_target`, `web_search`, `fetch_webpage`) is needed, emit the tool call so the server can queue it for operator confirmation.\n\n"
+        )
 
     sys_prompt = (
         f"You are C.O.R.A. (Cyber Oriented Reasoning Agent) v{get_cora_version().get('version', '5.15.12')}, "
@@ -5821,52 +6059,20 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         f"- Active Goal: `{active_goal or 'General interactive session'}`\n"
         f"- Session Personality Mode: `[{mode_info['number']}] {mode_info['label']}` — {mode_info['system_directive']}\n"
         f"- Network Isolation Posture: `{posture.get('hud_badge')}` ({posture.get('description')})\n"
-        f"- Permission Policy: `{perm_mode.upper()}`\n\n"
-        "### Operational Directives:\n"
+        + perm_directive_line
+        + "### Operational Directives:\n"
         "1. Directly address the operator's specific request, target IP/hostname, and Active Goal in clear, comprehensive detail.\n"
-        "2. When the operator asks to probe, scan, ping, or identify a service/appliance (such as a Fortinet firewall, web server, "
-        "or host process) and live command output is not yet attached, call `scan_target` or `run_shell_command` to gather real telemetry first. "
+        "2. When the operator asks to probe, scan, ping, verify, or execute a script/service/appliance and live command output is not yet attached, call `scan_target`, `read_project_file`, `write_project_file`, or `run_shell_command` to execute and gather real telemetry first. "
         "When the operator asks to search the internet, query a specific website (`site:example.com`), or read a specific webpage/URL/API, call `web_search` or `fetch_webpage`.\n"
         "3. When live command/probe output IS provided, analyze the exact findings (open/closed ports, TLS certificate serial/model strings, "
-        "HTTP headers, `Last-Modified` firmware build dates, static asset hashes, relevant CVEs for that firmware window, and concrete "
-        "administrative/CLI/HTTPS access procedures) and provide copy-pasteable commands.\n"
-        f"4. **Local Project `Files` Directory (`Projects/{active_proj}/Files/`)**: Every project has a dedicated `Files` directory at `Projects/{active_proj}/Files/`. Anything placed or uploaded into `Projects/{active_proj}/Files/` is directly visible and usable by you. When the operator tells you to go to the local `Files` or `File` directory to look at, analyze, or use a custom script or file, inspect `Projects/{active_proj}/Files/` using `read_project_file`, `list_project_files_tool`, `write_project_file`, or execute scripts there via `run_shell_command`.\n"
+        "HTTP headers, `Last-Modified` firmware build dates, static asset hashes, script bugs/callback mismatches, relevant CVEs, and concrete "
+        "remediation procedures) and provide copy-pasteable commands.\n"
+        f"4. **Local Project `Files` Directory (`Projects/{active_proj}/Files/`)**: Every project has a dedicated `Files` directory at `Projects/{active_proj}/Files/`. Anything placed or uploaded into `Projects/{active_proj}/Files/` is directly visible and usable by you. When the operator tells you to go to the local `Files` or `File` directory to look at, analyze, fix, or run a custom script or file, inspect `Projects/{active_proj}/Files/` using `read_project_file`, `list_project_files_tool`, `write_project_file` (always placing `\"filename\"` FIRST in JSON arguments), or execute scripts there via `run_shell_command`.\n"
         "5. Keep your output clean, structured, and easy to read. Do NOT dump internal reasoning engine numbers or raw thought processes into your main response unless the operator explicitly runs `/reason`.\n"
     )
 
-    # Load up to 4 clean messages from SQLite (filtering out any fallback synthesis blocks, incomplete phase stubs, or test strings)
-    history_msgs: List[Dict[str, str]] = []
-    try:
-        with get_db_conn() as conn:
-            recent_rows = conn.execute(
-                "SELECT role, content FROM messages WHERE project_slug = ? ORDER BY id DESC LIMIT 6",
-                (active_proj,),
-            ).fetchall()
-        for r in reversed(recent_rows):
-            r_role = str(r["role"] or "user")
-            r_content = str(r["content"] or "").strip()
-            if r_role not in ("user", "assistant") or not r_content:
-                continue
-            if r_content.upper() == "ONLINE" or r_content.startswith("Reply with the single word ONLINE"):
-                continue
-            if r_content.startswith("### 15-Engine Neuro-Symbolic Synthesis") or r_content.startswith("### C.O.R.A. Tactical Assessment"):
-                continue
-            if r_content.endswith("extract the version string:"):
-                continue
-            # Maintain strict user/assistant alternation for Jinja chat templates
-            if history_msgs and history_msgs[-1]["role"] == r_role:
-                history_msgs[-1]["content"] = r_content[:1200]
-            else:
-                history_msgs.append({"role": r_role, "content": r_content[:1200]})
-        if history_msgs and history_msgs[0]["role"] == "assistant":
-            history_msgs = history_msgs[1:]
-        if history_msgs and history_msgs[-1]["role"] == "user":
-            history_msgs = history_msgs[:-1]
-    except Exception:
-        history_msgs = []
-
-    user_prompt = query_text
-    if mem_excerpt.strip():
+    user_prompt = effective_query_text
+    if mem_excerpt.strip() and not is_short_followup:
         user_prompt += f"\n\n### Active Project Memory (`Projects/{active_proj}/memory.md`)\n{mem_excerpt}"
     if req.attached_files:
         clean_attached = [str(a).strip() for a in req.attached_files if str(a).strip()]
@@ -5876,15 +6082,15 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 + ", ".join(f"`{a}`" for a in clean_attached)
                 + f"\n{project_files_block}"
             )
-    elif re.search(r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded|custom\s+scripts?|in\s+files|from\s+files)\b", query_text, flags=re.I):
+    elif re.search(r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded|custom\s+scripts?|in\s+files|from\s+files|exploit\s+script|python\s+script)\b", effective_query_text, flags=re.I):
         user_prompt += f"\n\n{project_files_block}"
     elif project_files_block:
         user_prompt += f"\n\n{project_files_block[:1600]}"
 
-    if reasoning_guidance_block:
+    if reasoning_guidance_block and not is_short_followup:
         user_prompt += f"\n{reasoning_guidance_block}"
 
-    if active_goal and not is_goal_pursuit and active_goal.lower() not in query_text.lower():
+    if active_goal and not is_goal_pursuit and not is_short_followup and active_goal.lower() not in effective_query_text.lower():
         user_prompt += f"\n\n[Active Project Goal Context]: {active_goal}"
     if cmd_res.get("command"):
         if cmd_res.get("blocked"):
@@ -5912,13 +6118,128 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     relentless_active = bool(relentless_waves_requested or is_goal_pursuit or cfg.get("relentless_mode") == "true")
     cur_rel_max_int = int(cfg.get("relentless_max_waves") if cfg.get("relentless_max_waves") is not None else 12)
     if relentless_active:
-        max_tool_rounds = 14 if cur_rel_max_int == 0 else max(6, min(16, cur_rel_max_int))
+        max_tool_rounds = 64 if cur_rel_max_int == 0 else max(8, min(64, cur_rel_max_int * 4))
     else:
-        max_tool_rounds = 4
+        max_tool_rounds = 6
 
     seen_tool_calls: Dict[str, int] = {}
     web_intel_executed = False
     target_scan_executed = False
+    relentless_continuations = 0
+    auto_run_nudges = 0
+    max_relentless_continuations = 8 if (relentless_active and cur_rel_max_int == 0) else (max(1, cur_rel_max_int // 2) if relentless_active else 0)
+    PASSIVE_READ_TOOLS = {"read_project_file", "list_project_files_tool", "vault_search", "vault_read_note"}
+    queued_for_confirmation: List[Dict[str, Any]] = []
+
+    async def _dispatch_single_tool(fn_name: str, parsed_args: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        nonlocal target_scan_executed, web_intel_executed
+        if fn_name == "read_project_file":
+            p_val = str(parsed_args.get("path") or parsed_args.get("filename") or parsed_args.get("file") or "Files").strip()
+            t_r = await asyncio.to_thread(_execute_webui_read_project_file, p_val, active_proj)
+            return t_r, f"read_project_file({p_val})"
+        if fn_name == "list_project_files_tool":
+            s_val = str(parsed_args.get("subdir") or "Files").strip()
+            t_r = await asyncio.to_thread(_execute_webui_list_project_files, s_val, active_proj)
+            return t_r, f"list_project_files({s_val})"
+        if fn_name == "vault_search":
+            q_val = str(parsed_args.get("query") or parsed_args.get("keyword") or "").strip()
+            t_r = await asyncio.to_thread(_execute_webui_vault_search, q_val, active_proj)
+            return t_r, f"vault_search({q_val})"
+        if fn_name == "vault_read_note":
+            n_val = str(parsed_args.get("note") or parsed_args.get("path") or "").strip()
+            t_r = await asyncio.to_thread(_execute_webui_vault_read_note, n_val, active_proj)
+            return t_r, f"vault_read_note({n_val})"
+        if fn_name == "write_project_file":
+            f_val = str(
+                parsed_args.get("filename")
+                or parsed_args.get("path")
+                or parsed_args.get("file")
+                or parsed_args.get("file_path")
+                or parsed_args.get("target")
+                or ""
+            ).strip()
+            c_txt = str(parsed_args.get("content") or "")
+            t_r = await asyncio.to_thread(_execute_webui_write_project_file, f_val, c_txt, mode_info, active_proj)
+            return t_r, f"write_project_file({f_val})"
+        if fn_name == "scan_target":
+            t_val = str(parsed_args.get("target") or "").strip()
+            t_r = await asyncio.to_thread(
+                _execute_webui_target_scan,
+                t_val,
+                mode_info,
+                posture,
+                active_proj,
+            )
+            target_scan_executed = True
+            return t_r, f"scan_target({t_val})"
+        if fn_name == "web_search":
+            q_val = str(parsed_args.get("query") or "").strip()
+            site_val = str(parsed_args.get("site") or "").strip()
+            max_r = int(parsed_args.get("max_results") or 8)
+            t_r = await asyncio.to_thread(
+                execute_tier1_web_search,
+                q_val,
+                site_val,
+                max_r,
+                mode_info,
+                posture,
+                active_proj,
+                lambda: _is_execution_cancelled(exec_gen),
+            )
+            web_intel_executed = True
+            return t_r, f"web_search({q_val}" + (f", site={site_val})" if site_val else ")")
+        if fn_name == "fetch_webpage":
+            u_val = str(parsed_args.get("url") or parsed_args.get("target") or "").strip()
+            qf_val = str(parsed_args.get("query_filter") or parsed_args.get("query") or "").strip()
+            t_r = await asyncio.to_thread(
+                execute_tier1_fetch_webpage,
+                u_val,
+                qf_val,
+                7500,
+                mode_info,
+                posture,
+                active_proj,
+                lambda: _is_execution_cancelled(exec_gen),
+            )
+            web_intel_executed = True
+            return t_r, f"fetch_webpage({u_val}" + (f", filter={qf_val})" if qf_val else ")")
+        if fn_name == "run_shell_command":
+            c_val = str(parsed_args.get("command") or "").strip()
+            t_r = await asyncio.to_thread(
+                execute_safe_shell_command,
+                c_val,
+                mode_info,
+                posture,
+                active_proj,
+            )
+            return t_r, c_val
+        return {"executed": False, "blocked": True, "reason": f"Unknown tool: {fn_name}"}, fn_name
+
+    # If the operator just confirmed pending tools queued from a previous `CONFIRM`-mode turn, execute them immediately!
+    if user_confirmed_this_turn and pending_confirm_tools:
+        update_settings_dict({pending_confirm_key: ""})
+        tools_to_run = pending_confirm_tools
+        if is_numbered_reply and 1 <= selected_option_num <= len(pending_confirm_tools):
+            tools_to_run = [pending_confirm_tools[selected_option_num - 1]]
+        for pt in tools_to_run:
+            if _is_execution_cancelled(exec_gen):
+                return _build_cancelled_response()
+            pt_name = str(pt.get("name") or "")
+            pt_args = pt.get("args") if isinstance(pt.get("args"), dict) else {}
+            t_res_p, lbl_p = await _dispatch_single_tool(pt_name, pt_args)
+            if lbl_p:
+                executed_cmds_list.append(lbl_p)
+            out_p = (
+                f"BLOCKED: {t_res_p.get('reason')}"
+                if t_res_p.get("blocked")
+                else f"Exit Code: {t_res_p.get('exit_code', 0)}\n{str(t_res_p.get('output') or '(no output)')[:4200]}"
+            )
+            executed_outs_list.append(f"=== Confirmed Tool Executed: `{lbl_p}` ===\n{out_p}")
+        if executed_outs_list:
+            wire_messages[-1]["content"] += (
+                "\n\n### Live Output from Operator-Confirmed Tool Execution:\n"
+                + "\n\n".join(executed_outs_list)
+            )
 
     for tool_round in range(max_tool_rounds):
         if _is_execution_cancelled(exec_gen):
@@ -5941,6 +6262,64 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
 
         t_calls = llm_res.get("tool_calls") or []
         if not t_calls:
+            cur_text = str(llm_res.get("content") or "").strip()
+            # Anti-Stall AUTO-RUN Guard: If AUTO-RUN is active (or operator just confirmed an action) and the LLM
+            # stopped to ask "Would you like to..." / "Please confirm if you want to proceed" instead of calling a tool,
+            # automatically nudge it once to execute the tool directly!
+            asks_for_permission = bool(
+                re.search(
+                    r"(?:would\s+you\s+like\s+(?:me\s+to|to)\b|please\s+confirm\s+if\s+you\s+want|shall\s+i\s+(?:proceed|execute|run)|awaiting\s+your\s+command)",
+                    cur_text,
+                    flags=re.I,
+                )
+            )
+            has_active_tool_run = any(
+                not c.startswith(("read_project_file(", "list_project_files(", "vault_search(", "vault_read_note("))
+                for c in executed_cmds_list
+            )
+            if (
+                effective_auto_run
+                and auto_run_nudges < 1
+                and tool_round < (max_tool_rounds - 1)
+                and (asks_for_permission or (is_short_followup and not has_active_tool_run))
+            ):
+                auto_run_nudges += 1
+                if cur_text:
+                    wire_messages.append({"role": "assistant", "content": cur_text})
+                wire_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[AUTO-RUN Enforcement]: Permission Policy is `AUTO-RUN` (or the operator has already confirmed execution). "
+                            "Do NOT stop to ask the operator for confirmation or present a numbered menu of actions. "
+                            "Call the required tool (`run_shell_command`, `write_project_file`, `read_project_file`, `scan_target`, `web_search`, `fetch_webpage`) "
+                            "right now to execute the action directly!"
+                        ),
+                    }
+                )
+                continue
+
+            if (
+                relentless_active
+                and effective_auto_run
+                and relentless_continuations < max_relentless_continuations
+                and tool_round < (max_tool_rounds - 1)
+                and (len(cur_text) < 450 or not executed_outs_list)
+            ):
+                relentless_continuations += 1
+                if cur_text:
+                    wire_messages.append({"role": "assistant", "content": cur_text})
+                wire_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Relentless Wave Continuation #{relentless_continuations}]: Active Goal `{active_goal or query_text}` is not yet fully resolved. "
+                            "Continue executing live verification tools (`run_shell_command`, `scan_target`, `web_search`, `fetch_webpage`, `write_project_file`) "
+                            "or deliver the complete, end-to-end verified resolution covering every requirement of the goal."
+                        ),
+                    }
+                )
+                continue
             last_round_called_tools = False
             break
 
@@ -5963,10 +6342,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             fn_obj = tc.get("function") or {}
             fn_name = str(fn_obj.get("name") or "")
             raw_args = fn_obj.get("arguments") or "{}"
-            try:
-                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-            except Exception:
-                parsed_args = {"command": str(raw_args)}
+            parsed_args = _recover_tool_args(fn_name, raw_args, active_proj=active_proj, query_text=effective_query_text)
 
             # Compute normalized signature to prevent the LLM from repeating identical tool calls across waves
             if fn_name == "scan_target":
@@ -5983,10 +6359,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 duplicate_count_this_round += 1
                 dup_msg = (
                     f"[Duplicate Tool Call Skipped]: `{fn_name}` with these arguments was already executed in this session "
-                    "and its full output is already in context above. Do NOT repeat `scan_target` or `vault_search`. "
-                    "If you need live CVE/exploit intelligence, call `web_search` or `fetch_webpage` (e.g. "
-                    "`fetch_webpage(url=\"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=FortiOS&resultsPerPage=8\")` "
-                    "or `web_search(query=\"FortiOS 6.2 CVE exploit PoC\", site=\"exploit-db.com\")`), or stop calling tools and write your complete final response."
+                    "and its full output is already in context above. Do NOT repeat identical tool calls; proceed to the next step or write your final response."
                 )
                 wire_messages.append(
                     {
@@ -5998,82 +6371,30 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 )
                 continue
 
-            if fn_name == "read_project_file":
-                p_val = str(parsed_args.get("path") or parsed_args.get("filename") or "Files").strip()
-                t_res = await asyncio.to_thread(_execute_webui_read_project_file, p_val, active_proj)
-                label_cmd = f"read_project_file({p_val})"
-            elif fn_name == "list_project_files_tool":
-                s_val = str(parsed_args.get("subdir") or "Files").strip()
-                t_res = await asyncio.to_thread(_execute_webui_list_project_files, s_val, active_proj)
-                label_cmd = f"list_project_files({s_val})"
-            elif fn_name == "vault_search":
-                q_val = str(parsed_args.get("query") or parsed_args.get("keyword") or "").strip()
-                t_res = await asyncio.to_thread(_execute_webui_vault_search, q_val, active_proj)
-                label_cmd = f"vault_search({q_val})"
-            elif fn_name == "vault_read_note":
-                n_val = str(parsed_args.get("note") or parsed_args.get("path") or "").strip()
-                t_res = await asyncio.to_thread(_execute_webui_vault_read_note, n_val, active_proj)
-                label_cmd = f"vault_read_note({n_val})"
-            elif fn_name == "write_project_file":
-                f_val = str(parsed_args.get("filename") or parsed_args.get("path") or "").strip()
-                c_txt = str(parsed_args.get("content") or "")
-                t_res = await asyncio.to_thread(_execute_webui_write_project_file, f_val, c_txt, mode_info, active_proj)
-                label_cmd = f"write_project_file({f_val})"
-            elif fn_name == "scan_target":
-                t_val = str(parsed_args.get("target") or "").strip()
-                t_res = await asyncio.to_thread(
-                    _execute_webui_target_scan,
-                    t_val,
-                    mode_info,
-                    posture,
-                    active_proj,
+            # Enforce `Tools: CONFIRM` (`perm_mode == "confirm"`) on active/mutating/network tools
+            if not effective_auto_run and fn_name not in PASSIVE_READ_TOOLS:
+                preview_desc = f"{fn_name}({json.dumps(parsed_args)})"
+                if fn_name == "run_shell_command":
+                    preview_desc = f"`run_shell_command`: `{parsed_args.get('command', '')}`"
+                elif fn_name == "write_project_file":
+                    f_p = parsed_args.get("filename") or parsed_args.get("path") or "Files/script"
+                    preview_desc = f"`write_project_file`: `Projects/{active_proj}/Files/{f_p}` ({len(str(parsed_args.get('content') or ''))} chars)"
+                elif fn_name == "scan_target":
+                    preview_desc = f"`scan_target`: `{parsed_args.get('target', '')}`"
+                elif fn_name == "web_search":
+                    preview_desc = f"`web_search`: `{parsed_args.get('query', '')}`"
+                elif fn_name == "fetch_webpage":
+                    preview_desc = f"`fetch_webpage`: `{parsed_args.get('url', '')}`"
+                queued_for_confirmation.append(
+                    {
+                        "name": fn_name,
+                        "args": parsed_args,
+                        "preview": preview_desc,
+                    }
                 )
-                target_scan_executed = True
-                label_cmd = f"scan_target({t_val})"
-            elif fn_name == "web_search":
-                q_val = str(parsed_args.get("query") or "").strip()
-                site_val = str(parsed_args.get("site") or "").strip()
-                max_r = int(parsed_args.get("max_results") or 8)
-                t_res = await asyncio.to_thread(
-                    execute_tier1_web_search,
-                    q_val,
-                    site_val,
-                    max_r,
-                    mode_info,
-                    posture,
-                    active_proj,
-                    lambda: _is_execution_cancelled(exec_gen),
-                )
-                web_intel_executed = True
-                label_cmd = f"web_search({q_val}" + (f", site={site_val})" if site_val else ")")
-            elif fn_name == "fetch_webpage":
-                u_val = str(parsed_args.get("url") or parsed_args.get("target") or "").strip()
-                qf_val = str(parsed_args.get("query_filter") or parsed_args.get("query") or "").strip()
-                t_res = await asyncio.to_thread(
-                    execute_tier1_fetch_webpage,
-                    u_val,
-                    qf_val,
-                    7500,
-                    mode_info,
-                    posture,
-                    active_proj,
-                    lambda: _is_execution_cancelled(exec_gen),
-                )
-                web_intel_executed = True
-                label_cmd = f"fetch_webpage({u_val}" + (f", filter={qf_val})" if qf_val else ")")
-            elif fn_name == "run_shell_command":
-                c_val = str(parsed_args.get("command") or "").strip()
-                t_res = await asyncio.to_thread(
-                    execute_safe_shell_command,
-                    c_val,
-                    mode_info,
-                    posture,
-                    active_proj,
-                )
-                label_cmd = c_val
-            else:
-                t_res = {"executed": False, "blocked": True, "reason": f"Unknown tool: {fn_name}"}
-                label_cmd = fn_name
+                continue
+
+            t_res, label_cmd = await _dispatch_single_tool(fn_name, parsed_args)
 
             if _is_execution_cancelled(exec_gen) or t_res.get("cancelled"):
                 return _build_cancelled_response()
@@ -6114,17 +6435,58 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 }
             )
 
+        if queued_for_confirmation:
+            update_settings_dict({pending_confirm_key: json.dumps(queued_for_confirmation)})
+            confirm_lines = [
+                "### 🔒 Operator Confirmation Required (`Tools: CONFIRM` Mode Active)",
+                "C.O.R.A. is ready to execute the following active tool call(s), which are paused awaiting your permission:",
+                "",
+            ]
+            for idx_q, q_item in enumerate(queued_for_confirmation, 1):
+                confirm_lines.append(f"{idx_q}. {q_item['preview']}")
+            confirm_lines.extend(
+                [
+                    "",
+                    "👉 **Reply `yes` / `confirm` (or enter the item number `1`) to execute immediately, or switch `Tools: CONFIRM` → `Tools: AUTO-RUN` in the top bar for autonomous execution.**",
+                ]
+            )
+            pre_text = re.sub(r"(?is)<think>.*?</think>", "", str(llm_res.get("content") or "")).strip()
+            combined_confirm_reply = (f"{pre_text}\n\n---\n\n" if pre_text else "") + "\n".join(confirm_lines)
+            llm_res = {
+                "online": True,
+                "provider": llm_res.get("provider", "llama-server"),
+                "model": llm_res.get("model", model_id),
+                "thinking": "\n\n".join(all_thinking_parts),
+                "content": combined_confirm_reply,
+            }
+            last_round_called_tools = False
+            break
+
         if duplicate_count_this_round >= len(t_calls) and duplicate_count_this_round >= 2:
             # All tool calls in this round were duplicates; break out to autonomous wave check & synthesis
             break
 
     # -----------------------------------------------------------------------
     # Autonomous Relentless Multi-Wave Goal-Completion Controller
-    # Guarantees that if the goal requires target identification + live CVE lookup,
-    # any missing wave is executed automatically before final synthesis!
+    # ONLY runs when `effective_auto_run` is True AND the operator is actively pursuing
+    # a multi-wave goal (`is_goal_pursuit` or `relentless_waves_requested`), never
+    # hijacking local `Files/` script debugging or bypassing `Tools: CONFIRM`!
     # -----------------------------------------------------------------------
-    combined_goal_low = f"{query_text} {active_goal}".lower()
-    if not _is_execution_cancelled(exec_gen):
+    is_local_file_query = bool(
+        re.search(
+            r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|python\s+script|exploit\s+script|call\s*back|\.py\b)\b",
+            query_text,
+            flags=re.I,
+        )
+    )
+    if (
+        not _is_execution_cancelled(exec_gen)
+        and effective_auto_run
+        and not queued_for_confirmation
+        and (is_goal_pursuit or relentless_waves_requested)
+        and not is_local_file_query
+    ):
+        combined_goal_low = f"{query_text} {active_goal}".lower()
         # Wave A: Ensure target IP is scanned if present in goal/query and not yet scanned
         goal_ips = [
             ip
@@ -6150,7 +6512,6 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         needs_cve_lookup = any(k in combined_goal_low for k in ("cve", "vulnerabilit", "exploit", "fortigate", "fortios"))
         joined_outs_low = "\n".join(executed_outs_list).lower()
         if needs_cve_lookup and not web_intel_executed and not _is_execution_cancelled(exec_gen):
-            # Determine target product from collected telemetry or query
             if "fortigate" in joined_outs_low or "fortios" in joined_outs_low or "fgt" in joined_outs_low or "fortinet" in joined_outs_low:
                 cve_search_q = "FortiOS 6.2 6.0 7.0 SSL VPN FG-IR CVE-2018-13379 CVE-2022-40684 CVE-2023-27997 CVE-2024-21762 exploit"
                 nvd_url = "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=FortiOS%20SSL-VPN&resultsPerPage=6"
@@ -6197,7 +6558,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     # with the live tool telemetry when tools were executed
     if req.run_reasoning and executed_outs_list:
         t_pipe2 = time.perf_counter()
-        enriched_problem = f"{query_text}\n\n" + "\n\n".join(executed_outs_list)[:3500]
+        base_prob = (active_goal if (is_goal_pursuit or relentless_waves_requested) and active_goal else effective_query_text) or active_goal
+        enriched_problem = f"{base_prob}\n\n" + "\n\n".join(executed_outs_list)[:3500]
         prev_vault_note = reasoning_res.get("vault_note", "")
         reasoning_res = await asyncio.to_thread(
             run_neuro_symbolic_pipeline,
@@ -6213,25 +6575,33 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             str(reasoning_res.get("consensus_immediate_action") or "")
         )
 
-    # Whenever tools were executed and (`last_round_called_tools=True`, `relentless_active=True`,
-    # or the response content is short/empty `< 200` chars), perform the final synthesis call with `thinking_enabled=False`
-    # so 100% of the LLM token budget goes into writing a complete, verified resolution for every requirement of the goal!
-    if executed_outs_list and (
-        last_round_called_tools
-        or relentless_active
-        or not llm_res.get("online")
-        or len(str(llm_res.get("content") or "").strip()) < 200
+    # Perform the final synthesis call ONLY when the tool loop terminated on a tool call without a final response
+    # (or when the response content is empty/short `< 180` chars) and not waiting on a `CONFIRM` prompt.
+    if (
+        executed_outs_list
+        and not queued_for_confirmation
+        and (
+            last_round_called_tools
+            or not llm_res.get("online")
+            or len(str(llm_res.get("content") or "").strip()) < 180
+        )
     ):
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
+        if len(executed_outs_list) == 1:
+            combined_telemetry_str = executed_outs_list[0][:11000]
+        else:
+            head_telemetry = executed_outs_list[0][:3500]
+            tail_telemetry = "\n\n".join(executed_outs_list[1:])[-8500:]
+            combined_telemetry_str = f"{head_telemetry}\n\n{tail_telemetry}"
         synth_user_prompt = (
             f"{user_prompt[:3000]}\n\n"
-            f"### Live Telemetry, Target Scan & Intelligence Collected by C.O.R.A.:\n"
-            f"```text\n" + "\n\n".join(executed_outs_list)[:8000] + "\n```\n\n"
-            "Based strictly on the live telemetry above and the operator's request, write a complete, thorough, and well-structured final response that fulfills EVERY requirement of the operator's query and Active Goal:\n"
-            "1. **Verified Telemetry & Target/System Identification**: Summarize the exact empirical findings from the executed tools (e.g., discovered hosts/IPs, open/closed ports, TLS certificate subjects/serials, service banners, HTTP headers, firmware/software build versions, or local system/file state).\n"
-            "2. **Technical & Vulnerability Analysis**: If a network service, appliance, or software version was identified, detail the applicable security posture, root cause, or relevant CVEs (with CVSS scores, affected versions, and technical impact) grounded in the collected evidence.\n"
-            "3. **Runnable CLI Verification & Actionable Commands**: Provide complete, copy-pasteable CLI commands or scripts tailored to the actual target IP/hostname and environment so the operator can verify or act on the findings directly."
+            f"### Live Telemetry, Tool Execution & Intelligence Collected by C.O.R.A.:\n"
+            f"```text\n{combined_telemetry_str}\n```\n\n"
+            "Based strictly on the live tool execution telemetry above and the operator's request, write a complete, thorough, and well-structured final response:\n"
+            "1. **Verified Execution & Empirical Findings**: Summarize the exact findings from the executed tools (e.g., script bug/callback IP analysis, file updates, command outputs, discovered hosts/ports, TLS certificates, or firmware versions).\n"
+            "2. **Root-Cause & Technical Analysis**: Explain the exact root cause (such as a hardcoded callback IP/port mismatch in an exploit script, missing listener, or specific CVE mechanics) grounded in the evidence.\n"
+            "3. **Completed Actions & Verification**: Present the updated code/results directly. Do NOT end with 'Would you like me to...' or ask for permission to run tools that have already been executed."
         )
         synth_messages: List[Dict[str, Any]] = [{"role": "system", "content": sys_prompt}]
         synth_messages.extend(history_msgs[-2:])

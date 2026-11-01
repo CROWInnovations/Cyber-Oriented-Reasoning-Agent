@@ -1,7 +1,7 @@
 # C.O.R.A. Master Version History & Architectural Changelog (`core/Log/VERSION_HISTORY_AND_CHANGELOG.md`)
 
 **Author:** CROW Innovations  
-**Current Semantic Version:** `5.21.19` ([`cora_version.json`](./cora_version.json))  
+**Current Semantic Version:** `5.22.19` ([`cora_version.json`](./cora_version.json))  
 
 ---
 
@@ -9,12 +9,27 @@
 
 `C.O.R.A.` tracks its version deterministically in [`core/Log/cora_version.json`](./cora_version.json):
 - **`major_cli` (`5`)**: Major CLI, Custom WebUI, and Two-Tier Project/Vault Architecture generation.
-- **`engine_rev` (`21`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
+- **`engine_rev` (`22`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
 - **`patch_rev` (`19`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
 
 ---
 
 ## 2. Release History & Root-Cause Fix Ledger
+
+### `v5.22.19` — `AUTO-RUN` & `CONFIRM` Permission Enforcement, Short-Reply Resolution, Local Exploit Callback Abduction & Tool-Call Recovery
+- **WebUI `AUTO-RUN` & `CONFIRM` Enforcement (`core/webui/server.py`)**:
+  - Enforced `permission_mode` (`confirm` vs. `auto`) in `api_submit_query`: in `CONFIRM` mode, passive read tools (`read_project_file`, `list_project_files_tool`, `vault_search`, `vault_read_note`) execute while active/mutating/network tools (`run_shell_command`, `write_project_file`, `scan_target`, `web_search`, `fetch_webpage`) are queued in `pending_confirm_tools_<project>` awaiting operator approval.
+  - Added an explicit `AUTO-RUN` behavioral directive and Anti-Stall `AUTO-RUN` Guard that prevents the LLM from stopping to ask for confirmation when `AUTO-RUN` is enabled.
+  - Gated autonomous Wave A/B execution so background `scan_target` and `web_search`/`fetch_webpage` waves only run during active `/goal` or `/relentless` pursuit with `AUTO-RUN` enabled.
+- **Conversation History Tail Preservation & Short-Reply Resolution (`core/webui/server.py`)**:
+  - Preserved both head and tail (`[:1100] + ... + [-1700:]`) of assistant messages in `history_msgs` so numbered options and confirmation prompts at the end of responses are never truncated.
+  - Added automatic resolution of short confirmation replies (`yes`, `yes, confirm`, `confirm`, `proceed`) and numbered choices (`1`, `2`, `3`) against the previous assistant turn before invoking the 15-Engine pipeline and LLM.
+- **15-Engine Local Exploit / Callback Abduction & Target Priority (`bayesian.py`, `pipeline.py`, `vault_bridge.py`)**:
+  - Added the `exploit_callback_or_script_failure` Bayesian profile and `_auto_select_profile_and_dag()` in `pipeline.py` with automatic `$PROJECT_FILES_DIR` script inspection to detect hardcoded callback `LHOST`/`LPORT` mismatches against active host interfaces.
+  - Prioritized active project `memory.md` over stale cross-project `relentless_ledger.json` entries in `resolve_problem_targets()`.
+- **Tool-Call Truncation Recovery & CLI Permission Sync (`core/webui/server.py` & `core/agent-cli.py`)**:
+  - Increased tool-call token budget (`2800`/`3200`), added `_recover_tool_args()`, and supported both JSON and Qwen XML `<function=...><parameter=...>` tool call formats.
+  - Synced `SKIP_PERMISSIONS` with `[3] Berserker` mode and gated `scan_target`, `web_search`, and `fetch_webpage` with `confirm_action()` in `core/agent-cli.py`.
 
 ### `v5.21.19` — LOLBINS Reasoning Vault (`CROWInnovations/LOLBAS`), NIST NVD 2.0 & OpenCVE Intelligence & `web_intel.py` Fixes
 - **LOLBINS Living-Off-The-Land Binaries, Scripts & Libraries Reasoning Suite (`core/ObsidianVault/reasoning/LOLBINS.md` & `core/ObsidianVault/reasoning/LOLBINS/`)**:

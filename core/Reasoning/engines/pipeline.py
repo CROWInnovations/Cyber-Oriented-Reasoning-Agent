@@ -44,7 +44,7 @@ from .meta_learner import get_meta_arbiter_weights, run_meta_learning_reasoning
 from .rl_network_policy import run_rl_network_policy_reasoning
 from .spectral_manifold_pca import run_spectral_pca_reasoning
 from .sygus_extractor import run_sygus_reasoning
-from .temporal_fluents import run_temporal_fluent_reasoning
+from .temporal_fluents import load_fluent_state, run_temporal_fluent_reasoning
 from .vault_bridge import (
     get_hardware_reasoning_limits,
     render_command_template,
@@ -74,8 +74,9 @@ def _auto_infer_observed_evidence(
     existing_evidence: Dict[str, bool],
     sygus_extracted: Dict[str, Any],
     primary_in_local: bool,
+    resolved_target: str = "",
 ) -> Dict[str, bool]:
-    """Enrich Bayesian & Dempster-Shafer observed evidence from problem text, SyGuS CLI facts, and Geometric L2/L3 containment."""
+    """Enrich Bayesian & Dempster-Shafer observed evidence from problem text, SyGuS CLI facts, holding Temporal Fluents, and Geometric L2/L3 containment."""
     ev = dict(existing_evidence or {})
     # Normalize any legacy evidence key aliases
     if ev.get("curl_exit_28_Timeout"):
@@ -117,10 +118,49 @@ def _auto_infer_observed_evidence(
         ev.setdefault("arp_incomplete_or_missing", True)
     if "127.0.0.1:" in p_low or ("serial" in p_low and "ss -tulpn" in p_low):
         ev.setdefault("serial_ss_shows_127_0_0_1_only", True)
-    if re.search(r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|console)\b", p_low):
+    if re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low):
         ev.setdefault("serial_console_oob_available", True)
-    if any(k in p_low for k in ("privesc", "privilege escalation", "suid", "sudoers", "capabilities", "www-data", "active directory", "ldap", "smb")):
+    if any(
+        k in p_low
+        for k in (
+            "privesc", "privilege escalation", "suid", "sudoers", "getcap", "capsh", "cap_setuid",
+            "linux capabilities", "www-data", "active directory", "ldap", "smb",
+        )
+    ):
         ev.setdefault("post_exploitation_shell_active", True)
+
+    # Enrich from active HOLDING fluents in Engine 9 (`live_fluents.json`) for `resolved_target`
+    # when the current problem text has not explicitly reported a new failure (e.g., 100% loss / unreachable).
+    has_explicit_failure_in_text = bool(
+        ev.get("icmp_ping_fails")
+        or ev.get("curl_exit_28_timeout")
+        or ev.get("curl_exit_7_Immediate_refused")
+        or ev.get("arp_incomplete_or_missing")
+    )
+    if resolved_target and not resolved_target.startswith("<") and not has_explicit_failure_in_text:
+        try:
+            f_store = load_fluent_state()
+            fluents_map = f_store.get("fluents", {}) if isinstance(f_store, dict) else {}
+            for fk, fv in fluents_map.items():
+                if not isinstance(fv, dict) or fv.get("status") not in ("ACTIVE", "HOLDING"):
+                    continue
+                if fv.get("entity") != resolved_target and resolved_target not in fk:
+                    continue
+                cat = str(fv.get("category") or "")
+                val = str(fv.get("value") or "").upper()
+                if cat == "open_port" or ( fk.startswith(f"port:{resolved_target}:") and val == "OPEN"):
+                    ev.setdefault("alt_port_open_in_scan", True)
+                    ev.setdefault("icmp_ping_responds", True)
+                    ev.setdefault("arp_resolved_mac_present", True)
+                elif cat == "http_state" or fk.startswith(f"http:{resolved_target}"):
+                    ev.setdefault("alt_port_open_in_scan", True)
+                    ev.setdefault("http_401_or_403_or_tls_alert", True)
+                    ev.setdefault("icmp_ping_responds", True)
+                    ev.setdefault("arp_resolved_mac_present", True)
+                elif cat == "l2_neighbor" and val in ("REACHABLE", "STALE", "PERMANENT", "DYNAMIC"):
+                    ev.setdefault("arp_resolved_mac_present", True)
+        except Exception:
+            pass
 
     # Evidence keys for l2_l3_routing_blackhole profile
     if "default via" in p_low or "uses default" in p_low or (not primary_in_local and "no route" in p_low):
@@ -167,15 +207,87 @@ def _auto_infer_observed_evidence(
         ev.setdefault("http_401_or_403_or_tls_alert", True)
         ev.setdefault("icmp_ping_responds", True)
         ev.setdefault("arp_resolved_mac_present", True)
-    if not primary_in_local and any(
-        k in p_low
-        for k in (
-            "unreachable", "timed out", "timeout", "exit 28", "100% packet loss",
-            "no route", "blackhole", "isolated", "disjoint", "cross-subnet", "pivot", "route",
+    if (
+        not primary_in_local
+        and not (ev.get("alt_port_open_in_scan") or ev.get("icmp_ping_responds"))
+        and any(
+            k in p_low
+            for k in (
+                "unreachable", "timed out", "timeout", "exit 28", "100% packet loss",
+                "no route", "blackhole", "isolated", "disjoint", "cross-subnet", "pivot", "route",
+            )
         )
     ):
         ev.setdefault("target_outside_local_24_cidr", True)
+
+    # Detect local exploit / reverse-shell callback IP mismatch in Projects/<active_proj>/Files/
+    if any(
+        k in p_low
+        for k in (
+            "callback", "call back", "reverse shell", "lhost", "lport",
+            "python script", "files directory", "in the files", "exploit",
+        )
+    ):
+        try:
+            from .vault_bridge import PROJECTS_DIR, detect_host_network_context
+
+            active_proj = os.environ.get("CORA_ACTIVE_PROJECT", "").strip()
+            if active_proj:
+                files_dir = PROJECTS_DIR / active_proj / "Files"
+                if files_dir.is_dir():
+                    host_ips = set(detect_host_network_context().get("local_ips") or [])
+                    for py_f in sorted(files_dir.glob("*.py"))[:5]:
+                        script_txt = py_f.read_text(encoding="utf-8", errors="replace")[:16000]
+                        script_ips = [
+                            ip
+                            for ip in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", script_txt)
+                            if not ip.startswith(("127.", "0.", "255."))
+                        ]
+                        if script_ips and host_ips and not any(sip in host_ips for sip in script_ips):
+                            if any( sip != resolved_target for sip in script_ips):
+                                ev.setdefault("lhost_mismatch_detected_in_script", True)
+                                break
+        except Exception:
+            pass
     return ev
+
+
+def _auto_select_profile_and_dag(
+    problem: str,
+    bayesian_profile: str,
+    causal_dag: str,
+) -> tuple[str, str]:
+    """Automatically select the appropriate Bayesian profile & Causal DAG from problem text when default is passed."""
+    if bayesian_profile and bayesian_profile != "http_api_unreachable":
+        return bayesian_profile, causal_dag
+    p_low = (problem or "").lower()
+    if any(
+        k in p_low
+        for k in (
+            "callback", "call back", "reverse shell", "lhost", "lport",
+            "python script", "files directory", "in the files", "did not receive a call",
+        )
+    ) or ("exploit" in p_low and ("script" in p_low or "files" in p_low or ".py" in p_low)):
+        return "exploit_callback_or_script_failure", causal_dag
+    if any(
+        k in p_low
+        for k in (
+            "cross-subnet", "ip_forward", "masquerade", "static route", "routing blackhole",
+            "disjoint subnet", "route layer-2", "route layer-3", "via gateway",
+        )
+    ):
+        return "l2_l3_routing_blackhole", (
+            "l2_l3_cross_subnet_routing" if causal_dag == "network_api_reachability" else causal_dag
+        )
+    if any(
+        k in p_low
+        for k in (
+            "401 unauthorized", "403 forbidden", "405 method not allowed",
+            "www-authenticate", "bearer token", "x-forwarded-for", "csrf token",
+        )
+    ):
+        return "api_auth_rejection", causal_dag
+    return bayesian_profile, causal_dag
 
 
 def run_neuro_symbolic_pipeline(
@@ -202,6 +314,7 @@ def run_neuro_symbolic_pipeline(
     Computes a single authoritative `>>> CONSENSUS IMMEDIATE ACTION <<<` via the Consensus Arbiter
     (Guardrail 4) and saves the full 20-stage synthesis to `ObsidianVault/reasoning/`.
     """
+    bayesian_profile, causal_dag = _auto_select_profile_and_dag(problem, bayesian_profile, causal_dag)
     ctx = resolve_problem_targets(
         problem=problem,
         explicit_target=target_ip,
@@ -218,7 +331,7 @@ def run_neuro_symbolic_pipeline(
         p_low = (problem or "").lower()
         has_serial_oob = bool(
             ctx.get("has_serial_oob")
-            or re.search(r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|com[1-9]\d*)\b", p_low)
+            or re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|com[1-9]\d*|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low)
         )
 
     # Pre-run Stage 13 (SyGuS) and Stage 7 (Temporal Fluents) so their extracted facts feed downstream engines
@@ -297,6 +410,7 @@ def run_neuro_symbolic_pipeline(
         existing_evidence=observed_evidence or {},
         sygus_extracted=sygus_ext,
         primary_in_local=primary_in_local,
+        resolved_target=resolved_target,
     )
 
     default_probe_cmd = (
@@ -600,7 +714,17 @@ def run_neuro_symbolic_pipeline(
             if (cbr_matches and cbr_top_cmd)
             else ""
         )
-        if mdp_cmd and mdp_cmd in verified_set and mdp_q >= max(55.0, rl_q_lcb, eig_score):
+        if (
+            bayesian_profile == "exploit_callback_or_script_failure"
+            and top_probe.get("probe_cmd")
+            and top_probe.get("probe_cmd") in verified_set
+        ):
+            verified_cmd = str(top_probe["probe_cmd"])
+            consensus_rationale = (
+                f"Local exploit/callback diagnostic profile active; EIG probe targets top root cause "
+                f"`{bayes_res.get('top_hypothesis')}` ({bayes_res.get('top_probability', 0.0):.0%} posterior){cbr_hint_suffix}."
+            )
+        elif mdp_cmd and mdp_cmd in verified_set and mdp_q >= max(55.0, rl_q_lcb, eig_score):
             verified_cmd = mdp_cmd
             consensus_rationale = (
                 f"Preconditions satisfied & CEGAR-verified; Hedge-weighted H-MDP Bellman policy `{mdp_res.get('optimal_tactic')}` "

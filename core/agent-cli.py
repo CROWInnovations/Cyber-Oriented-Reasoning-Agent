@@ -2477,7 +2477,7 @@ def apply_personality_mode(mode_key: str, netiso_group: str = "") -> tuple[str, 
       - `NINJA`     : Requires `Red` (`All` interfaces) or `Blue` (`config` or `CLI switch override` interfaces); pre-emptive covert/low-noise execution.
     Returns `(normalized_mode_key, applied_netiso_level, allowed_interfaces)`.
     """
-    global ACTIVE_PERSONALITY_MODE
+    global ACTIVE_PERSONALITY_MODE, SKIP_PERMISSIONS
     norm = (mode_key or "DEFAULT").strip().upper()
     alias_to_key = {
         "1": "DEFAULT",
@@ -2501,6 +2501,10 @@ def apply_personality_mode(mode_key: str, netiso_group: str = "") -> tuple[str, 
     norm = alias_to_key.get(norm, "DEFAULT")
     ACTIVE_PERSONALITY_MODE = norm
     os.environ["CORA_PERSONALITY_MODE"] = norm
+    if norm == "BERSERKER":
+        SKIP_PERMISSIONS = True
+    elif "--dangerously-skip-permissions" not in sys.argv:
+        SKIP_PERMISSIONS = False
 
     if norm == "ANALYST":
         iso_lvl, ifaces = apply_network_isolation_level("white", "")
@@ -4095,6 +4099,8 @@ def execute_tool(name: str, args: dict) -> str:
                     return res_blk
             except Exception:
                 pass
+            if not confirm_action(f"Scan target `{target}` across HTTP/HTTPS/TCP management ports?"):
+                return f"User declined `scan_target({target})`."
             print(
                 f"\n\033[1;36m[Agent Tool -> scan_target]\033[0m {target} (auto-saving to Projects/{get_active_project_slug()}/targets/)",
                 flush=True,
@@ -4110,6 +4116,8 @@ def execute_tool(name: str, args: dict) -> str:
             q_val = (args.get("query") or "").strip()
             site_val = (args.get("site") or "").strip()
             max_r = int(args.get("max_results") or 8)
+            if not confirm_action(f"Execute online web_search for `{q_val}`" + (f" (site={site_val})?" if site_val else "?")):
+                return f"User declined `web_search({q_val})`."
             print(
                 f"\n\033[1;36m[Agent Tool -> web_search]\033[0m query='{q_val}'"
                 + (f" site='{site_val}'" if site_val else ""),
@@ -4132,6 +4140,8 @@ def execute_tool(name: str, args: dict) -> str:
 
             u_val = (args.get("url") or args.get("target") or "").strip()
             qf_val = (args.get("query_filter") or args.get("query") or "").strip()
+            if not confirm_action(f"Fetch external webpage `{u_val}`?"):
+                return f"User declined `fetch_webpage({u_val})`."
             print(
                 f"\n\033[1;36m[Agent Tool -> fetch_webpage]\033[0m {u_val}"
                 + (f" (filter='{qf_val}')" if qf_val else ""),
