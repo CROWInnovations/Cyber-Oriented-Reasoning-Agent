@@ -97,13 +97,18 @@ def _bind(hv_a, hv_b):
 
 
 def _bundle(hvs: List[Any], dim: Optional[int] = None):
-    """Superposition (majority-rule sign of sum) of multiple hypervectors."""
+    """Superposition (majority-rule sign of sum) of multiple hypervectors with deterministic coordinate-cycling tie-breaking."""
     import numpy as np
 
     if not hvs:
         return np.ones(int(dim or VSA_DIM), dtype=np.float32)
-    s = np.sum(hvs, axis=0)
-    s = np.where(s == 0, hvs[0], s)
+    if len(hvs) == 1:
+        return np.sign(hvs[0]).astype(np.float32)
+    arr = np.asarray(hvs, dtype=np.float32)
+    s = np.sum(arr, axis=0)
+    n_vecs, d = arr.shape[0], arr.shape[1]
+    tie_breaker = arr[np.arange(d) % n_vecs, np.arange(d)]
+    s = np.where(s == 0, tie_breaker, s)
     return np.sign(s).astype(np.float32)
 
 
@@ -292,27 +297,89 @@ def compute_somatic_gut_valence(
     )
 
     # Current situational vector (flag rabbit-hole traps only on genuine repetition/hang/loss loops)
-    has_trap_signal = any(
+    has_repetition_or_hang = any(
         k in prob_low
-        for k in ("100% packet loss", "repeated", "still failing", "hung", "loop", "exhausted", "blocked again", "timed out again")
+        for k in (
+            "repeated",
+            "still failing",
+            "hung",
+            "loop",
+            "exhausted",
+            "blocked again",
+            "timed out again",
+            "failed again",
+            "multiple attempts",
+            "stuck",
+        )
     )
-    live_posture = (
-        "unbounded_blocking_or_wrong_subnet" if has_trap_signal else "bounded_verified_probe_with_fallback"
+    loss_mentions = prob_low.count("100% packet loss") + prob_low.count("100% loss")
+    has_trap_signal = has_repetition_or_hang or (loss_mentions >= 2)
+    has_mild_loss = (loss_mentions == 1) and not has_trap_signal
+
+    has_verified_or_bounded_cues = any(
+        k in prob_low
+        for k in (
+            "-c ",
+            "--connect-timeout",
+            "ip neigh",
+            "ip route",
+            "ss -",
+            "tio",
+            "ttyusb",
+            "nmap",
+            "arp",
+            "sysctl",
+            "reachable",
+            "200 ok",
+            "open",
+        )
     )
-    live_outcome = "timeout_or_refused_loop" if has_trap_signal else "high_eig_breakthrough"
-    live_hv = encode_scenario_hv(
-        {
-            "symptom": symptom,
-            "control_channel": channel,
-            "posture": live_posture,
-            "outcome": live_outcome,
-        },
-        active_dim,
-    )
+
+    if has_trap_signal:
+        live_channel = (
+            "blind_repeated_inband_retry_without_l2_check"
+            if any(k in prob_low for k in ("repeated", "loop", "again", "still failing", "blind"))
+            else channel
+        )
+        live_posture = "unbounded_blocking_or_wrong_subnet"
+        live_outcome = "timeout_or_refused_loop"
+    elif has_mild_loss:
+        live_channel = channel
+        live_posture = (
+            "bounded_verified_probe_with_fallback"
+            if has_verified_or_bounded_cues
+            else "initial_single_loss_observation"
+        )
+        live_outcome = "single_probe_packet_loss_needs_l2_check"
+    else:
+        live_channel = channel
+        live_posture = (
+            "bounded_verified_probe_with_fallback"
+            if (has_verified_or_bounded_cues or best_resonance >= 0.55)
+            else "exploratory_diagnostic_posture"
+        )
+        live_outcome = (
+            "high_eig_breakthrough"
+            if (has_verified_or_bounded_cues or best_resonance >= 0.65 or any(k in prob_low for k in ("exit 7", "refused", "401", "403", "route", "subnet", "serial")))
+            else "pending_diagnostic_verification"
+        )
+
+    live_roles = {
+        "symptom": symptom,
+        "control_channel": live_channel,
+        "posture": live_posture,
+        "outcome": live_outcome,
+    }
+    for extra_k, extra_v in observed_roles.items():
+        if extra_k not in live_roles and extra_v:
+            live_roles[extra_k] = str(extra_v)
+
+    live_hv = encode_scenario_hv(live_roles, active_dim)
 
     sim_breakthrough = _cosine_sim(live_hv, proto_breakthrough)
     sim_trap = _cosine_sim(live_hv, proto_trap)
-    base_valence = (sim_breakthrough - sim_trap) * 0.85 + (best_resonance * 0.35)
+    mild_loss_penalty = 0.12 if has_mild_loss else 0.0
+    base_valence = (sim_breakthrough - sim_trap) * 0.85 + (best_resonance * 0.35) - mild_loss_penalty
 
     # Blend with learned experiential somatic markers if present
     store = load_json_state(SOMATIC_MARKERS_FILE, {"markers": {}})

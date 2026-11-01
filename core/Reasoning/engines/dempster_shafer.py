@@ -14,7 +14,14 @@ Capabilities:
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from .vault_bridge import ensure_directories, get_hardware_reasoning_limits, save_json_data, save_reasoning_to_vault, slugify
+from .vault_bridge import (
+    ensure_directories,
+    get_hardware_reasoning_limits,
+    resolve_problem_targets,
+    save_json_data,
+    save_reasoning_to_vault,
+    slugify,
+)
 
 FRAME_HYPOTHESES = (
     "l2_l3_network_unreachable",
@@ -123,11 +130,28 @@ def _dempster_combine_two(
     """
     Combine two mass functions `m1` and `m2` over singleton hypotheses + `OMEGA_IGNORANCE`
     and return `(combined_mass, pairwise_conflict_K)`.
+    Accounts for compatible intra-layer focal overlap so consistent sensors (e.g. `arp` + `ping`,
+    or `timeout` + `ping_fails`) do not generate false orthogonal conflict K.
     """
     hyps = list(FRAME_HYPOTHESES)
     conflict_k = 0.0
     raw: Dict[str, float] = {h: 0.0 for h in hyps}
     raw["OMEGA_IGNORANCE"] = 0.0
+
+    # Detect when both sensors consistently rule out L2/L3 unreachability (both support L4/L7 causes)
+    both_l2_l3_reachable = (
+        m1.get("l2_l3_network_unreachable", 0.0) <= 0.08
+        and m2.get("l2_l3_network_unreachable", 0.0) <= 0.08
+    )
+    # Detect when both sensors consistently report timeout/drop/unreachability
+    both_timeout_or_unreachable = (
+        m1.get("l2_l3_network_unreachable", 0.0) >= 0.40
+        and m2.get("l2_l3_network_unreachable", 0.0) >= 0.40
+        and m1.get("service_loopback_or_nonstandard_port", 0.0) <= 0.15
+        and m2.get("service_loopback_or_nonstandard_port", 0.0) <= 0.15
+    )
+    upper_layer_pair = {"host_firewall_or_acl_filtering", "service_loopback_or_nonstandard_port"}
+    drop_layer_pair = {"l2_l3_network_unreachable", "host_firewall_or_acl_filtering"}
 
     for k1, v1 in m1.items():
         for k2, v2 in m2.items():
@@ -140,6 +164,20 @@ def _dempster_combine_two(
                 raw[k1] = raw.get(k1, 0.0) + prod
             elif k1 == k2:
                 raw[k1] = raw.get(k1, 0.0) + prod
+            elif both_l2_l3_reachable and {k1, k2} == upper_layer_pair:
+                # Compatible L4/L7 focal overlap when both sensors agree L2/L3 is reachable
+                compat_share = 0.80 * prod
+                denom_w = (v1 + v2) if (v1 + v2) > 1e-9 else 1.0
+                raw[k1] = raw.get(k1, 0.0) + compat_share * (v1 / denom_w)
+                raw[k2] = raw.get(k2, 0.0) + compat_share * (v2 / denom_w)
+                conflict_k += 0.20 * prod
+            elif both_timeout_or_unreachable and {k1, k2} == drop_layer_pair:
+                # Compatible timeout/drop focal overlap when both sensors observe silence/loss
+                compat_share = 0.80 * prod
+                denom_w = (v1 + v2) if (v1 + v2) > 1e-9 else 1.0
+                raw[k1] = raw.get(k1, 0.0) + compat_share * (v1 / denom_w)
+                raw[k2] = raw.get(k2, 0.0) + compat_share * (v2 / denom_w)
+                conflict_k += 0.20 * prod
             else:
                 conflict_k += prod
 
@@ -167,7 +205,12 @@ def run_dempster_shafer_reasoning(
     save_to_vault = save_to_vault or export_to_vault
     try:
         ensure_directories()
-        ev = dict(observed_evidence or {})
+        if isinstance(observed_evidence, dict):
+            ev: Dict[str, bool] = dict(observed_evidence)
+        elif isinstance(observed_evidence, (list, tuple, set)):
+            ev = {str(k): True for k in observed_evidence if k}
+        else:
+            ev = {}
         p_low = f"{problem} {sensor_text}".lower()
         if "exit 7" in p_low or "refused" in p_low:
             ev.setdefault("curl_exit_7_Immediate_refused", True)
@@ -175,9 +218,48 @@ def run_dempster_shafer_reasoning(
             ev.setdefault("curl_exit_28_timeout", True)
         if "100% packet loss" in p_low or "network is unreachable" in p_low:
             ev.setdefault("icmp_ping_fails", True)
-        if ("arp" in p_low or bool(re.search(r"\breachable\b", p_low)) or "lladdr" in p_low) and "network is unreachable" not in p_low:
+        if re.search(
+            r"\barp\b[^.;\n]*\b(?:incomplete|failed|missing|unresolved)\b|\b(?:incomplete|failed|missing)\b[^.;\n]*\barp\b",
+            p_low,
+        ):
+            ev.setdefault("arp_incomplete_or_missing", True)
+        has_neg_reachability = bool(
+            re.search(
+                r"\b(?:not\s+reachable|unreachable|incomplete|failed)\b",
+                p_low,
+            )
+        )
+        has_pos_arp = bool(
+            "lladdr" in p_low
+            or re.search(r"(?<!not\s)(?<!un)\breachable\b", p_low)
+            or re.search(
+                r"\barp\b[^.;\n]*\b(?:resolved|mac|reachable|stale|dynamic|permanent|[0-9a-f]{2}(?::[0-9a-f]{2}){5})\b",
+                p_low,
+            )
+        )
+        if has_pos_arp and not has_neg_reachability:
             ev.setdefault("arp_resolved_mac_present", True)
-        if any(k in p_low for k in ("401", "403", "mtls", "client.crt", "https://", "http/1.1 200", "http/2 200")):
+        if any(
+            k in p_low
+            for k in (
+                "401",
+                "403",
+                "unauthorized",
+                "forbidden",
+                "mtls",
+                "client.crt",
+                "tls alert",
+                "ssl alert",
+                "certificate required",
+                "self-signed certificate",
+                "http/1.1 200",
+                "http/2 200",
+                "http/1.1 401",
+                "http/1.1 403",
+                "http/2 401",
+                "http/2 403",
+            )
+        ):
             ev.setdefault("http_401_or_403_or_tls_alert", True)
         if re.search(r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|console)\b", p_low):
             ev.setdefault("serial_console_oob_available", True)
@@ -186,6 +268,8 @@ def run_dempster_shafer_reasoning(
 
         # Deduplicate equivalent canonical keys so aliases are not double-counted
         canonical_map = {
+            "curl_exit_7_refused": "curl_exit_7_Immediate_refused",
+            "curl_exit_7_immediate_refused": "curl_exit_7_Immediate_refused",
             "curl_exit_28_Timeout": "curl_exit_28_timeout",
             "arp_mac_resolved": "arp_resolved_mac_present",
             "arp_resolved_ok": "arp_resolved_mac_present",
@@ -236,7 +320,7 @@ def run_dempster_shafer_reasoning(
             )
         intervals.sort(key=lambda x: -x["pignistic_prob"])
 
-        if max_conflict_k >= 0.45:
+        if max_conflict_k >= 0.35:
             conflict_verdict = (
                 f"HIGH SENSOR CONFLICT (K={max_conflict_k:.2f}): L2/L3 reachability contradicts L4/L7 refusal — "
                 "target is alive on L2, but service is either bound to 127.0.0.1 or filtered by host firewall."
@@ -248,6 +332,18 @@ def run_dempster_shafer_reasoning(
             )
         else:
             conflict_verdict = f"CONSISTENT EVIDENCE (K={max_conflict_k:.2f}, Ignorance={omega:.1%}): Sensor readings converge cleanly."
+
+        ctx = resolve_problem_targets(problem)
+        target_ip = ctx.get("primary_ip", "<TARGET_IP>")
+        top_hyp = intervals[0]["hypothesis"]
+        if ctx.get("target_os") == "windows":
+            diagnostic_probe = f"route print -4 & arp -a {target_ip}"
+        elif top_hyp == "l2_l3_network_unreachable":
+            diagnostic_probe = f"ip route get {target_ip} && ip neigh show {target_ip}"
+        elif top_hyp == "host_firewall_or_acl_filtering":
+            diagnostic_probe = f"ip neigh show {target_ip} && nmap -Pn -p 22,80,443,8080,8443 {target_ip}"
+        else:
+            diagnostic_probe = f"nmap -Pn -p 22,80,443,5000,8000,8080,8443 {target_ip}"
 
         md_lines = [
             "## Dempster-Shafer Evidence Theory (`[Belief, Plausibility]` & Conflict $K$)",
@@ -297,6 +393,7 @@ def run_dempster_shafer_reasoning(
             "conflict_verdict": conflict_verdict,
             "top_hypothesis": intervals[0]["hypothesis"],
             "top_interval": intervals[0]["interval_str"],
+            "diagnostic_probe": diagnostic_probe,
             "intervals": intervals,
             "vault_note": vault_ref,
             "markdown": markdown_report,
@@ -307,7 +404,9 @@ def run_dempster_shafer_reasoning(
             "engine": "dempster_shafer",
             "error": str(exc),
             "ignorance_omega": 0.0,
+            "epistemic_ignorance": 0.0,
             "conflict_mass_k": 0.0,
+            "diagnostic_probe": "",
             "intervals": [],
             "markdown_report": f"Dempster-Shafer Engine Error: {exc}",
         }

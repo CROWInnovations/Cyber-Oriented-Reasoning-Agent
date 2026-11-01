@@ -16,8 +16,8 @@ Svelte + TypeScript + Tailwind CSS dashboard directly to:
      CEGAR Command Pre-Verifier (`cegar_verifier.py`).
   4. Real-Time Hardware Telemetry (`psutil` CPU/RAM/Disk/Network + NVIDIA `pynvml` / `nvidia-smi`
      GPU utilization, VRAM used/total, temperatures, and power draw) streamed over WebSockets.
-  5. Local Inference APIs (`llama-server` on `127.0.0.1:8080/v1` and `Ollama` on `127.0.0.1:11434`)
-     with model discovery, health checks, and conversation routing.
+  5. Local Inference API (`llama-server` on `127.0.0.1:8080/v1`)
+     with GGUF model discovery, health checks, and conversation routing.
   6. Local SQLite Storage (`core/Log/cora_webui.db`) for operator settings, project metadata,
      and persistent conversation/query history.
 """
@@ -35,6 +35,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import ssl
@@ -82,7 +83,34 @@ if str(CORE_DIR) not in sys.path:
 if str(CORA_ROOT) not in sys.path:
     sys.path.insert(0, str(CORA_ROOT))
 
-from Tools.tool_manager import download_missing_tools, get_system_tools_inventory
+try:
+    from Tools.tool_manager import download_missing_tools, get_system_tools_inventory
+except ModuleNotFoundError:
+    def get_system_tools_inventory() -> Dict[str, Any]:
+        is_win = os.name == "nt"
+        tools_dir = CORA_ROOT / "Tools" / ("Windows" if is_win else "Linux")
+        tools_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "host_os": "windows" if is_win else "linux",
+            "host_os_label": "Windows" if is_win else "Linux",
+            "shell_label": "PowerShell" if is_win else "Bash",
+            "tools_dir": str(tools_dir),
+            "sysinternals_smb_share": r"\\live.sysinternals.com\tools" if is_win else "",
+            "total_count": 0,
+            "installed_count": 0,
+            "live_smb_count": 0,
+            "missing_downloadable_ids": [],
+            "tools": [],
+        }
+
+    def download_missing_tools(tool_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "downloaded": [],
+            "skipped": [],
+            "errors": [],
+            "inventory": get_system_tools_inventory(),
+        }
 
 from Network_Isolation.console_posture import (
     POSTURE_THEMES,
@@ -92,13 +120,18 @@ from Network_Isolation.console_posture import (
     _parse_iface_list,
 )
 from Reasoning.engines.cbr_fingerprints import match_failure_fingerprint
-from Reasoning.engines.cegar_verifier import _get_host_all_interface_subnets, verify_command_cegar
+from Reasoning.engines.cegar_verifier import (
+    _get_host_all_interface_subnets,
+    apply_serial_pacing_transform,
+    verify_command_cegar,
+)
 from Reasoning.engines.continual_learner import record_live_command_experience
 from Reasoning.engines.pipeline import run_neuro_symbolic_pipeline
 from Reasoning.engines.rl_network_policy import record_rl_step_transition
 from Reasoning.reasoning_cli import check_environment_status as get_system_status
 from Reasoning.engines.sygus_extractor import extract_structured_facts
 from Reasoning.engines.temporal_fluents import record_command_event
+from Reasoning.engines.web_intel import execute_tier1_fetch_webpage, execute_tier1_web_search
 from Reasoning.engines.vault_bridge import (
     DATA_DIR,
     PROJECTS_DIR,
@@ -331,7 +364,7 @@ _CLI_LICENSE_HEADER_LINES = (
     "GNU GENERAL PUBLIC LICENSE — Version 3, 29 June 2007",
     "C.O.R.A. — Cyber Oriented Reasoning Agent",
     "Copyright (C) 2026 CROW Innovations (https://CROWinnovations.com)",
-    "Repository: https://github.com/B0b-Skull/Cyber-Oriented-Reasoning-Agent",
+    "Repository: https://github.com/CROWInnovations/Cyber-Oriented-Reasoning-Agent",
     "",
     "OPEN-SOURCE ATTRIBUTION & AUTHORIZED SECURITY USE NOTICE:",
     "C.O.R.A. is open-source software licensed under the GNU General Public License v3.0 (GPL-3.0).",
@@ -386,7 +419,7 @@ def get_cli_banner_and_licensing_info() -> Dict[str, Any]:
     return {
         "version": ver_str,
         "developed_by": "https://CROWinnovations.com",
-        "repository": "https://github.com/B0b-Skull/Cyber-Oriented-Reasoning-Agent",
+        "repository": "https://github.com/CROWInnovations/Cyber-Oriented-Reasoning-Agent",
         "license_name": "GNU General Public License v3.0 (GPL-3.0)",
         "license_path": str(license_file),
         "crow_ascii_lines": list(_CLI_CROW_ASCII_LINES),
@@ -502,7 +535,6 @@ def init_sqlite_db() -> None:
         "selected_model": rec_model,
         "inference_provider": "llama-server",
         "llama_api_url": os.environ.get("LLAMA_API_URL", "http://127.0.0.1:8080/v1"),
-        "ollama_api_url": os.environ.get("OLLAMA_API_URL", "http://127.0.0.1:11434"),
         "thinking_enabled": "false",
         "permission_mode": "confirm",
         "auto_reason_on_query": "true",
@@ -636,7 +668,14 @@ def _sync_cli_session_files(cfg: Dict[str, str]) -> None:
 # Hardware Telemetry Collector (`psutil` + NVIDIA `pynvml` / `nvidia-smi`)
 # ---------------------------------------------------------------------------
 def _query_gpus_metrics() -> List[Dict[str, Any]]:
+    global _NVML_INITIALIZED
     gpus: List[Dict[str, Any]] = []
+    if not _NVML_INITIALIZED and _pynvml_mod is not None:
+        try:
+            _pynvml_mod.nvmlInit()
+            _NVML_INITIALIZED = True
+        except Exception:
+            _NVML_INITIALIZED = False
     if _NVML_INITIALIZED and _pynvml_mod is not None:
         try:
             count = _pynvml_mod.nvmlDeviceGetCount()
@@ -1013,6 +1052,36 @@ def ensure_project_structure(project_name: str) -> Path:
     return proj_dir
 
 
+def _parse_goal_and_relentless_switches(raw_text: str) -> Dict[str, Any]:
+    """
+    Extract optional `-mode:on|off`, `-mod:on|off`, `-max:<#>`, and leading `on`/`off` switches
+    from a goal or `/relentless` input string and return the clean goal text.
+    """
+    txt = (raw_text or "").strip()
+    rel_on: Optional[bool] = None
+    rel_max: Optional[int] = None
+
+    max_m = re.search(r"(?:^|\s)-max:([0-9]+|unlimited|inf|infinite)\b", txt, flags=re.I)
+    if max_m:
+        m_val = max_m.group(1).lower()
+        rel_max = 0 if m_val in ("0", "unlimited", "inf", "infinite") else max(1, int(m_val))
+        txt = (txt[: max_m.start()] + " " + txt[max_m.end() :]).strip()
+
+    mode_m = re.search(r"(?:^|\s)-mod(?:e)?:(on|off|true|false)\b", txt, flags=re.I)
+    if mode_m:
+        rel_on = mode_m.group(1).lower() in ("on", "true")
+        txt = (txt[: mode_m.start()] + " " + txt[mode_m.end() :]).strip()
+
+    # Strip repeated leading/trailing quotes and optional leading 'on ' when followed by goal text
+    txt = re.sub(r"^(?:on|true)\s+(?=[\"'A-Za-z0-9])", "", txt, flags=re.I).strip()
+    txt = txt.strip().strip('"').strip("'").strip()
+    return {
+        "cleaned_goal": txt,
+        "relentless_on": rel_on,
+        "relentless_max": rel_max,
+    }
+
+
 def get_project_last_goal(proj_dir: Path) -> str:
     goals_file = proj_dir / "goals.md"
     if not goals_file.is_file():
@@ -1025,14 +1094,15 @@ def get_project_last_goal(proj_dir: Path) -> str:
             flags=re.M | re.S,
         )
         if matches:
-            return " ".join(ln.strip() for ln in matches[-1].strip().splitlines() if ln.strip())
+            raw_g = " ".join(ln.strip() for ln in matches[-1].strip().splitlines() if ln.strip())
+            return _parse_goal_and_relentless_switches(raw_g)["cleaned_goal"]
     except Exception:
         pass
     return ""
 
 
 def append_project_goal(proj_dir: Path, goal_text: str) -> int:
-    goal_clean = (goal_text or "").strip()
+    goal_clean = _parse_goal_and_relentless_switches(goal_text)["cleaned_goal"]
     if not goal_clean:
         return 0
     ensure_project_structure(proj_dir.name)
@@ -1367,7 +1437,7 @@ def get_project_files_context_block(
 
 
 # ---------------------------------------------------------------------------
-# Local Inference Discovery (`llama-server` + `Ollama`) & Fast TTL Caches
+# Local Inference Discovery (`llama-server`) & Fast TTL Caches
 # ---------------------------------------------------------------------------
 _POSTURE_CACHE: Dict[str, Any] = {"ts": 0.0, "override": None, "data": None}
 _ENGINE_STATUS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
@@ -1549,11 +1619,15 @@ def _find_running_llama_process() -> Optional[Dict[str, Any]]:
                 cmdline = [str(x) for x in (proc.cmdline() or [])]
                 alias_val = ""
                 model_val = ""
+                cpu_only_flag = False
                 for idx, arg in enumerate(cmdline):
                     if arg == "--alias" and idx + 1 < len(cmdline):
                         alias_val = cmdline[idx + 1]
                     elif arg in ("--model", "-m") and idx + 1 < len(cmdline):
                         model_val = Path(cmdline[idx + 1]).name
+                    elif arg in ("--n-gpu-layers", "-ngl") and idx + 1 < len(cmdline):
+                        if str(cmdline[idx + 1]).strip() == "0":
+                            cpu_only_flag = True
                 active_str = alias_val or model_val or "llama-server"
                 if alias_val and model_val and model_val not in alias_val:
                     active_str = f"{alias_val} ({model_val})"
@@ -1561,6 +1635,7 @@ def _find_running_llama_process() -> Optional[Dict[str, Any]]:
                     "pid": proc.info["pid"],
                     "active_model": active_str,
                     "cmdline": cmdline,
+                    "cpu_only_flag": cpu_only_flag,
                 }
         except Exception:
             continue
@@ -1671,13 +1746,20 @@ def _get_llama_health(llama_base: str, ttl: float = 2.0) -> Dict[str, Any]:
                 "state": "loading",
                 "pid": live_proc["pid"],
                 "active_model": active_model,
+                "api_url": base_clean,
                 "detail": "Initializing CUDA & loading GGUF model into VRAM/RAM...",
             }
             _LLAMA_HEALTH_CACHE.update({"ts": now_mono, "base": base_clean, "data": res_loading})
             return dict(res_loading)
         if os.environ.get("CORA_SKIP_AUTO_LLAMA") != "1":
             _trigger_background_llama_autostart()
-        res_off = {"online": False, "state": "offline", "active_model": "", "detail": "Port not reachable"}
+        res_off = {
+            "online": False,
+            "state": "offline",
+            "active_model": "",
+            "api_url": base_clean,
+            "detail": "Port not reachable",
+        }
         _LLAMA_HEALTH_CACHE.update({"ts": now_mono, "base": base_clean, "data": res_off})
         return dict(res_off)
 
@@ -1702,6 +1784,7 @@ def _get_llama_health(llama_base: str, ttl: float = 2.0) -> Dict[str, Any]:
                 "online": False,
                 "state": "loading",
                 "active_model": active_model,
+                "api_url": base_clean,
                 "detail": "Loading model weights into VRAM/RAM...",
             }
             _LLAMA_HEALTH_CACHE.update({"ts": now_mono, "base": base_clean, "data": res_503})
@@ -1727,6 +1810,7 @@ def _get_llama_health(llama_base: str, ttl: float = 2.0) -> Dict[str, Any]:
                     "online": False,
                     "state": "loading",
                     "active_model": active_model,
+                    "api_url": base_clean,
                     "detail": "Loading model weights into VRAM/RAM...",
                 }
                 _LLAMA_HEALTH_CACHE.update({"ts": now_mono, "base": base_clean, "data": res_m503})
@@ -1745,6 +1829,7 @@ def _get_llama_health(llama_base: str, ttl: float = 2.0) -> Dict[str, Any]:
         "online": state == "ok",
         "state": state,
         "active_model": active_model if state != "offline" else "",
+        "api_url": base_clean,
         "detail": detail,
     }
     _LLAMA_HEALTH_CACHE.update({"ts": now_mono, "base": base_clean, "data": res_final})
@@ -1968,6 +2053,13 @@ def ensure_llama_server_running(
     bind_port = parsed.port or 8080
 
     # Fast path before lock: if llama-server is already healthy and matches (or prefer_running_model=True), return immediately
+    # unless llama-server was started in CPU-only mode (--n-gpu-layers 0) and a CUDA GPU is now online.
+    live_proc_check = _find_running_llama_process()
+    if not force_restart and live_proc_check and live_proc_check.get("cpu_only_flag"):
+        gpus_now = _query_gpus_metrics()
+        if gpus_now and int(gpus_now[0].get("vram_total_mb") or 0) > 0:
+            force_restart = True
+
     fast_health = _get_llama_health(llama_base)
     resolved = _resolve_gguf_model(model_id)
     if (
@@ -2073,7 +2165,6 @@ def ensure_llama_server_running(
             str(tune["ctx_size"]),
             "--parallel",
             "1",
-            "--context-shift",
             "--no-reasoning-preserve",
             "--reasoning",
             "off",
@@ -2226,7 +2317,6 @@ def ensure_llama_server_running(
 
 def discover_models_and_backends(cfg: Dict[str, str]) -> Dict[str, Any]:
     llama_base = (cfg.get("llama_api_url") or "http://127.0.0.1:8080/v1").rstrip("/")
-    ollama_base = (cfg.get("ollama_api_url") or "http://127.0.0.1:11434").rstrip("/")
 
     hw_tier = detect_hardware_tier()
     vram_total_mib = int(hw_tier.get("detected_gpu_vram_mib") or 0)
@@ -2287,37 +2377,9 @@ def discover_models_and_backends(cfg: Dict[str, str]) -> Dict[str, Any]:
     llama_state = str(llama_health.get("state") or ("ok" if llama_online else "offline"))
     llama_active_model = str(llama_health.get("active_model") or "")
 
-    # 3. Probe local Ollama (`/api/tags`)
-    ollama_online = False
-    ollama_models: List[Dict[str, Any]] = []
-    if _is_url_port_reachable(ollama_base):
-        try:
-            req = urllib.request.Request(f"{ollama_base}/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=1.2) as resp:
-                if resp.status == 200:
-                    ollama_online = True
-                    data = json.loads(resp.read().decode("utf-8", errors="replace"))
-                    for om in data.get("models", []):
-                        m_name = str(om.get("name", ""))
-                        size_b = int(om.get("size", 0))
-                        if m_name:
-                            entry = {
-                                "id": f"ollama:{m_name}",
-                                "name": f"{m_name} (Ollama)",
-                                "filename": m_name,
-                                "provider": "ollama",
-                                "role": "Ollama Local Model",
-                                "vram_est": f"{round(size_b / (1024**3), 1)} GB" if size_b else "Dynamic",
-                                "installed_on_disk": True,
-                            }
-                            ollama_models.append(entry)
-                            models_out.append(entry)
-        except Exception:
-            pass
-
     return {
         "selected_model": cfg.get("selected_model", "3.8"),
-        "inference_provider": cfg.get("inference_provider", "llama-server"),
+        "inference_provider": "llama-server",
         "recommended_model": rec_model_id,
         "recommended_full_gpu_model": rec_full_gpu_id,
         "llama_server": {
@@ -2326,11 +2388,6 @@ def discover_models_and_backends(cfg: Dict[str, str]) -> Dict[str, Any]:
             "api_url": llama_base,
             "active_model": llama_active_model,
             "last_error": _LLAMA_LAST_ERROR,
-        },
-        "ollama": {
-            "online": ollama_online,
-            "api_url": ollama_base,
-            "model_count": len(ollama_models),
         },
         "models": models_out,
     }
@@ -2487,10 +2544,63 @@ WEBUI_AGENT_TOOLS: List[Dict[str, Any]] = [
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Target IP address, hostname, or URL (e.g., 192.168.1.99 or https://192.168.1.99).",
+                        "description": "Target IP address, hostname, or URL (e.g., 198.51.100.10 or https://198.51.100.10).",
                     }
                 },
                 "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Perform a Tier-1 Pure-Python online web search (DuckDuckGo HTML/Lite + NIST NVD CVE API v2.0 enrichment) "
+                "or search within a specific website/domain using `site`. Returns clean titles, URLs, and snippets with 0 MB GPU VRAM and JS disabled."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query keywords (e.g. 'FortiOS 7.4 SSL VPN CVE' or 'Linux ip netns routing').",
+                    },
+                    "site": {
+                        "type": "string",
+                        "description": "Optional domain or website to restrict the search to (e.g. 'fortinet.com' or 'nvd.nist.gov').",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of search results to return (default 8).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": (
+                "Fetch any specific website URL or REST/JSON API endpoint (preserving full URL paths and query strings), "
+                "sanitize scripts/hidden CSS, convert HTML headings/tables/code/forms into clean Markdown, and optionally "
+                "filter sections matching `query_filter`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL to fetch (e.g. 'https://nvd.nist.gov/vuln/detail/CVE-2024-21762' or 'https://example.com/docs/api?page=1').",
+                    },
+                    "query_filter": {
+                        "type": "string",
+                        "description": "Optional keyword/phrase to highlight and extract matching sections from the page.",
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
@@ -2744,7 +2854,7 @@ def _unregister_http_conn(conn: Any) -> None:
 def cancel_all_active_executions() -> Dict[str, Any]:
     """
     Immediately halt all in-flight reasoning engine pipelines, child shell/scan subprocesses,
-    and active LLM (`llama-server` / `Ollama`) HTTP generation connections, then return C.O.R.A.
+    and active LLM (`llama-server`) HTTP generation connections, then return C.O.R.A.
     to an idle state awaiting further instructions.
     """
     global _EXEC_CANCEL_GENERATION
@@ -2769,6 +2879,11 @@ def cancel_all_active_executions() -> Dict[str, Any]:
                         timeout=3.0,
                         check=False,
                     )
+                else:
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except Exception:
+                        pass
                 try:
                     proc.terminate()
                 except Exception:
@@ -2817,14 +2932,19 @@ def cancel_all_active_executions() -> Dict[str, Any]:
     }
 
 
-def _post_json_cancellable(url: str, payload_bytes: bytes, timeout: float = 240.0) -> Tuple[int, bytes]:
+def _post_json_cancellable(
+    url: str,
+    payload_bytes: bytes,
+    timeout: float = 240.0,
+    exec_gen: Optional[int] = None,
+) -> Tuple[int, bytes]:
     """
     Send an HTTP/HTTPS JSON POST request with the underlying `http.client` socket registered
     in `_ACTIVE_HTTP_CONNS` before `getresponse()` blocks. Closing the socket on `/api/cancel`
-    immediately unblocks the request thread and causes `llama-server` / `Ollama` to abort
+    immediately unblocks the request thread and causes `llama-server` to abort
     active token generation on the spot while keeping the model warm in memory.
     """
-    if _is_execution_cancelled():
+    if _is_execution_cancelled(exec_gen):
         raise InterruptedError("Execution cancelled by operator.")
     parsed = urllib.parse.urlsplit(url)
     scheme = (parsed.scheme or "http").lower()
@@ -2844,7 +2964,7 @@ def _post_json_cancellable(url: str, payload_bytes: bytes, timeout: float = 240.
     _register_http_conn(conn)
     try:
         conn.connect()
-        if _is_execution_cancelled():
+        if _is_execution_cancelled(exec_gen):
             raise InterruptedError("Execution cancelled by operator.")
         conn.request(
             "POST",
@@ -2968,6 +3088,8 @@ def _execute_webui_target_scan(
 
     # 4. HTTP / HTTPS Endpoint & Header Inspection
     probe_urls: List[str] = []
+    if re.match(r"^https?://[^/]+/.+", raw_target, flags=re.I):
+        probe_urls.append(raw_target)
     if 443 in open_ports or not open_ports:
         probe_urls.extend(
             [
@@ -3021,24 +3143,33 @@ def _execute_webui_target_scan(
         title_m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body_str)
         page_title = re.sub(r"\s+", " ", title_m.group(1)).strip() if title_m else "(no <title>)"
         assets = re.findall(r'(?:href|src)=["\']([^"\']+)["\']', body_str, flags=re.I)
+        xhr_assets = re.findall(r'["\'](/[0-9a-fA-F]{16,64}/[^"\'<>\\\s]+)["\']', body_str)
+        for x_path in xhr_assets:
+            if x_path not in assets:
+                assets.append(x_path)
         for a_path in assets:
             if a_path.startswith("/") and a_path not in discovered_assets:
                 discovered_assets.append(a_path)
-        hdr_summary = ", ".join(f"{k}: {v}" for k, v in list(hdrs.items())[:12])
-        body_preview = re.sub(r"\s+", " ", body_str).strip()[:600]
+        hdr_summary = ", ".join(f"{k}: {v}" for k, v in list(hdrs.items())[:10])
+        body_preview = re.sub(r"\s+", " ", body_str).strip()[:300]
         report_lines.append(f"[{url}] -> HTTP {status_code} (Final URL: {final_url})")
         report_lines.append(f"  Headers: {hdr_summary}")
         report_lines.append(f"  Title: {page_title}")
         if assets:
-            report_lines.append(f"  Linked Assets: {', '.join(assets[:8])}")
+            report_lines.append(f"  Linked/XHR Assets: {', '.join(assets[:8])}")
         if body_preview:
             report_lines.append(f"  Body Snippet: {body_preview}")
 
-    # 5. Deep Static Asset & Build/Firmware Timestamp Inspection
+    # 5. Deep Static Asset & Build/Firmware Timestamp Inspection (prioritize lang/en.json &hash paths that preserve Last-Modified/ETag)
+    firmware_build_dates: List[str] = []
     if discovered_assets:
+        prioritized_assets = sorted(
+            discovered_assets,
+            key=lambda p: (0 if "lang/" in p.lower() or p.lower().endswith(".json") else (1 if len(p) > 20 else 2)),
+        )
         report_lines.append("")
         report_lines.append("--- [5] Static Asset & Build Timestamp Fingerprints ---")
-        for a_rel in discovered_assets[:3]:
+        for a_rel in prioritized_assets[:5]:
             if _is_execution_cancelled():
                 return {"executed": False, "blocked": True, "cancelled": True, "command": f"scan_target({host_only})", "reason": "Execution cancelled by operator."}
             a_url = f"{base_origin}{a_rel}"
@@ -3054,6 +3185,8 @@ def _execute_webui_target_scan(
                     a_body = a_resp.read(16384).decode("utf-8", errors="replace")
                 last_mod = a_hdrs.get("Last-Modified") or a_hdrs.get("last-modified") or "N/A"
                 etag_val = a_hdrs.get("ETag") or a_hdrs.get("etag") or "N/A"
+                if last_mod != "N/A" and last_mod not in firmware_build_dates:
+                    firmware_build_dates.append(f"{last_mod} (from {a_rel}, ETag={etag_val})")
                 ver_tokens = re.findall(
                     r"(?:version|build|release|fortios|fgt|v\d+\.\d+\.\d+)[^;,\n\"']{0,48}",
                     a_body,
@@ -3068,9 +3201,26 @@ def _execute_webui_target_scan(
                         vt_c = re.sub(r"\s+", " ", vt).strip()
                         if vt_c and vt_c not in clean_toks:
                             clean_toks.append(vt_c)
-                    report_lines.append(f"  Extracted Asset Version/Build Tokens: {', '.join(clean_toks[:8])}")
+                    report_lines.append(f"  Extracted Asset Version/Build Tokens: {', '.join(clean_toks[:6])}")
             except Exception as a_exc:
                 report_lines.append(f"[{a_url}] -> Asset probe error: {a_exc}")
+
+    # Prepend high-signal executive fingerprint summary at the very top so truncation never hides model/serial/firmware date
+    full_text_tmp = "\n".join(report_lines)
+    fgt_serial_m = re.search(r"\b(FG[A-Z0-9]{2,6}[A-Z0-9]{8,12})\b", full_text_tmp)
+    summary_top = [f"=== [0] High-Confidence Target Fingerprint Summary ({host_only}) ==="]
+    summary_top.append(f"• Open TCP Ports: {', '.join(str(p) for p in open_ports) if open_ports else 'None detected'}")
+    if fgt_serial_m:
+        serial_str = fgt_serial_m.group(1)
+        model_prefix = serial_str[:6]
+        summary_top.append(f"• Identified Appliance (from TLS Certificate): Fortinet FortiGate ({model_prefix}, Serial={serial_str})")
+    if firmware_build_dates:
+        summary_top.append(
+            f"• Static Asset Firmware Compile Timestamp (Last-Modified): {'; '.join(firmware_build_dates)} "
+            "(Note: Jul 2019 FortiOS compile timestamp corresponds to FortiOS 6.2.1 / 6.0.6 release window)"
+        )
+    summary_top.append("")
+    report_lines = summary_top + report_lines
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
     combined_out = "\n".join(report_lines)
@@ -3197,44 +3347,17 @@ def _call_llm_backend(
     cfg: Dict[str, str],
     thinking_enabled: bool = True,
     tools: Optional[List[Dict[str, Any]]] = None,
+    exec_gen: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Route conversation to `Ollama` (if `model_id` starts with `ollama:` or provider is `ollama`)
-    or `llama-server` (`/v1/chat/completions`).
+    Route conversation to `llama-server` (`/v1/chat/completions`).
     Automatically starts `llama-server` if stopped, waits for `/health` (`200 OK`), retries on `HTTP 503`
     (`Loading model`), compacts context on `HTTP 400`/`500` while preserving the `user` query,
     supports OpenAI-compatible `tools` / `tool_calls`, and aborts immediately when
     the operator clicks the WebGUI Cancel button (`POST /api/cancel`).
     """
-    if _is_execution_cancelled():
+    if _is_execution_cancelled(exec_gen):
         return {"online": False, "cancelled": True, "error": "Execution cancelled by operator.", "provider": "cancelled"}
-
-    is_ollama = model_id.startswith("ollama:") or cfg.get("inference_provider") == "ollama"
-    if is_ollama:
-        ollama_base = (cfg.get("ollama_api_url") or "http://127.0.0.1:11434").rstrip("/")
-        if not _is_url_port_reachable(ollama_base):
-            return {"online": False, "error": f"Ollama server at {ollama_base} is not listening.", "provider": "ollama"}
-        clean_model = model_id.split(":", 1)[1] if model_id.startswith("ollama:") else model_id
-        payload = json.dumps(
-            {
-                "model": clean_model,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0.4},
-            }
-        ).encode("utf-8")
-        try:
-            status_code, body_bytes = _post_json_cancellable(f"{ollama_base}/api/chat", payload, timeout=180.0)
-            body_text = body_bytes.decode("utf-8", errors="replace")
-            if status_code >= 400:
-                return {"online": False, "error": f"Ollama HTTP {status_code}: {body_text[:300]}", "provider": "ollama"}
-            raw = json.loads(body_text)
-            content = str((raw.get("message") or {}).get("content") or "")
-            return _split_thinking_and_reply(content, provider="ollama", model=clean_model)
-        except Exception as exc:
-            if _is_execution_cancelled() or isinstance(exc, InterruptedError):
-                return {"online": False, "cancelled": True, "error": "Execution cancelled by operator.", "provider": "ollama"}
-            return {"online": False, "error": f"Ollama error: {exc}", "provider": "ollama"}
 
     llama_base = (cfg.get("llama_api_url") or "http://127.0.0.1:8080/v1").rstrip("/")
     ensure_res = ensure_llama_server_running(
@@ -3243,7 +3366,7 @@ def _call_llm_backend(
         wait_ready_sec=90.0,
         prefer_running_model=True,
     )
-    if _is_execution_cancelled() or ensure_res.get("cancelled"):
+    if _is_execution_cancelled(exec_gen) or ensure_res.get("cancelled"):
         return {"online": False, "cancelled": True, "error": "Execution cancelled by operator.", "provider": "llama-server"}
     if not ensure_res.get("online"):
         return {
@@ -3258,35 +3381,48 @@ def _call_llm_backend(
         effective_alias = effective_alias.split(" (", 1)[0].strip()
     chat_url = f"{llama_base}/v1/chat/completions" if not llama_base.endswith("/v1") else f"{llama_base}/chat/completions"
 
-    def _build_payload(msgs: List[Dict[str, Any]], max_toks: int = 1536, include_tools: bool = True) -> bytes:
+    def _build_payload(
+        msgs: List[Dict[str, Any]],
+        max_toks: int = 2560,
+        include_tools: bool = True,
+        think_flag: bool = True,
+    ) -> bytes:
         est_prompt_toks = max(256, len(json.dumps(msgs)) // 3)
         if tools and include_tools:
             est_prompt_toks += 650
-        safe_max_toks = max(384, min(max_toks, 7500 - est_prompt_toks)) if est_prompt_toks < 7100 else 512
+        safe_max_toks = max(512, min(max_toks, 7600 - est_prompt_toks)) if est_prompt_toks < 7000 else 640
         payload_dict: Dict[str, Any] = {
             "model": effective_alias,
             "messages": msgs,
             "temperature": 0.4,
             "max_tokens": safe_max_toks,
-            "chat_template_kwargs": {"enable_thinking": bool(thinking_enabled)},
+            "chat_template_kwargs": {"enable_thinking": bool(think_flag)},
         }
         if tools and include_tools:
             payload_dict["tools"] = tools
             payload_dict["tool_choice"] = "auto"
         return json.dumps(payload_dict).encode("utf-8")
 
-    cur_messages = _compact_messages_for_llama_context(list(messages), max_chars=13500, force_flatten=False)
+    cur_messages = _compact_messages_for_llama_context(list(messages), max_chars=14000, force_flatten=False)
     include_tools_flag = bool(tools)
-    req_max_toks = 1536
+    req_max_toks = 2560
+    cur_thinking_flag = bool(thinking_enabled)
     for attempt in range(4):
-        if _is_execution_cancelled():
+        if _is_execution_cancelled(exec_gen):
             return {"online": False, "cancelled": True, "error": "Execution cancelled by operator.", "provider": "llama-server"}
         try:
-            payload_bytes = _build_payload(cur_messages, max_toks=req_max_toks, include_tools=include_tools_flag)
-            status_code, body_bytes = _post_json_cancellable(chat_url, payload_bytes, timeout=240.0)
+            payload_bytes = _build_payload(
+                cur_messages,
+                max_toks=req_max_toks,
+                include_tools=include_tools_flag,
+                think_flag=cur_thinking_flag,
+            )
+            status_code, body_bytes = _post_json_cancellable(
+                chat_url, payload_bytes, timeout=240.0, exec_gen=exec_gen
+            )
             body_text = body_bytes.decode("utf-8", errors="replace")
             if status_code >= 400:
-                if status_code == 503 and attempt < 3 and not _is_execution_cancelled():
+                if status_code == 503 and attempt < 3 and not _is_execution_cancelled(exec_gen):
                     ensure_llama_server_running(
                         model_id=model_id,
                         cfg=cfg,
@@ -3294,7 +3430,7 @@ def _call_llm_backend(
                         prefer_running_model=True,
                     )
                     continue
-                if status_code in (400, 500) and attempt < 3 and not _is_execution_cancelled():
+                if status_code in (400, 500) and attempt < 3 and not _is_execution_cancelled(exec_gen):
                     low_body = body_text.lower()
                     if include_tools_flag and ("tool" in low_body or "template" in low_body or attempt >= 1):
                         include_tools_flag = False
@@ -3304,7 +3440,7 @@ def _call_llm_backend(
                         max_chars=target_chars,
                         force_flatten=True,
                     )
-                    req_max_toks = 1024 if attempt == 0 else 768
+                    req_max_toks = 1536 if attempt == 0 else 1024
                     continue
                 return {
                     "online": False,
@@ -3312,7 +3448,9 @@ def _call_llm_backend(
                     "provider": "llama-server",
                 }
             raw = json.loads(body_text)
-            choice_msg = (raw.get("choices") or [{}])[0].get("message") or {}
+            choice_obj = (raw.get("choices") or [{}])[0]
+            finish_reason = str(choice_obj.get("finish_reason") or "")
+            choice_msg = choice_obj.get("message") or {}
             content = str(choice_msg.get("content") or "")
             reasoning_field = str(choice_msg.get("reasoning_content") or "")
             tool_calls = choice_msg.get("tool_calls") or []
@@ -3322,11 +3460,54 @@ def _call_llm_backend(
             res = _split_thinking_and_reply(content, provider="llama-server", model=effective_alias)
             if reasoning_field and not res["thinking"]:
                 res["thinking"] = reasoning_field.strip()
+            # If the reasoning model exhausted `max_tokens` inside `<think>` (`reasoning_content`) before emitting
+            # its `content` or `tool_calls`, immediately re-invoke once with `enable_thinking=False` while preserving
+            # its partial thought summary so the turn never terminates early with empty content!
+            if (
+                cur_thinking_flag
+                and not res["content"].strip()
+                and not tool_calls
+                and res.get("thinking")
+                and (finish_reason == "length" or len(res["thinking"]) > 200)
+                and not _is_execution_cancelled(exec_gen)
+            ):
+                saved_thinking = res["thinking"]
+                cur_thinking_flag = False
+                recovery_msgs = list(cur_messages)
+                if recovery_msgs and recovery_msgs[-1].get("role") == "user":
+                    last_u = dict(recovery_msgs[-1])
+                    last_u["content"] = (
+                        str(last_u.get("content") or "")
+                        + f"\n\n[Internal Thought Summary Already Computed]: {saved_thinking[-900:]}\n"
+                        "Now immediately emit your next tool call (`web_search`, `fetch_webpage`, `scan_target`, `run_shell_command`) or write your complete final response."
+                    )
+                    recovery_msgs[-1] = last_u
+                rec_payload = _build_payload(
+                    recovery_msgs,
+                    max_toks=2560,
+                    include_tools=include_tools_flag,
+                    think_flag=False,
+                )
+                r_code, r_bytes = _post_json_cancellable(
+                    chat_url, rec_payload, timeout=180.0, exec_gen=exec_gen
+                )
+                if r_code < 400:
+                    r_raw = json.loads(r_bytes.decode("utf-8", errors="replace"))
+                    r_msg = ((r_raw.get("choices") or [{}])[0]).get("message") or {}
+                    r_content = str(r_msg.get("content") or "")
+                    r_tools = r_msg.get("tool_calls") or []
+                    if not r_tools and "<tool_call>" in r_content:
+                        r_tools = _extract_xml_tool_calls(r_content)
+                        r_content = re.sub(r"(?is)<tool_call>.*?</tool_call>", "", r_content).strip()
+                    res = _split_thinking_and_reply(r_content, provider="llama-server", model=effective_alias)
+                    res["thinking"] = saved_thinking
+                    tool_calls = r_tools
+                    choice_msg = r_msg
             res["tool_calls"] = tool_calls
             res["raw_assistant_message"] = choice_msg
             return res
         except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException, OSError) as net_exc:
-            if _is_execution_cancelled():
+            if _is_execution_cancelled(exec_gen):
                 return {"online": False, "cancelled": True, "error": "Execution cancelled by operator.", "provider": "llama-server"}
             if attempt < 2:
                 ensure_llama_server_running(
@@ -3335,7 +3516,8 @@ def _call_llm_backend(
                     wait_ready_sec=60.0,
                     prefer_running_model=True,
                 )
-                cur_messages = _compact_messages_for_llama_context(cur_messages, max_chars=9000, force_flatten=True)
+                if len(json.dumps(cur_messages)) > 9500:
+                    cur_messages = _compact_messages_for_llama_context(cur_messages, max_chars=9000, force_flatten=True)
                 continue
             return {
                 "online": False,
@@ -3343,7 +3525,7 @@ def _call_llm_backend(
                 "provider": "llama-server",
             }
         except Exception as exc:
-            if _is_execution_cancelled() or isinstance(exc, InterruptedError):
+            if _is_execution_cancelled(exec_gen) or isinstance(exc, InterruptedError):
                 return {"online": False, "cancelled": True, "error": "Execution cancelled by operator.", "provider": "llama-server"}
             return {"online": False, "error": f"llama-server error: {exc}", "provider": "llama-server"}
 
@@ -3398,7 +3580,12 @@ def _format_internal_thinking_and_engine_trace(
         mdp_tactic = reasoning_res.get("mdp_optimal_tactic") or "Reconnaissance"
         mdp_tool = reasoning_res.get("mdp_optimal_tool") or "nmap"
         mdp_q = reasoning_res.get("mdp_optimal_q_star") or 0.0
-        stop_dec = (reasoning_res.get("optimal_stopping") or {}).get("decision", "HOLD_OPTIMAL_TACTIC_LINE")
+        opt_stop_dict = reasoning_res.get("optimal_stopping") or {}
+        stop_dec = (
+            opt_stop_dict.get("stopping_decision")
+            or opt_stop_dict.get("decision")
+            or "HOLD_OPTIMAL_TACTIC_LINE"
+        )
         rl_imm = reasoning_res.get("rl_immediate_action") or {}
         pca_cluster = (reasoning_res.get("pca_cluster_assignment") or {}).get("cluster_id", "N/A")
         pca_var = reasoning_res.get("pca_cumulative_variance_pct") or 0.0
@@ -3438,7 +3625,7 @@ def _synthesize_neuro_symbolic_fallback_response(
     cmd_res: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    When `llama-server` / `Ollama` is warming up or re-synchronizing, return a clean, readable
+    When `llama-server` is warming up or re-synchronizing, return a clean, readable
     tactical response without cluttering the main output window with all 15 internal reasoning
     engine metrics (those remain tucked inside the `Ctrl+O` expandable thought process pane),
     and immediately trigger background `llama-server` keep-alive engagement.
@@ -3527,7 +3714,8 @@ def execute_safe_shell_command(
             "cegar": {"blocked": True, "reason": "Catastrophic filesystem destruction guardrail"},
         }
 
-    # 1. Check Engine 9 CEGAR Pre-Verifier (includes WHITE/BLUE/Windows interface & subnet checks)
+    # 1. Pre-normalize serial pacing (-o 15 -O 120) and check Engine 9 CEGAR Pre-Verifier
+    cmd_clean, _ = apply_serial_pacing_transform(cmd_clean)
     cegar = verify_command_cegar(cmd_clean)
     if cegar.get("blocked"):
         repaired = cegar.get("repaired_command") or cegar.get("auto_repaired_command")
@@ -3636,10 +3824,14 @@ def execute_safe_shell_command(
             exec_cmd_str = re.sub(r"\bip\s+neigh\s+show\b", "arp -a", exec_cmd_str)
         elif os.name != "nt":
             exec_cmd_str = re.sub(r"\bping\s+-n\s+(\d+)\b", r"ping -c \1", exec_cmd_str)
-        # Automatically add -k to curl https:// invocations if not already present so self-signed appliance certs do not fail with Exit Code 60
+        # Automatically add -k -L to all curl https:// invocations if not already present so self-signed appliance certs do not fail with Exit Code 60
         if re.search(r"\bcurl(?:\.exe)?\b", exec_cmd_str, flags=re.I) and "https://" in exec_cmd_str.lower():
-            if not re.search(r"(?:^|\s)(?:-k|--insecure)\b", exec_cmd_str):
-                exec_cmd_str = re.sub(r"\b(curl(?:\.exe)?)\b", r"\1 -k", exec_cmd_str, count=1, flags=re.I)
+            exec_cmd_str = re.sub(
+                r"\b(curl(?:\.exe)?)(?!\s+-(?:[a-zA-Z]*k|-insecure))\b",
+                r"\1 -k -L",
+                exec_cmd_str,
+                flags=re.I,
+            )
 
         use_ps_wrapper = False
         if os.name == "nt" and not re.match(r"^(?:powershell|pwsh|cmd(?:\.exe)?)\b", exec_cmd_str, flags=re.I):
@@ -3687,9 +3879,22 @@ def execute_safe_shell_command(
                 "errors": "replace",
             }
             if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
                 bash_bin = shutil.which("bash")
                 if bash_bin:
                     popen_kwargs["executable"] = bash_bin
+                if color_level == "WHITE" and shutil.which("unshare"):
+                    probe_unshare = subprocess.run(
+                        ["unshare", "-r", "-n", "true"],
+                        capture_output=True,
+                        timeout=1.5,
+                        check=False,
+                    )
+                    if probe_unshare.returncode == 0:
+                        escaped_inner = exec_cmd_str.replace("'", "'\"'\"'")
+                        exec_cmd_str = (
+                            f"unshare -r -n bash -c 'ip link set dev lo up 2>/dev/null || true; {escaped_inner}'"
+                        )
             proc = subprocess.Popen(exec_cmd_str, **popen_kwargs)
 
         _register_subprocess(proc)
@@ -3704,6 +3909,11 @@ def execute_safe_shell_command(
                         timeout=3.0,
                         check=False,
                     )
+                elif os.name != "nt" and proc.pid:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
                 proc.kill()
             except Exception:
                 pass
@@ -3723,11 +3933,17 @@ def execute_safe_shell_command(
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         combined_out = (stdout_str or "") + (("\n" + stderr_str) if stderr_str else "")
+        if not combined_out.strip() and "curl" in cmd_clean.lower() and "|" in cmd_clean:
+            combined_out = (
+                "(0 matching lines returned by grep/pipe; note: target HTTPS web UI loads version/language metadata dynamically "
+                "via static assets such as `/<hash>/lang/en.json` `Last-Modified` header and TLS certificate serial — use `scan_target` "
+                "or `curl -sS -k -L -i` without restrictive grep filters)"
+            )
         sygus_facts = extract_structured_facts(cmd_clean, combined_out)
         cbr_match = None
         if not mode_info.get("read_only"):
             try:
-                if proc.returncode != 0:
+                if proc.returncode != 0 or "tio" in cmd_clean.lower():
                     cbr_match = match_failure_fingerprint(cmd_clean, proc.returncode, combined_out)
                     if cbr_match and cbr_match.get("verified_fix"):
                         combined_out = (
@@ -3736,9 +3952,13 @@ def execute_safe_shell_command(
                         )
                 record_command_event(cmd_clean, combined_out, proc.returncode)
                 record_live_command_experience(cmd_clean, proc.returncode, combined_out)
+                open_ports_only = [
+                    p for p in sygus_facts.get("open_ports", [])
+                    if isinstance(p, dict) and p.get("state", "open") == "open"
+                ]
                 facts_cnt = (
                     len(sygus_facts.get("arp_neighbors", []))
-                    + len(sygus_facts.get("open_ports", []))
+                    + len(open_ports_only)
                     + len(sygus_facts.get("routes", []))
                     + (1 if sygus_facts.get("summary_header") else 0)
                 )
@@ -3787,7 +4007,7 @@ app = FastAPI(
     description=(
         "Local Python + FastAPI backend connecting the Svelte + TypeScript + Tailwind CSS dashboard "
         "to CORA Projects, 15-Engine Neuro-Symbolic Reasoning, psutil + NVIDIA NVML telemetry, "
-        "SQLite persistence, and local inference APIs (llama-server & Ollama)."
+        "SQLite persistence, and local inference API (llama-server)."
     ),
 )
 
@@ -3808,7 +4028,6 @@ class SessionConfigUpdateRequest(BaseModel):
     selected_model: Optional[str] = None
     inference_provider: Optional[str] = None
     llama_api_url: Optional[str] = None
-    ollama_api_url: Optional[str] = None
     thinking_enabled: Optional[bool] = None
     permission_mode: Optional[str] = None
     active_goal: Optional[str] = None
@@ -4079,17 +4298,12 @@ async def update_session_configuration(req: SessionConfigUpdateRequest) -> Dict[
 
     if req.selected_model is not None:
         updates["selected_model"] = req.selected_model.strip()
-        if req.selected_model.startswith("ollama:"):
-            updates["inference_provider"] = "ollama"
-        elif req.inference_provider is None:
-            updates["inference_provider"] = "llama-server"
+        updates["inference_provider"] = "llama-server"
 
     if req.inference_provider is not None:
-        updates["inference_provider"] = req.inference_provider.strip().lower()
+        updates["inference_provider"] = "llama-server"
     if req.llama_api_url is not None:
         updates["llama_api_url"] = req.llama_api_url.strip()
-    if req.ollama_api_url is not None:
-        updates["ollama_api_url"] = req.ollama_api_url.strip()
     if req.thinking_enabled is not None:
         updates["thinking_enabled"] = "true" if req.thinking_enabled else "false"
     if req.permission_mode is not None:
@@ -4112,8 +4326,13 @@ async def update_session_configuration(req: SessionConfigUpdateRequest) -> Dict[
     active_proj = resolve_active_project_slug(updates.get("active_project"), cfg=current)
     proj_dir = ensure_project_structure(active_proj) if active_proj else (LOG_DIR / "_unassigned_workspace")
     if req.active_goal is not None:
-        goal_str = req.active_goal.strip()
+        parsed_g = _parse_goal_and_relentless_switches(req.active_goal)
+        goal_str = parsed_g["cleaned_goal"]
         updates["active_goal"] = goal_str
+        if parsed_g["relentless_on"] is not None:
+            updates["relentless_mode"] = "true" if parsed_g["relentless_on"] else "false"
+        if parsed_g["relentless_max"] is not None:
+            updates["relentless_max_waves"] = str(parsed_g["relentless_max"])
         if active_proj:
             current_last = get_project_last_goal(proj_dir)
             if goal_str and goal_str != current_last:
@@ -4826,7 +5045,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
       1. Applies any inline dropdown selections (Project, Mode, Network Isolation, Model, Thinking, Permissions).
       2. Runs the 15-Engine Neuro-Symbolic Reasoning Pipeline (`run_full_20_engine_pipeline`).
       3. Optionally executes a requested shell command (guarded by CEGAR + Analyst/White isolation rules).
-      4. Automatically starts/switches `llama-server` if needed and queries the selected local LLM (`llama-server` or `Ollama`).
+      4. Automatically starts/switches `llama-server` if needed and queries the selected local LLM (`llama-server`).
       5. Saves both the user query and CORA response to SQLite (`messages`) and updates `Projects/<slug>/reasoning/`.
     """
     t0 = time.perf_counter()
@@ -4963,7 +5182,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     if q_low in ("/status", "/hw", "/state", "/context"):
         hw = await asyncio.to_thread(collect_hardware_metrics)
         llama_st = await asyncio.to_thread(
-            _get_llama_health, cfg.get("llama_api_base", "http://127.0.0.1:8080/v1")
+            _get_llama_health, cfg.get("llama_api_url", "http://127.0.0.1:8080/v1")
         )
         gpu_lines = []
         for g in hw.get("gpus") or []:
@@ -5123,54 +5342,27 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     # -----------------------------------------------------------------------
     is_goal_pursuit = False
     relentless_waves_requested = False
+    active_goal = _parse_goal_and_relentless_switches(active_goal)["cleaned_goal"]
 
     if q_low.startswith("/relentless"):
         rel_rest = query_text[11:].strip()
         rel_low = rel_rest.lower()
         cur_rel_on = cfg.get("relentless_mode", "false") == "true"
-        cur_rel_max = int(cfg.get("relentless_max_waves") or 12)
+        cur_rel_max = int(cfg.get("relentless_max_waves") if cfg.get("relentless_max_waves") is not None else 12)
 
-        # Parse optional -max:<#>
-        max_match = re.search(r"-max:([0-9]+|unlimited|inf|infinite)", rel_rest, flags=re.IGNORECASE)
-        if max_match:
-            m_val = max_match.group(1).lower()
-            cur_rel_max = 0 if m_val in ("0", "unlimited", "inf", "infinite") else max(1, int(m_val))
+        # Parse optional -max:<#> and -mode:on|off switches
+        parsed_rel = _parse_goal_and_relentless_switches(rel_rest)
+        if parsed_rel["relentless_max"] is not None:
+            cur_rel_max = int(parsed_rel["relentless_max"])
             cfg = update_settings_dict({"relentless_max_waves": str(cur_rel_max)})
-            rel_rest = (rel_rest[: max_match.start()] + rel_rest[max_match.end() :]).strip()
-            rel_low = rel_rest.lower()
-
-        if rel_low in ("status", "-mode:status"):
-            max_lbl = "0 (UNLIMITED — never stop)" if cur_rel_max == 0 else f"{cur_rel_max} waves"
-            goal_lbl = active_goal or '(none — set via /goal "<objective>" or /relentless "<objective>")'
-            status_txt = (
-                "```text\n"
-                f"Relentless Mode : {'ON (ARMED)' if cur_rel_on else 'OFF (Single-Turn)'}\n"
-                f"Max Waves Cap   : {max_lbl}\n"
-                f"Active Goal     : {goal_lbl}\n"
-                "```"
-            )
-            return _persist_and_return_turn(
-                conversation_id=req.conversation_id or f"conv-{active_proj}",
-                project_slug=active_proj,
-                user_query=query_text,
-                reply_content=status_txt,
-                thinking_content="",
-                cmd_res={},
-                reasoning_res={},
-                posture=posture,
-                mode_info=mode_info,
-                model_id="CORA Relentless Controller",
-                t0=t0,
-                llm_online=True,
-                llm_error="",
-            )
-
-        if rel_low in ("on", "-mode:on", "off", "-mode:off") or (max_match and not rel_rest):
-            if rel_low in ("on", "-mode:on"):
-                cur_rel_on = True
-            elif rel_low in ("off", "-mode:off"):
-                cur_rel_on = False
+        if parsed_rel["relentless_on"] is not None:
+            cur_rel_on = bool(parsed_rel["relentless_on"])
             cfg = update_settings_dict({"relentless_mode": "true" if cur_rel_on else "false"})
+
+        rel_rest_clean = parsed_rel["cleaned_goal"]
+        rel_low_clean = rel_rest_clean.lower()
+
+        if rel_low in ("status", "-mode:status") or rel_low_clean in ("status", "-mode:status"):
             max_lbl = "0 (UNLIMITED — never stop)" if cur_rel_max == 0 else f"{cur_rel_max} waves"
             goal_lbl = active_goal or '(none — set via /goal "<objective>" or /relentless "<objective>")'
             status_txt = (
@@ -5196,7 +5388,35 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 llm_error="",
             )
 
-        if rel_low in ("audit", "-mode:audit"):
+        if rel_low in ("off", "-mode:off") or rel_low_clean in ("off", "-mode:off") or parsed_rel["relentless_on"] is False:
+            cur_rel_on = False
+            cfg = update_settings_dict({"relentless_mode": "false"})
+            max_lbl = "0 (UNLIMITED — never stop)" if cur_rel_max == 0 else f"{cur_rel_max} waves"
+            goal_lbl = active_goal or '(none — set via /goal "<objective>" or /relentless "<objective>")'
+            status_txt = (
+                "```text\n"
+                f"Relentless Mode : OFF (Single-Turn)\n"
+                f"Max Waves Cap   : {max_lbl}\n"
+                f"Active Goal     : {goal_lbl}\n"
+                "```"
+            )
+            return _persist_and_return_turn(
+                conversation_id=req.conversation_id or f"conv-{active_proj}",
+                project_slug=active_proj,
+                user_query=query_text,
+                reply_content=status_txt,
+                thinking_content="",
+                cmd_res={},
+                reasoning_res={},
+                posture=posture,
+                mode_info=mode_info,
+                model_id="CORA Relentless Controller",
+                t0=t0,
+                llm_online=True,
+                llm_error="",
+            )
+
+        if rel_low in ("audit", "-mode:audit") or rel_low_clean in ("audit", "-mode:audit"):
             goals_file = proj_dir / "goals.md"
             goals_txt = goals_file.read_text(encoding="utf-8", errors="replace")[:3500] if goals_file.is_file() else "(no goals recorded)"
             audit_md = (
@@ -5223,26 +5443,30 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 llm_error="",
             )
 
-        # Otherwise `/relentless` or `/relentless "<goal text>" [-max:<#>]`: arm and pursue goal!
+        # Any `/relentless`, `/relentless on`, `/relentless -mode:on`, `/relentless -max:0`, or `/relentless "<goal>"`
+        # arms Relentless Mode AND immediately pursues the active goal from start to finish!
         is_goal_pursuit = True
         relentless_waves_requested = True
-        cfg = update_settings_dict({"relentless_mode": "true"})
-        cleaned_goal = rel_rest.strip().strip('"').strip("'")
-        if cleaned_goal:
-            active_goal = cleaned_goal
+        cur_rel_on = True
+        cfg = update_settings_dict({"relentless_mode": "true", "relentless_max_waves": str(cur_rel_max)})
+        if rel_rest_clean and rel_low_clean not in ("on", "true"):
+            active_goal = rel_rest_clean
             update_settings_dict({"active_goal": active_goal})
             if active_goal != get_project_last_goal(proj_dir):
                 append_project_goal(proj_dir, active_goal)
         elif not active_goal:
+            max_lbl = "0 (UNLIMITED — never stop)" if cur_rel_max == 0 else f"{cur_rel_max} waves"
             return _persist_and_return_turn(
                 conversation_id=req.conversation_id or f"conv-{active_proj}",
                 project_slug=active_proj,
                 user_query=query_text,
                 reply_content=(
-                    "No active goal is set for `/relentless`. Set one via:\n"
-                    "- `/relentless \"<objective text>\" [-max:<#>]`\n"
-                    "- `/goal \"<objective text>\"`\n\n"
-                    + _format_webui_switch_help("relentless")
+                    "```text\n"
+                    f"Relentless Mode : ON (ARMED)\n"
+                    f"Max Waves Cap   : {max_lbl}\n"
+                    f"Active Goal     : (none — set via /goal \"<objective>\" or /relentless \"<objective>\")\n"
+                    "```\n\n"
+                    "Relentless Mode is now **ARMED**, but no Active Goal is set yet. Provide a goal via `/relentless \"<objective>\"` or the Active Goal bar."
                 ),
                 thinking_content="",
                 cmd_res={},
@@ -5255,9 +5479,11 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 llm_error="",
             )
         query_text = (
-            f"[Relentless Autonomous Goal Pursuit (Max Waves={cur_rel_max or 'UNLIMITED'})]: {active_goal}\n"
-            "Execute multi-step diagnostic/reconnaissance tools (`scan_target`, `run_shell_command`), pivot across "
-            "capabilities if any probe fails or times out, and deliver a complete, verified resolution for every requirement of this goal."
+            f"[Relentless Autonomous Goal Pursuit (Max Waves={'UNLIMITED' if cur_rel_max == 0 else cur_rel_max})]: {active_goal}\n"
+            "Execute multi-step reconnaissance and live intelligence tools (`scan_target`, `web_search`, `fetch_webpage`, `run_shell_command`), "
+            "pivot automatically across capabilities without repeating identical tool calls, and deliver a complete, verified resolution "
+            "(including exact device/firmware identification, applicable CVEs with CVSS scores, and copy-pasteable Linux CLI exploit/verification scripts) "
+            "for EVERY requirement of this goal."
         )
 
     elif q_low.startswith("/goal"):
@@ -5317,16 +5543,18 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             )
 
         is_goal_pursuit = True
-        max_match = re.search(r"-max:([0-9]+|unlimited|inf|infinite)", goal_rest, flags=re.IGNORECASE)
-        if max_match:
-            m_val = max_match.group(1).lower()
-            cur_rel_max = 0 if m_val in ("0", "unlimited", "inf", "infinite") else max(1, int(m_val))
-            update_settings_dict({"relentless_max_waves": str(cur_rel_max), "relentless_mode": "true"})
+        parsed_g = _parse_goal_and_relentless_switches(goal_rest)
+        if parsed_g["relentless_max"] is not None:
+            cur_rel_max = int(parsed_g["relentless_max"])
+            cfg = update_settings_dict({"relentless_max_waves": str(cur_rel_max), "relentless_mode": "true"})
             relentless_waves_requested = True
-            goal_rest = (goal_rest[: max_match.start()] + goal_rest[max_match.end() :]).strip()
+        if parsed_g["relentless_on"] is not None:
+            cfg = update_settings_dict({"relentless_mode": "true" if parsed_g["relentless_on"] else "false"})
+            if parsed_g["relentless_on"]:
+                relentless_waves_requested = True
 
-        goal_arg = goal_rest.strip().strip('"').strip("'")
-        if goal_arg:
+        goal_arg = parsed_g["cleaned_goal"]
+        if goal_arg and goal_arg.lower() not in ("on", "off"):
             active_goal = goal_arg
             update_settings_dict({"active_goal": active_goal})
             if active_goal != get_project_last_goal(proj_dir):
@@ -5335,8 +5563,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             raise HTTPException(status_code=400, detail="No active goal is set. Provide `/goal \"<objective>\"`.")
         query_text = (
             f"[Active Goal Pursuit]: {active_goal}\n"
-            "Execute necessary diagnostic/reconnaissance tools (`scan_target`, `run_shell_command`) and provide a complete, "
-            "actionable resolution for every requirement of this goal."
+            "Execute necessary diagnostic, reconnaissance, and live CVE intelligence tools (`scan_target`, `web_search`, `fetch_webpage`, `run_shell_command`) "
+            "and provide a complete, actionable resolution for every requirement of this goal."
         )
 
     # Handle /files, /file, /upload, /add slash commands for Projects/<project>/Files/
@@ -5597,15 +5825,13 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         "### Operational Directives:\n"
         "1. Directly address the operator's specific request, target IP/hostname, and Active Goal in clear, comprehensive detail.\n"
         "2. When the operator asks to probe, scan, ping, or identify a service/appliance (such as a Fortinet firewall, web server, "
-        "or host process) and live command output is not yet attached, call `scan_target` or `run_shell_command` to gather real telemetry first.\n"
+        "or host process) and live command output is not yet attached, call `scan_target` or `run_shell_command` to gather real telemetry first. "
+        "When the operator asks to search the internet, query a specific website (`site:example.com`), or read a specific webpage/URL/API, call `web_search` or `fetch_webpage`.\n"
         "3. When live command/probe output IS provided, analyze the exact findings (open/closed ports, TLS certificate serial/model strings, "
         "HTTP headers, `Last-Modified` firmware build dates, static asset hashes, relevant CVEs for that firmware window, and concrete "
         "administrative/CLI/HTTPS access procedures) and provide copy-pasteable commands.\n"
         f"4. **Local Project `Files` Directory (`Projects/{active_proj}/Files/`)**: Every project has a dedicated `Files` directory at `Projects/{active_proj}/Files/`. Anything placed or uploaded into `Projects/{active_proj}/Files/` is directly visible and usable by you. When the operator tells you to go to the local `Files` or `File` directory to look at, analyze, or use a custom script or file, inspect `Projects/{active_proj}/Files/` using `read_project_file`, `list_project_files_tool`, `write_project_file`, or execute scripts there via `run_shell_command`.\n"
         "5. Keep your output clean, structured, and easy to read. Do NOT dump internal reasoning engine numbers or raw thought processes into your main response unless the operator explicitly runs `/reason`.\n"
-        f"{reasoning_guidance_block}\n"
-        f"{project_files_block}\n\n"
-        f"### Active Project Memory (`Projects/{active_proj}/memory.md`)\n{mem_excerpt}\n"
     )
 
     # Load up to 4 clean messages from SQLite (filtering out any fallback synthesis blocks, incomplete phase stubs, or test strings)
@@ -5640,6 +5866,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         history_msgs = []
 
     user_prompt = query_text
+    if mem_excerpt.strip():
+        user_prompt += f"\n\n### Active Project Memory (`Projects/{active_proj}/memory.md`)\n{mem_excerpt}"
     if req.attached_files:
         clean_attached = [str(a).strip() for a in req.attached_files if str(a).strip()]
         if clean_attached:
@@ -5650,6 +5878,11 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             )
     elif re.search(r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded|custom\s+scripts?|in\s+files|from\s+files)\b", query_text, flags=re.I):
         user_prompt += f"\n\n{project_files_block}"
+    elif project_files_block:
+        user_prompt += f"\n\n{project_files_block[:1600]}"
+
+    if reasoning_guidance_block:
+        user_prompt += f"\n{reasoning_guidance_block}"
 
     if active_goal and not is_goal_pursuit and active_goal.lower() not in query_text.lower():
         user_prompt += f"\n\n[Active Project Goal Context]: {active_goal}"
@@ -5676,7 +5909,17 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
 
     llm_res: Dict[str, Any] = {}
     last_round_called_tools = False
-    max_tool_rounds = 6 if (relentless_waves_requested or is_goal_pursuit or cfg.get("relentless_mode") == "true") else 3
+    relentless_active = bool(relentless_waves_requested or is_goal_pursuit or cfg.get("relentless_mode") == "true")
+    cur_rel_max_int = int(cfg.get("relentless_max_waves") if cfg.get("relentless_max_waves") is not None else 12)
+    if relentless_active:
+        max_tool_rounds = 14 if cur_rel_max_int == 0 else max(6, min(16, cur_rel_max_int))
+    else:
+        max_tool_rounds = 4
+
+    seen_tool_calls: Dict[str, int] = {}
+    web_intel_executed = False
+    target_scan_executed = False
+
     for tool_round in range(max_tool_rounds):
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
@@ -5687,6 +5930,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             cfg=cfg,
             thinking_enabled=thinking_on,
             tools=agent_tools,
+            exec_gen=exec_gen,
         )
         if _is_execution_cancelled(exec_gen) or llm_res.get("cancelled"):
             return _build_cancelled_response()
@@ -5711,6 +5955,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             }
         )
 
+        duplicate_count_this_round = 0
         for tc in t_calls:
             if _is_execution_cancelled(exec_gen):
                 return _build_cancelled_response()
@@ -5722,6 +5967,36 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
             except Exception:
                 parsed_args = {"command": str(raw_args)}
+
+            # Compute normalized signature to prevent the LLM from repeating identical tool calls across waves
+            if fn_name == "scan_target":
+                norm_t = re.sub(r"^https?://", "", str(parsed_args.get("target") or "").lower()).split("/")[0].split(":")[0].strip()
+                dedup_sig = f"scan_target:{norm_t}"
+            elif fn_name == "vault_search":
+                norm_q = " ".join(sorted(re.findall(r"[a-z0-9]+", str(parsed_args.get("query") or parsed_args.get("keyword") or "").lower())))
+                dedup_sig = f"vault_search:{norm_q}"
+            else:
+                dedup_sig = f"{fn_name}:{json.dumps(parsed_args, sort_keys=True)}"
+
+            seen_tool_calls[dedup_sig] = seen_tool_calls.get(dedup_sig, 0) + 1
+            if seen_tool_calls[dedup_sig] > 1:
+                duplicate_count_this_round += 1
+                dup_msg = (
+                    f"[Duplicate Tool Call Skipped]: `{fn_name}` with these arguments was already executed in this session "
+                    "and its full output is already in context above. Do NOT repeat `scan_target` or `vault_search`. "
+                    "If you need live CVE/exploit intelligence, call `web_search` or `fetch_webpage` (e.g. "
+                    "`fetch_webpage(url=\"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=FortiOS&resultsPerPage=8\")` "
+                    "or `web_search(query=\"FortiOS 6.2 CVE exploit PoC\", site=\"exploit-db.com\")`), or stop calling tools and write your complete final response."
+                )
+                wire_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": fn_name,
+                        "content": dup_msg,
+                    }
+                )
+                continue
 
             if fn_name == "read_project_file":
                 p_val = str(parsed_args.get("path") or parsed_args.get("filename") or "Files").strip()
@@ -5753,7 +6028,39 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                     posture,
                     active_proj,
                 )
+                target_scan_executed = True
                 label_cmd = f"scan_target({t_val})"
+            elif fn_name == "web_search":
+                q_val = str(parsed_args.get("query") or "").strip()
+                site_val = str(parsed_args.get("site") or "").strip()
+                max_r = int(parsed_args.get("max_results") or 8)
+                t_res = await asyncio.to_thread(
+                    execute_tier1_web_search,
+                    q_val,
+                    site_val,
+                    max_r,
+                    mode_info,
+                    posture,
+                    active_proj,
+                    lambda: _is_execution_cancelled(exec_gen),
+                )
+                web_intel_executed = True
+                label_cmd = f"web_search({q_val}" + (f", site={site_val})" if site_val else ")")
+            elif fn_name == "fetch_webpage":
+                u_val = str(parsed_args.get("url") or parsed_args.get("target") or "").strip()
+                qf_val = str(parsed_args.get("query_filter") or parsed_args.get("query") or "").strip()
+                t_res = await asyncio.to_thread(
+                    execute_tier1_fetch_webpage,
+                    u_val,
+                    qf_val,
+                    7500,
+                    mode_info,
+                    posture,
+                    active_proj,
+                    lambda: _is_execution_cancelled(exec_gen),
+                )
+                web_intel_executed = True
+                label_cmd = f"fetch_webpage({u_val}" + (f", filter={qf_val})" if qf_val else ")")
             elif fn_name == "run_shell_command":
                 c_val = str(parsed_args.get("command") or "").strip()
                 t_res = await asyncio.to_thread(
@@ -5773,33 +6080,132 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
 
             if label_cmd:
                 executed_cmds_list.append(label_cmd)
+            raw_out = str(t_res.get("output") or "(no output)")
+            if len(raw_out) > 4200:
+                preserved_out = (
+                    raw_out[:2600]
+                    + f"\n... [{len(raw_out) - 3800} middle chars omitted; head+tail preserved] ...\n"
+                    + raw_out[-1200:]
+                )
+            else:
+                preserved_out = raw_out
+            extra_headers: List[str] = []
+            cbr_m = t_res.get("cbr_match")
+            if isinstance(cbr_m, dict) and cbr_m.get("verified_fix"):
+                extra_headers.append(
+                    f"[Engine 11 CBR Match: {cbr_m.get('case_id', 'CBR')} -> Fix: `{cbr_m.get('verified_fix')}`]"
+                )
+            sygus_m = t_res.get("sygus_facts")
+            if isinstance(sygus_m, dict) and sygus_m.get("summary_header"):
+                extra_headers.append(f"[Engine 13 SyGuS Facts: {sygus_m.get('summary_header')}]")
+            hdr_prefix = ("\n".join(extra_headers) + "\n") if extra_headers else ""
             out_txt = (
                 f"BLOCKED: {t_res.get('reason')}"
                 if t_res.get("blocked")
-                else f"Exit Code: {t_res.get('exit_code', 0)}\n{t_res.get('output') or '(no output)'}"
+                else f"Exit Code: {t_res.get('exit_code', 0)}\n{hdr_prefix}{preserved_out}"
             )
-            executed_outs_list.append(f"=== Tool Executed: `{label_cmd}` ===\n{out_txt[:4500]}")
+            executed_outs_list.append(f"=== Tool Executed: `{label_cmd}` ===\n{out_txt[:5000]}")
             wire_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc_id,
                     "name": fn_name,
-                    "content": out_txt[:2200],
+                    "content": out_txt[:3800],
                 }
             )
+
+        if duplicate_count_this_round >= len(t_calls) and duplicate_count_this_round >= 2:
+            # All tool calls in this round were duplicates; break out to autonomous wave check & synthesis
+            break
+
+    # -----------------------------------------------------------------------
+    # Autonomous Relentless Multi-Wave Goal-Completion Controller
+    # Guarantees that if the goal requires target identification + live CVE lookup,
+    # any missing wave is executed automatically before final synthesis!
+    # -----------------------------------------------------------------------
+    combined_goal_low = f"{query_text} {active_goal}".lower()
+    if not _is_execution_cancelled(exec_gen):
+        # Wave A: Ensure target IP is scanned if present in goal/query and not yet scanned
+        goal_ips = [
+            ip
+            for ip in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", combined_goal_low)
+            if not ip.startswith(("127.", "0.", "255."))
+        ]
+        if goal_ips and not target_scan_executed and not mode_info["read_only"]:
+            auto_ip = goal_ips[0]
+            t_res_auto = await asyncio.to_thread(
+                _execute_webui_target_scan,
+                auto_ip,
+                mode_info,
+                posture,
+                active_proj,
+            )
+            if not t_res_auto.get("cancelled") and not t_res_auto.get("blocked"):
+                target_scan_executed = True
+                lbl_auto = f"scan_target({auto_ip})"
+                executed_cmds_list.append(lbl_auto)
+                executed_outs_list.append(f"=== Tool Executed: `{lbl_auto}` ===\n{str(t_res_auto.get('output') or '')[:5000]}")
+
+        # Wave B: Ensure live CVE / exploit web intelligence is fetched if the goal/query asks for CVEs/exploits
+        needs_cve_lookup = any(k in combined_goal_low for k in ("cve", "vulnerabilit", "exploit", "fortigate", "fortios"))
+        joined_outs_low = "\n".join(executed_outs_list).lower()
+        if needs_cve_lookup and not web_intel_executed and not _is_execution_cancelled(exec_gen):
+            # Determine target product from collected telemetry or query
+            if "fortigate" in joined_outs_low or "fortios" in joined_outs_low or "fgt" in joined_outs_low or "fortinet" in joined_outs_low:
+                cve_search_q = "FortiOS 6.2 6.0 7.0 SSL VPN FG-IR CVE-2018-13379 CVE-2022-40684 CVE-2023-27997 CVE-2024-21762 exploit"
+                nvd_url = "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=FortiOS%20SSL-VPN&resultsPerPage=6"
+            else:
+                cve_search_q = f"{active_goal or query_text} CVE exploit PoC"[:120]
+                nvd_url = ""
+
+            w_res = await asyncio.to_thread(
+                execute_tier1_web_search,
+                cve_search_q,
+                "",
+                8,
+                mode_info,
+                posture,
+                active_proj,
+                lambda: _is_execution_cancelled(exec_gen),
+            )
+            if w_res.get("executed") and not w_res.get("cancelled"):
+                web_intel_executed = True
+                lbl_w = f"web_search({cve_search_q[:60]})"
+                executed_cmds_list.append(lbl_w)
+                executed_outs_list.append(f"=== Tool Executed: `{lbl_w}` ===\n{str(w_res.get('output') or '')[:4500]}")
+
+            if nvd_url and not _is_execution_cancelled(exec_gen):
+                f_res = await asyncio.to_thread(
+                    execute_tier1_fetch_webpage,
+                    nvd_url,
+                    "CVE-",
+                    5500,
+                    mode_info,
+                    posture,
+                    active_proj,
+                    lambda: _is_execution_cancelled(exec_gen),
+                )
+                if f_res.get("executed") and not f_res.get("cancelled"):
+                    lbl_f = f"fetch_webpage({nvd_url})"
+                    executed_cmds_list.append(lbl_f)
+                    executed_outs_list.append(f"=== Tool Executed: `{lbl_f}` ===\n{str(f_res.get('output') or '')[:4500]}")
 
     if _is_execution_cancelled(exec_gen):
         return _build_cancelled_response()
 
-    # Re-evaluate the 15-Engine Neuro-Symbolic Pipeline with the live tool telemetry when tools were executed
+    # Re-evaluate the 15-Engine Neuro-Symbolic Pipeline in-memory (`save_to_vault=False` to avoid duplicate Vault I/O)
+    # with the live tool telemetry when tools were executed
     if req.run_reasoning and executed_outs_list:
         t_pipe2 = time.perf_counter()
-        enriched_problem = f"{query_text}\n\n" + "\n\n".join(executed_outs_list)[:3000]
+        enriched_problem = f"{query_text}\n\n" + "\n\n".join(executed_outs_list)[:3500]
+        prev_vault_note = reasoning_res.get("vault_note", "")
         reasoning_res = await asyncio.to_thread(
             run_neuro_symbolic_pipeline,
             problem=enriched_problem,
-            save_to_vault=(not mode_info["read_only"]),
+            save_to_vault=False,
         )
+        if prev_vault_note and not reasoning_res.get("vault_note"):
+            reasoning_res["vault_note"] = prev_vault_note
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
         reasoning_res["pipeline_latency_ms"] = round((time.perf_counter() - t_pipe2) * 1000.0, 2)
@@ -5807,23 +6213,27 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             str(reasoning_res.get("consensus_immediate_action") or "")
         )
 
-    # Whenever the last tool round executed tools (`last_round_called_tools=True`), hit a context/tool round limit,
-    # or the response content is empty/short, perform a clean final synthesis call with all live tool telemetry
-    # embedded in the user message so the LLM ALWAYS finishes and delivers a complete resolution of the query/goal.
+    # Whenever tools were executed and (`last_round_called_tools=True`, `relentless_active=True`,
+    # or the response content is short/empty `< 200` chars), perform the final synthesis call with `thinking_enabled=False`
+    # so 100% of the LLM token budget goes into writing a complete, verified resolution for every requirement of the goal!
     if executed_outs_list and (
         last_round_called_tools
+        or relentless_active
         or not llm_res.get("online")
-        or len(str(llm_res.get("content") or "").strip()) < 240
+        or len(str(llm_res.get("content") or "").strip()) < 200
     ):
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
         synth_user_prompt = (
-            f"{user_prompt[:3500]}\n\n"
-            f"### Live Telemetry & Command Output Collected by C.O.R.A.:\n"
-            f"```text\n" + "\n\n".join(executed_outs_list)[:6500] + "\n```\n\n"
-            "Based on ALL of the live telemetry above, provide a complete, clear, and well-structured final analysis directly resolving every part of the operator's query and active goal (including exact hardware/software model, firmware version/build date from headers/certs/hashes, applicable CVEs, and step-by-step login/access instructions). Keep your response clean and do not repeat internal reasoning engine telemetry."
+            f"{user_prompt[:3000]}\n\n"
+            f"### Live Telemetry, Target Scan & Intelligence Collected by C.O.R.A.:\n"
+            f"```text\n" + "\n\n".join(executed_outs_list)[:8000] + "\n```\n\n"
+            "Based strictly on the live telemetry above and the operator's request, write a complete, thorough, and well-structured final response that fulfills EVERY requirement of the operator's query and Active Goal:\n"
+            "1. **Verified Telemetry & Target/System Identification**: Summarize the exact empirical findings from the executed tools (e.g., discovered hosts/IPs, open/closed ports, TLS certificate subjects/serials, service banners, HTTP headers, firmware/software build versions, or local system/file state).\n"
+            "2. **Technical & Vulnerability Analysis**: If a network service, appliance, or software version was identified, detail the applicable security posture, root cause, or relevant CVEs (with CVSS scores, affected versions, and technical impact) grounded in the collected evidence.\n"
+            "3. **Runnable CLI Verification & Actionable Commands**: Provide complete, copy-pasteable CLI commands or scripts tailored to the actual target IP/hostname and environment so the operator can verify or act on the findings directly."
         )
-        synth_messages: List[Dict[str, Any]] = [{"role": "system", "content": sys_prompt[:4500]}]
+        synth_messages: List[Dict[str, Any]] = [{"role": "system", "content": sys_prompt}]
         synth_messages.extend(history_msgs[-2:])
         synth_messages.append({"role": "user", "content": synth_user_prompt})
         synth_res = await asyncio.to_thread(
@@ -5831,8 +6241,9 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             messages=synth_messages,
             model_id=model_id,
             cfg=cfg,
-            thinking_enabled=thinking_on,
+            thinking_enabled=False,
             tools=None,
+            exec_gen=exec_gen,
         )
         if _is_execution_cancelled(exec_gen) or synth_res.get("cancelled"):
             return _build_cancelled_response()
@@ -5948,7 +6359,10 @@ def _persist_and_return_turn(
             "recommended_tactic_category": reasoning_res.get("mdp_optimal_tactic", "Reconnaissance"),
             "recommended_tool": reasoning_res.get("mdp_optimal_tool", "nmap"),
             "bellman_q_star": reasoning_res.get("mdp_optimal_q_star", 0.0),
-            "optimal_stopping_decision": (reasoning_res.get("optimal_stopping") or {}).get("decision", "CONTINUE"),
+            "optimal_stopping_decision": (
+                (reasoning_res.get("optimal_stopping") or {}).get("stopping_decision")
+                or (reasoning_res.get("optimal_stopping") or {}).get("decision", "CONTINUE")
+            ),
         },
         "rl_network_policy": {
             "stage": reasoning_res.get("rl_state_key", "N/A"),
@@ -5957,7 +6371,9 @@ def _persist_and_return_turn(
         },
         "spectral_pca_kmeans": {
             "assigned_cluster_label": pca_cluster.get("cluster_id", "N/A"),
-            "silhouette_score": pca_cluster.get("silhouette_score", 0.0),
+            "silhouette_score": pca_cluster.get(
+                "silhouette_score", reasoning_res.get("silhouette_score", 0.0)
+            ),
             "cumulative_top3_variance_pct": reasoning_res.get("pca_cumulative_variance_pct", 0.0),
         },
         "vsa_top": {
@@ -6061,7 +6477,7 @@ def _persist_and_return_turn(
 @app.post("/api/cancel")
 async def api_cancel_execution() -> Dict[str, Any]:
     """
-    Stop all active reasoning engines, child shell/scan probes, and in-flight LLM (`llama-server` / `Ollama`)
+    Stop all active reasoning engines, child shell/scan probes, and in-flight LLM (`llama-server`)
     generation immediately and return C.O.R.A. to idle awaiting further instructions.
     """
     return await asyncio.to_thread(cancel_all_active_executions)

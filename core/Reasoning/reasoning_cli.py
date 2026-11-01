@@ -217,6 +217,8 @@ def run_self_tests() -> Dict[str, Any]:
         DATA_DIR / "rl_policy_table.json",
         DATA_DIR / "learned_cbr_cases.json",
         DATA_DIR / "cbr_cases" / "cbr_library.json",
+        DATA_DIR / "mdp_transitions.json",
+        DATA_DIR / "spectral_manifold_state.json",
     ]
     snapshots: Dict[Path, Optional[bytes]] = {}
     for sf in state_files_to_preserve:
@@ -390,6 +392,30 @@ def run_self_tests() -> Dict[str, Any]:
                     sf.unlink()
             except Exception:
                 pass
+        try:
+            from Reasoning.engines import (
+                cbr_fingerprints,
+                mdp_tactical,
+                rl_network_policy,
+                spectral_manifold_pca,
+                vault_bridge,
+            )
+
+            vault_bridge._JSON_STATE_RAM_CACHE.clear()
+            mdp_tactical._MDP_STORE_RAM_CACHE["data"] = None
+            mdp_tactical._MDP_STORE_RAM_CACHE["mtime"] = -1.0
+            mdp_tactical._MDP_STORE_RAM_CACHE["dirty_count"] = 0
+            mdp_tactical._MDP_SOLVED_CACHE["mtime"] = -1.0
+            mdp_tactical._MDP_SOLVED_CACHE["stratified_pool"] = None
+            spectral_manifold_pca._PCA_MANIFOLD_CACHE["mtime"] = -1.0
+            spectral_manifold_pca._PCA_MANIFOLD_CACHE["model"] = None
+            rl_network_policy._RL_RAM_CACHE["mtime"] = -1.0
+            rl_network_policy._RL_RAM_CACHE["store"] = None
+            cbr_fingerprints._CBR_RAM_CACHE["data"] = None
+            cbr_fingerprints._CBR_RAM_CACHE["mtime_base"] = -1.0
+            cbr_fingerprints._CBR_RAM_CACHE["mtime_learned"] = -1.0
+        except Exception:
+            pass
 
     assert cegar_block_tio["blocked"] is True, "CEGAR should block interactive tio without --script"
     assert cegar_pass["blocked"] is False, "CEGAR should allow bounded ping -c 3"
@@ -518,6 +544,7 @@ def _execute_reasoning_tool_impl(mode: str, args: Dict[str, Any]) -> str:
             problem=args.get("problem", "Multi-Step Trajectory RL & Symbolic Network World-Model"),
             target_ip=args.get("target_ip") or args.get("target") or "",
             secondary_target_ip=args.get("secondary_target_ip") or "",
+            observed_evidence=args.get("observed_evidence"),
             train_episodes=int(args.get("train_episodes", 0)),
             sense_topology=bool(args.get("sense_topology", True)),
             export_to_vault=save_vault,
@@ -529,6 +556,7 @@ def _execute_reasoning_tool_impl(mode: str, args: Dict[str, Any]) -> str:
             problem=args.get("problem", "Spectral Manifold PCA, K-Means++ Clustering & Graph Laplacian Chokepoints"),
             target_ip=args.get("target_ip") or args.get("target") or "",
             secondary_target_ip=args.get("secondary_target_ip") or "",
+            observed_evidence=args.get("observed_evidence"),
             force_recompute=bool(args.get("force_recompute", False)),
             export_to_vault=save_vault,
         )

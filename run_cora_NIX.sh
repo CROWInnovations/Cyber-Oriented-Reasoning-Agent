@@ -723,7 +723,7 @@ ensure_bin_runtime_health() {
       chmod +x "$BIN_DIR"/llama* "$BIN_DIR"/ggml* "$BIN_DIR"/*.so* 2>/dev/null || true
     fi
   fi
-  for _cuda_compat in "/usr/local/lib/ollama/cuda_v12" "/usr/local/cuda/compat"; do
+  for _cuda_compat in "/usr/local/cuda/compat" "/usr/local/cuda/lib64"; do
     if [[ -d "$_cuda_compat" && ":${LD_LIBRARY_PATH:-}:" != *":$_cuda_compat:"* ]]; then
       export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$_cuda_compat"
     fi
@@ -788,9 +788,8 @@ detect_hardware_and_tune() {
   GPU_FREE_MIB=0
 
   if command -v nvidia-smi >/dev/null 2>&1; then
-    local gpu_lines gpu_line
-    gpu_lines=$(env -u LD_LIBRARY_PATH nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null || true)
-    if [[ -n "$gpu_lines" && "$gpu_lines" != *"Failed"* ]]; then
+    local gpu_lines="" gpu_line=""
+    if gpu_lines=$(env -u LD_LIBRARY_PATH nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null) && [[ -n "$gpu_lines" && "${gpu_lines,,}" != *"failed"* ]]; then
       GPU_COUNT=$(printf '%s\n' "$gpu_lines" | grep -c '[^[:space:]]' || echo 0)
       gpu_line=$(printf '%s\n' "$gpu_lines" | head -n1)
       GPU_DETECTED=1
@@ -1146,10 +1145,10 @@ start_cora_webui() {
         --port "$LLAMA_PORT" \
         --ctx-size "$CTX_SIZE" \
         --parallel 1 \
-        --context-shift \
         --no-reasoning-preserve \
         "${GPU_ARGS[@]}" \
         "${FEATURE_ARGS[@]}" \
+        "${SERVER_AGENT_ARGS[@]}" \
         "${SAMPLING_GUARD_ARGS[@]}" \
         --threads "$THREADS" \
         --threads-batch "$THREADS_BATCH" \
@@ -1336,7 +1335,6 @@ start_services() {
       --port "$LLAMA_PORT" \
       --ctx-size "$CTX_SIZE" \
       --parallel 1 \
-      --context-shift \
       --no-reasoning-preserve \
       "${GPU_ARGS[@]}" \
       "${FEATURE_ARGS[@]}" \
@@ -1398,7 +1396,6 @@ run_cli() {
       --port "$LLAMA_PORT" \
       --ctx-size "$CTX_SIZE" \
       --parallel 1 \
-      --context-shift \
       --no-reasoning-preserve \
       "${GPU_ARGS[@]}" \
       "${FEATURE_ARGS[@]}" \
@@ -1499,9 +1496,9 @@ status_services() {
   else
     printf '  CORA WebUI:   STOPPED (Start with: ./run_cora_NIX.sh webui  or  ./run_cora_NIX.sh start)\n'
   fi
-  if command -v nvidia-smi >/dev/null 2>&1; then
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     printf '\nGPU Memory Usage:\n'
-    nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total,utilization.gpu --format=csv
+    nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total,utilization.gpu --format=csv || true
   fi
 }
 

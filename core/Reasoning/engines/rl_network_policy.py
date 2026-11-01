@@ -170,6 +170,9 @@ def resolve_monotonic_osi_stage(
     if has_port_fluent and cand_rank < OSI_STAGE_RANK["STAGE_4_BYPASS_ICMP_PORT_SCAN"]:
         if candidate_stage not in ("STAGE_2_OOB_SERIAL_UNLOCK", "STAGE_3_CROSS_SUBNET_L3_ROUTE"):
             return "STAGE_6_L7_SERVICE_GOAL_VERIFY", True
+    if has_route_fluent and cand_rank < OSI_STAGE_RANK["STAGE_4_BYPASS_ICMP_PORT_SCAN"]:
+        if candidate_stage != "STAGE_2_OOB_SERIAL_UNLOCK":
+            return "STAGE_4_BYPASS_ICMP_PORT_SCAN", True
     if has_arp_fluent and candidate_stage == "STAGE_0_UNMAPPED_LOCAL_NET":
         return "STAGE_1_L2_NEIGHBOR_DISCOVERY", True
     return candidate_stage, False
@@ -405,7 +408,20 @@ def encode_symbolic_rl_state(
     p_low = (problem or "").lower()
     ev = observed_evidence or {}
 
-    # Check active holding fluents from Engine 9 (and whether any fluent was explicitly invalidated)
+    # Check active holding fluents from Engine 9 (filtered by current target/interface relevance,
+    # and only set stale_invalidated if a fluent was invalidated on the most recent turn)
+    cur_turn = int(fluents_store.get("turn_counter", 0)) if isinstance(fluents_store, dict) else 0
+    rel_ips = {
+        ip
+        for ip in (
+            ctx.get("target_ip", ""),
+            ctx.get("secondary_target_ip", ""),
+            str(ctx.get("remote_subnet", "")).split("/")[0],
+            topo.get("default_gateway", ""),
+        )
+        if ip and not ip.startswith("<") and ip != "none_detected"
+    }
+    prim_iface = str(topo.get("primary_interface") or ctx.get("primary_interface") or "").lower()
     has_arp_fluent = False
     has_route_fluent = False
     has_port_fluent = False
@@ -413,8 +429,12 @@ def encode_symbolic_rl_state(
     for k, v in fluents.items():
         if isinstance(v, dict):
             st_val = str(v.get("status", ""))
+            ks = f"{k} {v.get('fluent', '')} {v.get('entity', '')} {v.get('value', '')}".lower()
+            fluent_ips = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", ks))
+            if rel_ips and fluent_ips and not (fluent_ips & rel_ips):
+                if not (prim_iface and prim_iface in ks):
+                    continue
             if st_val in ("ACTIVE", "HOLDING"):
-                ks = f"{k} {v.get('fluent', '')}".lower()
                 if "neighbor" in ks or "arp" in ks:
                     has_arp_fluent = True
                 if "route" in ks:
@@ -422,7 +442,8 @@ def encode_symbolic_rl_state(
                 if "port" in ks or "open" in ks:
                     has_port_fluent = True
             elif st_val == "STALE_INVALIDATED":
-                stale_invalidated = True
+                if cur_turn > 0 and int(v.get("updated_turn", -1)) == cur_turn:
+                    stale_invalidated = True
 
     f_vec = extract_feature_vector_from_context(problem, ev)
     if topo.get("interfaces") or topo.get("local_subnets"):
@@ -734,6 +755,7 @@ def record_rl_step_transition(
     exit_code: int,
     new_facts_count: int = 0,
     problem_context: str = "",
+    pre_state_key: str = "",
 ) -> Dict[str, Any]:
     """
     Online Intra-Session RL Update (`TD(lambda)` Eligibility Traces):
@@ -752,8 +774,18 @@ def record_rl_step_transition(
             "td_error": 0.0,
         }
     store = load_or_init_rl_policy()
-    state_info = encode_symbolic_rl_state(problem=f"{problem_context} {command}")
-    s_key = state_info["state_key"]
+    # Extract target IPs/CIDRs from command without passing command verbs (like `replace`) that would prematurely advance pre_state
+    cmd_ips = " ".join(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b", command or ""))
+    pre_prob = f"{problem_context} {cmd_ips}".strip()
+    state_info = encode_symbolic_rl_state(problem=pre_prob)
+    if pre_state_key and "::" in pre_state_key:
+        s_key = pre_state_key
+        c_part, st_part = pre_state_key.split("::", 1)
+        state_info["state_key"] = s_key
+        state_info["cluster_id"] = c_part
+        state_info["stage"] = st_part
+    else:
+        s_key = state_info["state_key"]
 
     # Refresh live network topology cache if a network-modifying command succeeded
     if exit_code == 0 and act_id in ("A0_ENUM_IFACES_AND_ARP", "A1_PROBE_L2_NEIGHBOR", "A3_INJECT_STATIC_ROUTE_AND_FWD"):
@@ -765,6 +797,8 @@ def record_rl_step_transition(
     r_exec = 1.5 if exit_code == 0 else -2.5
     r_novelty = min(10.5, 3.5 * float(new_facts_count))
     opt_act, next_stage = RL_STAGES_OPTIMAL_MAP.get(state_info["stage"], ("A0_ENUM_IFACES_AND_ARP", "STAGE_1_L2_NEIGHBOR_DISCOVERY"))
+    if state_info["cluster_id"] == "C4_L7_API_AUTH_CHALLENGE" and state_info["stage"] == "STAGE_4_BYPASS_ICMP_PORT_SCAN":
+        next_stage = "STAGE_5_L7_AUTH_OR_HEADER_BYPASS"
     r_layer = 4.5 if (exit_code == 0 and act_id == opt_act) else 0.0
     r_goal = 15.0 if (exit_code == 0 and act_id == "A6_CURL_L7_ENDPOINT_VERIFY" and new_facts_count > 0) else 0.0
 
@@ -787,14 +821,33 @@ def record_rl_step_transition(
     n_row[act_id] = int(n_row.get(act_id, 0)) + 1
 
     next_s_key = f"{state_info['cluster_id']}::{next_stage}"
-    next_q_row = q_table.get(next_s_key, {})
-    max_next_q = max(next_q_row.values()) if next_q_row else 0.0
+    stage_advanced = bool(exit_code == 0 and (act_id == opt_act or new_facts_count > 0))
+    post_s_key = next_s_key if stage_advanced else s_key
+    if post_s_key.endswith("::STAGE_7_GOAL_ACHIEVED"):
+        max_next_q = 0.0
+    else:
+        boot_q_row = q_table.get(post_s_key, {})
+        max_next_q = max(boot_q_row.values()) if boot_q_row else 0.0
 
     td_error = total_reward + (gamma * max_next_q) - float(q_row.get(act_id, 0.0))
     v_row[act_id] = round(0.85 * float(v_row.get(act_id, 3.0)) + 0.15 * min(25.0, td_error * td_error), 4)
 
-    # Update eligibility traces over the recent session trajectory
+    # Reset eligibility traces if the target IP changed between episodes
+    cur_target_ip = resolve_problem_targets(problem=pre_prob).get("target_ip", "")
+    prev_target_ip = str(store.get("last_trace_target_ip", "") or "")
     traces: Dict[str, float] = store.get("eligibility_traces", {})
+    if (
+        cur_target_ip
+        and cur_target_ip != "<TARGET_IP>"
+        and prev_target_ip
+        and prev_target_ip != "<TARGET_IP>"
+        and cur_target_ip != prev_target_ip
+    ):
+        traces = {}
+    if cur_target_ip and cur_target_ip != "<TARGET_IP>":
+        store["last_trace_target_ip"] = cur_target_ip
+
+    # Update eligibility traces over the recent session trajectory
     trace_key = f"{s_key}||{act_id}"
     traces[trace_key] = float(traces.get(trace_key, 0.0)) + 1.0
 
@@ -813,6 +866,12 @@ def record_rl_step_transition(
             traces.pop(tk, None)
         else:
             traces[tk] = new_e
+
+    # Reset eligibility traces upon reaching terminal goal stage
+    if post_s_key.endswith(("::STAGE_6_L7_SERVICE_GOAL_VERIFY", "::STAGE_7_GOAL_ACHIEVED")) and (
+        post_s_key.endswith("::STAGE_7_GOAL_ACHIEVED") or r_goal > 0.0
+    ):
+        traces = {}
 
     store["eligibility_traces"] = traces
     recent_traj.append(
@@ -837,7 +896,6 @@ def record_rl_step_transition(
         _RL_RAM_CACHE["mtime"] = time.time()
     _RL_RAM_CACHE["store"] = store
 
-    post_s_key = next_s_key if (exit_code == 0 and (act_id == opt_act or new_facts_count > 0)) else s_key
     return {
         "state_key": s_key,
         "pre_state": s_key,
@@ -905,6 +963,12 @@ def predict_rl_next_step_rollout(
         raw_tmpl = act_meta["windows_template"] if is_windows else act_meta["linux_template"]
         rendered_cmd = render_command_template(raw_tmpl, ctx)
         next_stage = act_meta["unlocks_stage"]
+        if cur_cluster == "C4_L7_API_AUTH_CHALLENGE" and cur_stage == "STAGE_4_BYPASS_ICMP_PORT_SCAN":
+            next_stage = "STAGE_5_L7_AUTH_OR_HEADER_BYPASS"
+        elif cur_cluster == "C2_CROSS_SUBNET_L3_PIVOT" and cur_stage == "STAGE_1_L2_NEIGHBOR_DISCOVERY":
+            next_stage = "STAGE_3_CROSS_SUBNET_L3_ROUTE"
+        elif cur_cluster == "C1_OOB_SERIAL_LOOPBACK_APPLIANCE" and cur_stage == "STAGE_1_L2_NEIGHBOR_DISCOVERY":
+            next_stage = "STAGE_2_OOB_SERIAL_UNLOCK"
 
         rollout.append(
             {

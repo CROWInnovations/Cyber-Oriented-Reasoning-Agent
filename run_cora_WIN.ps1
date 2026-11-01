@@ -916,7 +916,6 @@ function Build-LlamaServerArgumentList([bool]$IncludeServerAgent = $true) {
         "--port", $LlamaPort,
         "--ctx-size", $script:CtxSize,
         "--parallel", "1",
-        "--context-shift",
         "--no-reasoning-preserve"
     )) {
         $argList.Add($a)

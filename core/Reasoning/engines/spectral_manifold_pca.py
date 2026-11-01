@@ -269,7 +269,8 @@ def _fit_pca_and_kmeans_manifold() -> Dict[str, Any]:
 
     hw = get_hardware_reasoning_limits()
     pca_buf_limit = int(hw.get("pca_history_buffer_size", 500))
-    kmeans_iters = max(8, int(hw.get("kmeans_n_init", 12)))
+    kmeans_n_init = max(8, int(hw.get("kmeans_n_init", 12)))
+    kmeans_max_iter = max(kmeans_n_init, int(hw.get("kmeans_max_iter", 100)))
 
     store = load_json_state(MANIFOLD_STATE_FILE, {"observed_vectors": []})
     extra_vecs = store.get("observed_vectors", []) if isinstance(store, dict) else []
@@ -305,7 +306,8 @@ def _fit_pca_and_kmeans_manifold() -> Dict[str, Any]:
 
     # Refine centroids with hardware-scaled iterations of Prototype-Anchored (30% Canonical + 70% Empirical)
     # Lloyd's K-Means++ update over X to prevent centroid drift or archetype label inversion
-    for _ in range(kmeans_iters):
+    for _ in range(kmeans_max_iter):
+        prev_centroids = centroids_12d.copy()
         dists = np.linalg.norm(X[:, None, :] - centroids_12d[None, :, :], axis=-1)
         labels = np.argmin(dists, axis=1)
         for c_idx in range(k_clusters):
@@ -315,6 +317,8 @@ def _fit_pca_and_kmeans_manifold() -> Dict[str, Any]:
                 centroids_12d[c_idx] = (0.30 * proto_centroids_12d[c_idx]) + (0.70 * emp_mean)
             else:
                 centroids_12d[c_idx] = proto_centroids_12d[c_idx]
+        if np.allclose(centroids_12d, prev_centroids, atol=1e-6):
+            break
 
     dists_final = np.linalg.norm(X[:, None, :] - centroids_12d[None, :, :], axis=-1)
     labels_final = np.argmin(dists_final, axis=1)
@@ -330,6 +334,15 @@ def _fit_pca_and_kmeans_manifold() -> Dict[str, Any]:
         labels_final = np.argmin(dists_final, axis=1)
         centroids_pca = (centroids_12d - mean_vec) @ V_k.T
         sil_score = _silhouette_score_numpy(X_pca, labels_final)
+
+    cluster_stds = np.zeros((k_clusters, X.shape[1]), dtype=np.float64)
+    for c_idx in range(k_clusters):
+        mask = (labels_final == c_idx)
+        if np.any(mask):
+            c_std = np.std(X[mask], axis=0)
+            cluster_stds[c_idx] = np.maximum(0.20, 0.5 * c_std + 0.5 * std_safe)
+        else:
+            cluster_stds[c_idx] = np.maximum(0.20, std_safe)
 
     # Extract top feature loadings for PC1, PC2, PC3
     pc_loadings: List[Dict[str, Any]] = []
@@ -362,6 +375,7 @@ def _fit_pca_and_kmeans_manifold() -> Dict[str, Any]:
     model = {
         "mean_vec": mean_vec,
         "std_safe": std_safe,
+        "cluster_stds": cluster_stds,
         "V_k": V_k,
         "explained_ratios": explained_ratios,
         "cumulative_top3_variance_pct": round(float(np.sum(explained_ratios[:3])) * 100.0, 2),
@@ -393,6 +407,7 @@ def quantize_state_to_cluster(feature_vec: List[float]) -> Dict[str, Any]:
     x = np.array(feature_vec, dtype=np.float64)
     mean_vec = model["mean_vec"]
     std_safe = model["std_safe"]
+    cluster_stds = model.get("cluster_stds")
     V_k = model["V_k"]
     centroids_12d = model["centroids_12d"]
 
@@ -405,12 +420,13 @@ def quantize_state_to_cluster(feature_vec: List[float]) -> Dict[str, Any]:
     best_k = int(np.argmin(dists))
     min_dist = float(dists[best_k])
 
-    # Diagonal-regularized Mahalanobis distance from cluster centroid
-    diff_norm = (x - centroids_12d[best_k]) / std_safe
-    mahalanobis_d = float(np.sqrt(np.mean(diff_norm ** 2)))
+    # Per-cluster diagonal-regularized Mahalanobis distance from cluster centroid
+    c_std = cluster_stds[best_k] if cluster_stds is not None else std_safe
+    diff_norm = (x - centroids_12d[best_k]) / c_std
+    mahalanobis_d = float(np.sqrt(np.sum(diff_norm ** 2)))
 
-    mahalanobis_outlier_veto = bool(mahalanobis_d > 3.0 and pca_residual > 1.25)
-    is_anomaly = bool(mahalanobis_outlier_veto or pca_residual > 0.88 or mahalanobis_d > 2.15)
+    mahalanobis_outlier_veto = bool((mahalanobis_d > 3.0 and pca_residual > 0.75) or mahalanobis_d > 4.2 or pca_residual > 1.15)
+    is_anomaly = bool(mahalanobis_outlier_veto or pca_residual > 0.85 or mahalanobis_d > 2.65)
     meta = CLUSTER_ARCHETYPE_LABELS.get(best_k, CLUSTER_ARCHETYPE_LABELS[0])
 
     if mahalanobis_outlier_veto:
@@ -431,6 +447,7 @@ def quantize_state_to_cluster(feature_vec: List[float]) -> Dict[str, Any]:
         "mahalanobis_distance": round(mahalanobis_d, 4),
         "mahalanobis_outlier_veto": mahalanobis_outlier_veto,
         "prototype_anchored": True,
+        "silhouette_score": round(float(model.get("silhouette_score", 0.0)), 4),
         "anomaly_status": anomaly_status,
     }
 
@@ -440,7 +457,7 @@ def record_manifold_observation(feature_vec: List[float]) -> None:
     if not feature_vec or len(feature_vec) != len(FEATURE_NAMES):
         return
     ensure_directories()
-    store = load_json_state(MANIFOLD_STATE_FILE, {"observed_vectors": []})
+    store = load_json_state(MANIFOLD_STATE_FILE, {"observed_vectors": [], "total_observations_count": 0})
     vecs = store.get("observed_vectors", [])
     if not isinstance(vecs, list):
         vecs = []
@@ -449,15 +466,19 @@ def record_manifold_observation(feature_vec: List[float]) -> None:
         hw = get_hardware_reasoning_limits()
         pca_buf_limit = int(hw.get("pca_history_buffer_size", 500))
         vecs.append(rounded)
+        total_obs = int(store.get("total_observations_count", len(vecs) - 1)) + 1
+        store["total_observations_count"] = total_obs
         store["observed_vectors"] = vecs[-pca_buf_limit:]
         store["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
         save_json_state(MANIFOLD_STATE_FILE, store)
         # Keep in-RAM SVD/K-Means++ model valid between periodic refits (refit every 10 novel vectors)
-        if _PCA_MANIFOLD_CACHE.get("model") is not None and (len(vecs) % 10 != 0):
+        if _PCA_MANIFOLD_CACHE.get("model") is not None and (total_obs % 10 != 0):
             try:
                 _PCA_MANIFOLD_CACHE["mtime"] = os.path.getmtime(MANIFOLD_STATE_FILE)
             except OSError:
                 pass
+        else:
+            _PCA_MANIFOLD_CACHE["mtime"] = -1.0
 
 
 append_live_feature_observation = record_manifold_observation

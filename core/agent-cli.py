@@ -3323,7 +3323,8 @@ def build_system_prompt(force_refresh_hw: bool = False) -> str:
         f"Returns a single authoritative `>>> CONSENSUS IMMEDIATE ACTION <<<` + Speculative Next-Tool Branches + 3-Step RL Rollout and saves session reports to `Projects/{active_slug}/reasoning/`.\n"
         f"  7. `run_shell_command`: Execute any {shell_label} command or custom script in `{active_proj_dir / 'Files'}` (`$PROJECT_FILES_DIR`, which is on `PATH`; pre-verified by CEGAR; save downloaded files to `{active_proj_dir / 'downloads'}`; outputs > 2,500 chars are losslessly archived to `Reasoning/data/shadow_archive/`).\n"
         f"  8. `write_file` / `edit_file` / `read_file` / `list_directory`: Full local filesystem access, including direct shorthand access to `Files/<filename>` inside `{active_proj_dir / 'Files'}`.\n"
-        f"  9. `generate_project_report`: Generate a comprehensive 5-section Project Status & Findings Report (`Projects/{active_slug}/REPORT.md` + standalone SVG graphic `assets/report_dashboard.svg`) containing an Executive Summary, a High-School Reading Level Walkthrough, Visual Graphics/Mermaid Diagrams, a Technical Evidence Write-Up, and a Final Conclusion.\n\n"
+        f"  9. `generate_project_report`: Generate a comprehensive 5-section Project Status & Findings Report (`Projects/{active_slug}/REPORT.md` + standalone SVG graphic `assets/report_dashboard.svg`) containing an Executive Summary, a High-School Reading Level Walkthrough, Visual Graphics/Mermaid Diagrams, a Technical Evidence Write-Up, and a Final Conclusion.\n"
+        f"  10. `web_search` / `fetch_webpage`: Tier-1 Pure-Python online web search (DuckDuckGo HTML/Lite + NIST NVD CVE API v2.0 + `site:example.com` domain scoping) and clean HTML-to-Markdown webpage/API extraction (`0 MB` GPU VRAM, JS disabled, auto-saved to `Projects/{active_slug}/targets/`).\n\n"
         "PEAK PERFORMANCE & MEMORY RULES:\n"
         "- NEVER say you are a cloud AI or that you cannot access local files, network targets, hardware, or commands.\n"
         "- Check the Obsidian Memory Index and Active Project Memory below first! If a target, playbook, reasoning synthesis, or project is already indexed, read it "
@@ -3409,6 +3410,59 @@ TOOLS = [
                     }
                 },
                 "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Perform a Tier-1 Pure-Python online web search (DuckDuckGo HTML/Lite + NIST NVD CVE API v2.0 enrichment) "
+                "or search within a specific website/domain using `site`. Returns clean titles, URLs, and snippets with 0 MB GPU VRAM and JS disabled."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query keywords (e.g. 'FortiOS 7.4 SSL VPN CVE' or 'Linux ip netns routing').",
+                    },
+                    "site": {
+                        "type": "string",
+                        "description": "Optional domain or website to restrict the search to (e.g. 'fortinet.com' or 'nvd.nist.gov').",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of search results to return (default 8).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": (
+                "Fetch any specific website URL or REST/JSON API endpoint (preserving full URL paths and query strings), "
+                "sanitize scripts/hidden CSS, convert HTML headings/tables/code/forms into clean Markdown, and optionally "
+                "filter sections matching `query_filter`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL to fetch (e.g. 'https://nvd.nist.gov/vuln/detail/CVE-2024-21762' or 'https://example.com/docs/api?page=1').",
+                    },
+                    "query_filter": {
+                        "type": "string",
+                        "description": "Optional keyword/phrase to highlight and extract matching sections from the page.",
+                    },
+                },
+                "required": ["url"],
             },
         },
     },
@@ -4050,6 +4104,51 @@ def execute_tool(name: str, args: dict) -> str:
             _record_attempt("scan_target", target, status, scan_out)
             return scan_out
 
+        elif name == "web_search":
+            from Reasoning.engines.web_intel import execute_tier1_web_search
+
+            q_val = (args.get("query") or "").strip()
+            site_val = (args.get("site") or "").strip()
+            max_r = int(args.get("max_results") or 8)
+            print(
+                f"\n\033[1;36m[Agent Tool -> web_search]\033[0m query='{q_val}'"
+                + (f" site='{site_val}'" if site_val else ""),
+                flush=True,
+            )
+            ws_res = execute_tier1_web_search(
+                query=q_val,
+                site=site_val,
+                max_results=max_r,
+                posture=ACTIVE_POSTURE,
+                project_slug=get_active_project_slug(),
+            )
+            out_txt = str(ws_res.get("output") or ws_res.get("reason") or "")
+            status = "BLOCKED" if ws_res.get("blocked") else ("OK" if ws_res.get("exit_code") == 0 else "FAIL")
+            _record_attempt("web_search", f"{q_val} {site_val}".strip(), status, out_txt)
+            return out_txt
+
+        elif name == "fetch_webpage":
+            from Reasoning.engines.web_intel import execute_tier1_fetch_webpage
+
+            u_val = (args.get("url") or args.get("target") or "").strip()
+            qf_val = (args.get("query_filter") or args.get("query") or "").strip()
+            print(
+                f"\n\033[1;36m[Agent Tool -> fetch_webpage]\033[0m {u_val}"
+                + (f" (filter='{qf_val}')" if qf_val else ""),
+                flush=True,
+            )
+            fw_res = execute_tier1_fetch_webpage(
+                url=u_val,
+                query_filter=qf_val,
+                max_chars=7500,
+                posture=ACTIVE_POSTURE,
+                project_slug=get_active_project_slug(),
+            )
+            out_txt = str(fw_res.get("output") or fw_res.get("reason") or "")
+            status = "BLOCKED" if fw_res.get("blocked") else ("OK" if fw_res.get("exit_code") == 0 else "FAIL")
+            _record_attempt("fetch_webpage", u_val, status, out_txt)
+            return out_txt
+
         elif name == "vault_save_note":
             cat = args.get("category", "knowledge")
             title = args.get("title", "note")
@@ -4531,8 +4630,19 @@ def sanitize_messages(messages: list) -> None:
     messages[:] = cleaned
 
 
-MAX_HISTORY_TOKENS = int(os.environ.get("MAX_HISTORY_TOKENS", "14000"))
-_TOKENIZE_ENDPOINT_STATE = {"checked_ts": 0.0, "available": False}
+def _resolve_default_max_history_tokens() -> int:
+    env_max = os.environ.get("MAX_HISTORY_TOKENS", "").strip()
+    if env_max.isdigit() and int(env_max) > 0:
+        return int(env_max)
+    ctx_env = os.environ.get("CTX_SIZE", "").strip()
+    if ctx_env.isdigit() and int(ctx_env) >= 4096:
+        return max(2048, int(ctx_env) - 2048)
+    # Default safe budget that fits inside an 8192-token context window with 2048 max_tokens generation headroom
+    return 6144
+
+
+MAX_HISTORY_TOKENS = _resolve_default_max_history_tokens()
+_TOKENIZE_ENDPOINT_STATE = {"checked_ts": 0.0, "available": False, "server_n_ctx": 0}
 
 
 def _estimate_message_tokens(msg: dict, allow_remote: bool = False) -> int:
@@ -4616,6 +4726,29 @@ def trim_messages_to_fit(
     sanitize_messages(messages)
     if messages and messages[0].get("role") == "system" and not messages[0].get("content"):
         messages[0]["content"] = build_system_prompt()
+
+    # Dynamically cap max_tokens against live llama-server n_ctx if queried via /props
+    if not os.environ.get("MAX_HISTORY_TOKENS"):
+        srv_ctx = int(_TOKENIZE_ENDPOINT_STATE.get("server_n_ctx") or 0)
+        if srv_ctx <= 0:
+            try:
+                props_url = API_URL.split("/v1/")[0].rstrip("/") + "/props"
+                with urllib.request.urlopen(props_url, timeout=0.15) as resp_p:
+                    if resp_p.status == 200:
+                        pdata = json.loads(resp_p.read().decode("utf-8", errors="replace"))
+                        n_ctx_val = int(
+                            (pdata.get("default_generation_settings") or {}).get("n_ctx")
+                            or pdata.get("n_ctx")
+                            or 0
+                        )
+                        if n_ctx_val >= 2048:
+                            _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = n_ctx_val
+                            srv_ctx = n_ctx_val
+            except Exception:
+                _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = int(os.environ.get("CTX_SIZE", "8192") or 8192)
+                srv_ctx = _TOKENIZE_ENDPOINT_STATE["server_n_ctx"]
+        if srv_ctx >= 4096:
+            max_tokens = min(max_tokens, max(2048, srv_ctx - 2048))
 
     for m in messages[1:-2]:
         if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 2500:
@@ -4758,13 +4891,27 @@ def _build_wire_messages_with_personality_prefix(messages: list) -> list[dict]:
         wire_msgs.append(clean_m)
 
     prefix = get_personality_mode_preemptive_turn_prefix()
-    if prefix:
-        for idx in range(len(wire_msgs) - 1, -1, -1):
-            if wire_msgs[idx].get("role") == "user" and isinstance(wire_msgs[idx].get("content"), str):
-                cur_c = wire_msgs[idx]["content"]
-                if not cur_c.startswith("[PRE-EMPTIVE "):
-                    wire_msgs[idx] = {**wire_msgs[idx], "content": f"{prefix}{cur_c}"}
-                break
+    for idx in range(len(wire_msgs) - 1, -1, -1):
+        if wire_msgs[idx].get("role") == "user" and isinstance(wire_msgs[idx].get("content"), str):
+            cur_c = wire_msgs[idx]["content"]
+            l1_block = ""
+            if len(cur_c) >= 12 and not cur_c.startswith("[System Note]") and "[15-Engine L1 Guidance]" not in cur_c:
+                try:
+                    from Reasoning.engines.context_vm import build_dynamic_l1_state_block
+
+                    l1_snip = build_dynamic_l1_state_block(problem=cur_c[:300])
+                    if l1_snip:
+                        l1_block = f"\n\n[15-Engine L1 Guidance]\n{l1_snip}"
+                except Exception:
+                    pass
+            new_c = cur_c
+            if prefix and not new_c.startswith("[PRE-EMPTIVE "):
+                new_c = f"{prefix}{new_c}"
+            if l1_block:
+                new_c = f"{new_c}{l1_block}"
+            if new_c != cur_c:
+                wire_msgs[idx] = {**wire_msgs[idx], "content": new_c}
+            break
     return wire_msgs
 
 
@@ -5767,10 +5914,10 @@ def handle_relentless_command(arg_str: str, messages: list) -> None:
     if parsed_max is not None:
         MAX_RELENTLESS_WAVES = parsed_max
         save_current_cli_session(messages)
-        if not cleaned_goal and not sub_mode:
-            print(
-                f"\n\033[1;32m[Relentless Mode]\033[0m Max waves per run set to `{_format_max_waves_label()}`.\n"
-            )
+        print(
+            f"\n\033[1;32m[Relentless Mode]\033[0m Max waves per run set to `{_format_max_waves_label()}`.\n"
+        )
+        if not cleaned_goal and not sub_mode and not (ACTIVE_GOAL or get_last_project_goal()):
             return
 
     # Enable Relentless Mode
@@ -6809,7 +6956,7 @@ def handle_files_command(arg_str: str, messages: list) -> None:
                 added_list.append(dest)
             update_project_memory_index(proj_ws, f"Files/{src.name}/", f"Imported directory ({len(added_list)} files) to Files/", ["files"])
 
-        if messages and messages[0].get("role") == "system":
+        if messages and messages[0].get("role") == "system" and not messages[0].get("content"):
             messages[0]["content"] = build_system_prompt(force_refresh_hw=False)
         print(f"\n\033[1;32m[Added {len(added_list)} File(s) to `Projects/{slug}/Files/`]\033[0m")
         for f_added in added_list[:20]:
@@ -6841,7 +6988,7 @@ def handle_files_command(arg_str: str, messages: list) -> None:
             target_p.unlink()
         elif target_p.is_dir():
             shutil.rmtree(target_p)
-        if messages and messages[0].get("role") == "system":
+        if messages and messages[0].get("role") == "system" and not messages[0].get("content"):
             messages[0]["content"] = build_system_prompt(force_refresh_hw=False)
         print(f"\n\033[1;32m[Removed]\033[0m Deleted `Projects/{slug}/Files/{raw_rel}`.\n")
         return
@@ -7991,7 +8138,7 @@ def main() -> None:
                     print(f"\n\033[1;31m[Error]\033[0m {exc}\n")
             continue
 
-        if messages and messages[0].get("role") == "system":
+        if messages and messages[0].get("role") == "system" and not messages[0].get("content"):
             messages[0]["content"] = build_system_prompt(force_refresh_hw=False)
         messages.append({"role": "user", "content": user_input})
         try:

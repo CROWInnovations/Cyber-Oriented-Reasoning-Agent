@@ -65,6 +65,9 @@ KNOWN_TECH_CONCEPTS = {
     "srm", "seaccesscheck", "sddl", "dacl", "sacl", "mic", "wdigest", "cloudap", "dsregcmd", "cmdkey",
     "vaultcmd", "runasppl", "ppl", "eprocess", "ethread", "peb", "teb", "ssdt", "patchguard", "byovd",
     "ring0", "ring3",
+    "cve", "nvd", "cisa", "kev", "epss", "osv", "exploit-db", "nuclei", "gtfobins", "lolbas", "loldrivers",
+    "shodan", "internetdb", "psirt", "malwarebazaar", "threatfox", "urlhaus", "feodotracker", "greynoise",
+    "web_search", "fetch_webpage",
 }
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
@@ -127,10 +130,17 @@ _WINDOWS_INTERNALS_INTENT_RE = re.compile(
     r"deviceguard|hvci|credential[\s_\-]*guard|split[\s_\-]*token|eprocess|ethread|ssdt|patchguard)\b",
     re.I,
 )
+_CYBER_INTEL_INTENT_RE = re.compile(
+    r"\b(?:cve(?:-\d{4}-\d{4,7})?|nvd|cisa|kev|epss|cvss|osv|ghsa|exploit[\s_\-]*db|nuclei|gtfobins|"
+    r"lolbas|loldrivers|loobins|shodan|internetdb|psirt|fortiguard|msrc|malwarebazaar|threatfox|"
+    r"urlhaus|feodotracker|greynoise|zero[\s_\-]*day|0day|vulnerability|vulnerabilities|advisory|advisories|"
+    r"threat[\s_\-]*intel|threat[\s_\-]*intelligence|cyber[\s_\-]*security[\s_\-]*tools|web_search|fetch_webpage)\b",
+    re.I,
+)
 
 
 def infer_team_role_from_query(query: str) -> str:
-    """Infer whether a query/problem primarily aligns with `windows_internals`, `blue_team`, `red_team`, `hunt_team`, `reverse_engineering`, `windows_forensics`, or `linux_forensics`."""
+    """Infer whether a query/problem primarily aligns with `cyber_threat_intel`, `windows_internals`, `blue_team`, `red_team`, `hunt_team`, `reverse_engineering`, `windows_forensics`, or `linux_forensics`."""
     q_low = (query or "").lower()
     if not q_low:
         return ""
@@ -141,12 +151,15 @@ def infer_team_role_from_query(query: str) -> str:
     win_dfir_hits = len(_WINDOWS_FORENSICS_INTENT_RE.findall(q_low))
     lin_dfir_hits = len(_LINUX_FORENSICS_INTENT_RE.findall(q_low))
     win_int_hits = len(_WINDOWS_INTERNALS_INTENT_RE.findall(q_low))
+    intel_hits = len(_CYBER_INTEL_INTENT_RE.findall(q_low))
     if "blue team" in q_low or "blue_team" in q_low:
         blue_hits += 4
     if "red team" in q_low or "red_team" in q_low:
         red_hits += 4
     if "hunt team" in q_low or "hunt_team" in q_low or "threat hunt" in q_low:
         hunt_hits += 4
+    if any(k in q_low for k in ("cve-", "cve ", "cisa kev", "nvd", "epss", "gtfobins", "lolbas", "loldrivers", "shodan", "internetdb", "exploit-db", "psirt", "fortiguard")):
+        intel_hits += 5
     if any(k in q_low for k in ("reverse engineer", "reverse_engineer", "revengai", "reveng.ai", "reait")):
         reveng_hits += 5
     if any(k in q_low for k in ("ring 0", "ring0", "ring 3", "ring3", "kernel space", "user space", "ntoskrnl", "seaccesscheck", "vtl 1", "vtl1", "smss.exe", "wininit.exe")):
@@ -161,6 +174,7 @@ def infer_team_role_from_query(query: str) -> str:
         lin_dfir_hits += 5
     best_role, best_score = "", 0
     for role, sc in (
+        ("cyber_threat_intel", intel_hits),
         ("windows_internals", win_int_hits),
         ("windows_forensics", win_dfir_hits),
         ("linux_forensics", lin_dfir_hits),
@@ -172,6 +186,12 @@ def infer_team_role_from_query(query: str) -> str:
         if sc > best_score:
             best_role, best_score = role, sc
     return best_role if best_score > 0 else ""
+
+_STOPWORDS = {
+    "to", "in", "on", "or", "is", "at", "an", "as", "by", "of", "the", "and", "for",
+    "with", "from", "into", "that", "this", "are", "was", "were", "be", "not", "can",
+    "all", "has", "had", "but", "out", "its", "via",
+}
 
 _GRAPH_CACHE: Dict[str, Any] = {
     "signature": None,
@@ -274,11 +294,7 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
             st = md_path.stat()
             mtime_ns = int(st.st_mtime_ns)
             fsize = int(st.st_size)
-            # Volatile self-echo files (`projects/goal_*.md` and auto-generated `reasoning/*.md`) are indexed by path existence
-            # rather than mtime_ns, whereas curated strategy playbooks (`*_strategy_playbook.md`) are tracked by mtime_ns.
-            is_team_playbook = md_path.name.endswith("_strategy_playbook.md")
-            is_volatile = (("reasoning" in md_path.parts) and not is_team_playbook) or md_path.name.startswith("goal_")
-            sig_parts.append((str(md_path), 0 if is_volatile else mtime_ns, 0 if is_volatile else fsize))
+            sig_parts.append((str(md_path), mtime_ns, fsize))
             md_files.append((md_path, mtime_ns, fsize))
         except Exception:
             continue
@@ -296,6 +312,13 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
 
     G = nx.Graph()
     note_metadata: Dict[str, Dict[str, Any]] = {}
+    stem_to_rel_map: Dict[str, str] = {}
+    for md_path, _mtime_ns, _fsize in md_files:
+        rel_obj_tmp = md_path.relative_to(VAULT_DIR).with_suffix("")
+        rel_s_tmp = str(rel_obj_tmp).replace("\\", "/").lower()
+        stem_low = md_path.stem.lower()
+        if stem_low not in stem_to_rel_map or not rel_s_tmp.startswith("reasoning/"):
+            stem_to_rel_map[stem_low] = rel_s_tmp
 
     for md_path, mtime_ns, fsize in md_files:
         rel_Obj = md_path.relative_to(VAULT_DIR).with_suffix("")
@@ -379,17 +402,18 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
         for wl in extracted.get("wikilinks", ()):
             if wl.startswith("00_"):
                 continue
-            target_note_id = f"note:{wl}"
+            resolved_wl = stem_to_rel_map.get(wl, wl) if "/" not in wl else wl
+            target_note_id = f"note:{resolved_wl}"
             if not G.has_node(target_note_id):
-                G.add_node(target_note_id, node_type="note", bipartite=0, label=wl, category="linked", summary=wl)
-            if wl in (
+                G.add_node(target_note_id, node_type="note", bipartite=0, label=resolved_wl, category="linked", summary=resolved_wl)
+            if resolved_wl in (
                 "commands/windows_master_command_playbook",
                 "commands/linux_master_command_playbook",
                 "commands/tio_serial_playbook",
                 "commands/curl_playbook",
             ):
                 wl_weight = 0.05 * cat_mult
-            elif wl.startswith("knowledge/0") or wl.startswith("knowledge/10_"):
+            elif resolved_wl.startswith("knowledge/0") or resolved_wl.startswith("knowledge/10_"):
                 wl_weight = 0.25 * cat_mult
             else:
                 wl_weight = 2.5 * cat_mult
@@ -427,7 +451,7 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
     node_list = list(G.nodes())
     n_nodes = len(node_list)
     node_to_idx = {n: i for i, n in enumerate(node_list)}
-    search_index: List[Tuple[int, str, str, str, float]] = []
+    search_index: List[Tuple[int, str, str, str, float, Set[str], Set[str]]] = []
     note_connected_concepts: Dict[str, List[str]] = {}
     concept_connected_notes: Dict[str, List[str]] = {}
 
@@ -437,6 +461,8 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
         summary_low = (
             f"{ndata.get('summary', '')} {ndata.get('when_to_apply', '')} {ndata.get('os_platform', '')}"
         ).lower()
+        label_tokens = set(re.findall(r"[a-z0-9]+", label_low))
+        summary_tokens = set(re.findall(r"[a-z0-9]+", summary_low))
         cat_low = str(ndata.get("category", "")).lower()
         is_team_playbook = label_low.endswith("_strategy_playbook")
         is_hub_or_master = bool(
@@ -446,7 +472,7 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
             )
         )
         cat_boost = 2.05 if is_team_playbook else (0.65 if cat_low == "reasoning" else (1.85 if is_hub_or_master else 1.5))
-        search_index.append((idx, node, label_low, summary_low, cat_boost))
+        search_index.append((idx, node, label_low, summary_low, cat_boost, label_tokens, summary_tokens))
         if ndata.get("bipartite") == 0:
             note_connected_concepts[node] = [
                 G.nodes[nbr].get("label", nbr)
@@ -506,7 +532,7 @@ def run_associative_vault_reasoning(
     query: str,
     seed_concepts: Optional[List[str]] = None,
     alpha_damping: float = 0.82,
-    top_k: int = 6,
+    top_k: Optional[int] = None,
     save_to_vault: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -516,6 +542,10 @@ def run_associative_vault_reasoning(
     import networkx as nx
 
     try:
+        hw = get_hardware_reasoning_limits()
+        if top_k is None:
+            top_k = int(hw.get("top_k_activated_notes", 6))
+        max_ppr_iter = max(15, min(60, int(hw.get("pagerank_max_iter", 35))))
         if isinstance(query, (list, tuple, set)):
             query = " ".join(str(x) for x in query)
         else:
@@ -543,10 +573,18 @@ def run_associative_vault_reasoning(
         if not save_to_vault and cache_key in _PPR_QUERY_CACHE:
             return copy.deepcopy(_PPR_QUERY_CACHE[cache_key])
 
-        raw_tokens = {t for t in re.findall(r"[a-zA-Z0-9_.\-/]+", query.lower()) if len(t) >= 2}
+        raw_tokens = {
+            t
+            for t in re.findall(r"[a-zA-Z0-9_.\-/]+", query.lower())
+            if len(t) >= 2 and t not in _STOPWORDS
+        }
         if seed_concepts:
             for sc in seed_concepts:
-                raw_tokens.update(t for t in re.findall(r"[a-zA-Z0-9_.\-/]+", str(sc).lower()) if len(t) >= 2)
+                raw_tokens.update(
+                    t
+                    for t in re.findall(r"[a-zA-Z0-9_.\-/]+", str(sc).lower())
+                    if len(t) >= 2 and t not in _STOPWORDS
+                )
 
         import numpy as np
 
@@ -565,9 +603,12 @@ def run_associative_vault_reasoning(
         import math
 
         tok_df: Dict[str, int] = {tok: 0 for tok in raw_tokens}
-        for _idx, _node, label_low, summary_low, _cb in search_index:
+        for _idx, _node, label_low, summary_low, _cb, label_tokens, summary_tokens in search_index:
             for tok in raw_tokens:
-                if tok in label_low or tok in summary_low:
+                if len(tok) <= 3:
+                    if tok in label_tokens or tok in summary_tokens:
+                        tok_df[tok] += 1
+                elif tok in label_low or tok in summary_low:
                     tok_df[tok] += 1
         tok_idf: Dict[str, float] = {
             tok: max(0.25, math.log(1.0 + float(max(1, n_nodes)) / float(1 + df)))
@@ -579,6 +620,7 @@ def run_associative_vault_reasoning(
 
         inferred_team_role = infer_team_role_from_query(query)
         role_to_playbook = {
+            "cyber_threat_intel": "cyber_threat_cve_and_tools_intelligence_strategy_playbook",
             "windows_internals": "windows_kernel_and_userspace_enumeration_strategy_playbook",
             "windows_forensics": "windows_digital_forensics_strategy_playbook",
             "linux_forensics": "linux_digital_forensics_strategy_playbook",
@@ -586,13 +628,18 @@ def run_associative_vault_reasoning(
         pb_slug = role_to_playbook.get(inferred_team_role, f"{inferred_team_role}_strategy_playbook")
         target_team_note = f"note:reasoning/{pb_slug}" if inferred_team_role else ""
 
-        for idx, node, label_low, summary_low, cat_boost in search_index:
+        for idx, node, label_low, summary_low, cat_boost, label_tokens, summary_tokens in search_index:
             score = 0.0
             label_clean = label_low.lstrip("#")
             for tok in raw_tokens:
                 idf_w = tok_idf.get(tok, 1.0)
                 if tok == label_low or tok == label_clean:
                     score += 5.0 * cat_boost * idf_w
+                elif len(tok) <= 3:
+                    if tok in label_tokens:
+                        score += 3.2 * cat_boost * idf_w
+                    elif tok in summary_tokens:
+                        score += 1.1 * cat_boost * idf_w
                 elif tok in label_low:
                     score += 3.2 * cat_boost * idf_w
                 elif tok in summary_low:
@@ -612,7 +659,7 @@ def run_associative_vault_reasoning(
         # Fast vectorized Personalized PageRank power iteration (< 0.8 ms for 1,000+ nodes)
         if edge_src is not None and len(edge_src) > 0:
             p = pers_vec.copy()
-            for _ in range(35):
+            for _ in range(max_ppr_iter):
                 p_prev = p
                 dangling_mass = float(np.sum(p_prev[dangling_mask])) if dangling_mask is not None else 0.0
                 p = (1.0 - alpha_damping + alpha_damping * dangling_mass) * pers_vec
@@ -670,23 +717,25 @@ def run_associative_vault_reasoning(
                 u, v = top_note_nodes[i], top_note_nodes[j]
                 if G.nodes[u].get("category") == G.nodes[v].get("category"):
                     continue
-                if nx.has_path(G, u, v):
+                try:
                     shortest = nx.shortest_path(G, source=u, target=v)
-                    if 2 <= len(shortest) <= 5:
-                        readable_chain = " $\\leftrightarrow$ ".join(
-                            f"`[[{G.nodes[n].get('label', n)}]]`"
-                            if G.nodes[n].get("bipartite") == 0
-                            else f"**`{G.nodes[n].get('label', n)}`**"
-                            for n in shortest
-                        )
-                        conceptual_leap_paths.append(
-                            {
-                                "from_note": G.nodes[u].get("label", u),
-                                "to_note": G.nodes[v].get("label", v),
-                                "hops": len(shortest) - 1,
-                                "path_chain": readable_chain,
-                            }
-                        )
+                except nx.NetworkXNoPath:
+                    continue
+                if 2 <= len(shortest) <= 5:
+                    readable_chain = " $\\leftrightarrow$ ".join(
+                        f"`[[{G.nodes[n].get('label', n)}]]`"
+                        if G.nodes[n].get("bipartite") == 0
+                        else f"**`{G.nodes[n].get('label', n)}`**"
+                        for n in shortest
+                    )
+                    conceptual_leap_paths.append(
+                        {
+                            "from_note": G.nodes[u].get("label", u),
+                            "to_note": G.nodes[v].get("label", v),
+                            "hops": len(shortest) - 1,
+                            "path_chain": readable_chain,
+                        }
+                    )
                 if len(conceptual_leap_paths) >= 4:
                     break
             if len(conceptual_leap_paths) >= 4:

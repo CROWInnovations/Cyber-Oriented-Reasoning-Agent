@@ -1,4 +1,4 @@
-# 15-Engine 5-Layer Lexical Neuro-Symbolic, Somatic, Forecasting, Continual, Meta-Learning, Dual-Mode Pessimistic $Q_{\text{LCB}}$ RL & Prototype-Anchored Spectral PCA/K-Means++ Reasoning Suite + Two-Tier `Projects/` Memory Isolation (`~/Projects/CORA/core/Reasoning`) — `v4.5.0-15Engine-Core`
+# 15-Engine 5-Layer Lexical Neuro-Symbolic, Somatic, Forecasting, Continual, Meta-Learning, Dual-Mode Pessimistic $Q_{\text{LCB}}$ RL & Prototype-Anchored Spectral PCA/K-Means++ Reasoning Suite + Two-Tier `Projects/` Memory Isolation (`~/Projects/CORA/core/Reasoning`) — `v5.20.18` (`15-Engine Core`)
 
 **Author:** CROW Innovations  
 

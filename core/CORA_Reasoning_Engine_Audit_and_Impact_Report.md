@@ -1,25 +1,28 @@
 # CORA 20-Engine Reasoning Audit, Impact Analysis & 15-Engine Streamlined Core Report
 
-**Date:** 2026-10-25  
+**Date:** 2026-10-31  
 **Project Path:** `~/Projects/CORA`  
-**Architecture Version:** `v4.5.0-15Engine-Core`  
+**Architecture Version:** `v5.20.18` (`15-Engine Streamlined Core`)  
 
 ---
 
 ## 1. Executive Summary
 
-An end-to-end diagnostic and performance audit was conducted across the `CORA` CLI launcher (`run_cora_NIX.sh`, `core/agent-cli.py`) and all **20 Neuro-Symbolic Reasoning Engines** (`core/Reasoning/engines/`).
+An end-to-end diagnostic, mathematical, and performance audit was conducted across the `CORA` CLI launcher (`run_cora_NIX.sh`, `run_cora_WIN.ps1`, `core/agent-cli.py`), the Custom WebUI (`core/webui/server.py`), and all **15 Active Neuro-Symbolic Reasoning Engines** (`core/Reasoning/engines/`).
 
 ### Key Outcomes
-1. **CLI Prompt Startup Fixed (`431.5 ms` warm / `5.06 s` cold 27B model load):**
-   - Removed the deprecated `--mlock` flag from `run_cora_NIX.sh` and `setup_cora_NIX.sh` that caused `llama-server` (`libllama 0.7.0`) to exit with `error: invalid argument: --mlock`.
+1. **CLI Prompt Startup & LLM KV-Cache Reuse Fixed (`431.5 ms` warm / `5.06 s` cold 27B model load):**
+   - Removed deprecated/unsupported `--mlock`, `--context-shift`, and `--cache-reuse` flags from `run_cora_NIX.sh`, `run_cora_WIN.ps1`, `setup_cora_NIX.sh`, and `core/webui/server.py`.
+   - Preserved `messages[0]["content"]` (`sys_prompt`) 100% static across turns in both `core/agent-cli.py` and `core/webui/server.py` (moving dynamic `memory.md` and `[15-Engine L1 Guidance]` blocks into the user turn payload) for instant `llama-server` KV-cache prefix reuse.
+   - Dynamically aligned `MAX_HISTORY_TOKENS` in `core/agent-cli.py` with `CTX_SIZE` and `/props` `n_ctx`.
    - Upgraded `is_llama_running()` to automatically detect live `bin/llama-server` processes and backfill `Log/llama-server.pid` and `Log/llama-server.model` so duplicate server instances are never spawned over an active port.
    - Fixed the `DECSTBM` (`\033[1;{rows}r`) cursor-homing bug in `BottomPinnedHUD.render_before_prompt()` (`agent-cli.py`) that reset the cursor to `(1, 1)` before saving cursor position (`\0337`).
    - Eliminated synchronous main-thread blocking in `SpeculativeLookaheadCache` and fixed the `sense_live_local_network_topology()` return-schema mismatch in `get_live_hardware_summary()`.
-2. **Reasoning Pipeline Accelerated by 7x (`130.2 ms` $\rightarrow$ `18.1 ms`):**
+2. **Reasoning Pipeline Accelerated (`130.2 ms` $\rightarrow$ `~9.1 ms` warm; Full 15-Engine Self-Test `664.8 ms` $\rightarrow$ `369.9 ms`):**
    - Consolidated the 20-engine suite down to the **15-Engine Core** by removing 5 redundant planning/symbolic engines (`fca`, `analogy`, `planner_asp`, `evolutionary_leap`, `ablation_discovery_engine`) whose outputs were bypassed by the Layer 5 Consensus Arbiter.
-   - Eliminated synchronous 2.93 MB disk rewrites (`mdp_transitions.json`) on every shell command via RAM-cached Dirichlet updates and periodic flushing (`flush_mdp_store_if_dirty()`).
-   - Right-sized Engine 7 (`vsa.py`) bipolar hypervectors to `1,024-D` (from `16,384-D`), cutting Engine 7 latency from `13.0 ms` to **`~1.1 ms`** while preserving 100% of Damasio Somatic Gut Valence trap detection and role-filler unbinding accuracy.
+   - Eliminated synchronous 2.76 MB disk rewrites (`mdp_transitions.json`) on every shell command via RAM-cached Dirichlet updates, cache invalidation (`_MDP_SOLVED_CACHE["mtime"] = -1.0`), and periodic flushing (`flush_mdp_store_if_dirty()`).
+   - Right-sized Engine 7 (`vsa.py`) bipolar hypervectors to `1,024-D` (from `16,384-D`), cutting Engine 7 latency from `13.0 ms` to **`~1.1 ms`**, fixed 2-vector `_bundle` tie-breaking erasure, and required `timeout_hits >= 2` before triggering Somatic Gut Valence trap overrides.
+   - Fixed Dempster-Shafer focal element overlap (`K = 0.104 < 0.25` for consistent sensor failures vs `K = 0.518 >= 0.35` for contradictory `arp_l2_reachable` + `icmp_100pct_loss`), Causal `do(X)` double-negation and baseline `ACE`, Bellman potential shaping, `TD(λ)` RL post-state bootstrapping, Spectral PCA Mahalanobis distance (`np.sqrt(np.sum(diff_norm ** 2))`), Brier-centered Hedge meta-weights, and Layer-5 `[0, 1]` score normalization.
 
 ---
 

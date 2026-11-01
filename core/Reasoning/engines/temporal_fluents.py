@@ -21,8 +21,10 @@ from .vault_bridge import (
     DATA_DIR,
     ensure_directories,
     get_hardware_reasoning_limits,
+    load_json_state,
     resolve_problem_targets,
     save_json_data,
+    save_json_state,
     save_reasoning_to_vault,
     slugify,
 )
@@ -32,13 +34,9 @@ FLUENT_STATE_FILE = DATA_DIR / "temporal_fluents" / "live_fluents.json"
 
 def _load_fluent_store() -> Dict[str, Any]:
     ensure_directories()
-    if FLUENT_STATE_FILE.is_file():
-        try:
-            data = json.loads(FLUENT_STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "fluents" in data:
-                return data
-        except Exception:
-            pass
+    data = load_json_state(str(FLUENT_STATE_FILE), {"turn_counter": 0, "fluents": {}, "events_log": []})
+    if isinstance(data, dict) and "fluents" in data:
+        return data
     return {"turn_counter": 0, "fluents": {}, "events_log": []}
 
 
@@ -65,8 +63,7 @@ def get_l1_state_summary_line() -> str:
 
 def _save_fluent_store(store: Dict[str, Any]) -> None:
     ensure_directories()
-    FLUENT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    FLUENT_STATE_FILE.write_text(json.dumps(store, indent=2) + "\n", encoding="utf-8")
+    save_json_state(str(FLUENT_STATE_FILE), store)
 
 
 def record_command_event(command: str, output: str, returncode: int = 0) -> Dict[str, Any]:
@@ -86,45 +83,84 @@ def record_command_event(command: str, output: str, returncode: int = 0) -> Dict
     invalidated: List[str] = []
     initiated: List[str] = []
 
-    # 1. Check for State-Terminating (Reset) Events first (Linux & Windows)
-    if any(
-        k in cmd_low
-        for k in (
-            "systemctl restart network",
-            "service networking restart",
-            "nmcli networking off",
-            "ip link set",
-            " down",
-            "restart-netadapter",
-            "disable-netadapter",
-            "ipconfig /release",
-        )
-    ):
-        for fk, fv in fluents.items():
-            if fv.get("category") in ("transient_route", "transient_ip_alias") and fv.get("status") in ("ACTIVE", "HOLDING"):
-                fv["status"] = "STALE_INVALIDATED"
-                fv["invalidated_by"] = command[:80]
-                fv["updated_turn"] = turn_id
-                invalidated.append(fk)
+    # 1. Check for State-Terminating (Reset) Events first (Linux & Windows, only when returncode == 0)
+    if returncode == 0:
+        if (
+            any(
+                k in cmd_low
+                for k in (
+                    "systemctl restart network",
+                    "service networking restart",
+                    "nmcli networking off",
+                    "restart-netadapter",
+                    "disable-netadapter",
+                    "ipconfig /release",
+                )
+            )
+            or re.search(r"\bip\s+link\s+set\b[^;&|]*\bdown\b|\bifconfig\s+\S+\s+down\b", cmd_low)
+        ):
+            for fk, fv in fluents.items():
+                if fv.get("category") in ("transient_route", "transient_ip_alias") and fv.get("status") in ("ACTIVE", "HOLDING"):
+                    fv["status"] = "STALE_INVALIDATED"
+                    fv["invalidated_by"] = command[:80]
+                    fv["updated_turn"] = turn_id
+                    invalidated.append(fk)
 
-    if any(k in cmd_low for k in ("reboot", "systemctl reboot", "shutdown -r", "shutdown /r", "restart-computer")):
-        for fk, fv in fluents.items():
-            if fv.get("persistence") == "transient" and fv.get("status") in ("ACTIVE", "HOLDING"):
-                fv["status"] = "STALE_INVALIDATED"
-                fv["invalidated_by"] = "target_or_host_reboot"
-                fv["updated_turn"] = turn_id
-                invalidated.append(fk)
+        if re.search(r"\b(?:reboot|systemctl\s+reboot|shutdown\s+[-/]r|restart-computer)\b", cmd_low):
+            for fk, fv in fluents.items():
+                if fv.get("persistence") == "transient" and fv.get("status") in ("ACTIVE", "HOLDING"):
+                    fv["status"] = "STALE_INVALIDATED"
+                    fv["invalidated_by"] = "target_or_host_reboot"
+                    fv["updated_turn"] = turn_id
+                    invalidated.append(fk)
 
-    if any(k in cmd_low for k in ("ip route del", "ip route flush", "route delete", "remove-netroute")):
-        for fk, fv in fluents.items():
-            if fv.get("category") == "transient_route" and fv.get("status") in ("ACTIVE", "HOLDING"):
-                fv["status"] = "STALE_INVALIDATED"
-                fv["invalidated_by"] = command[:80]
-                fv["updated_turn"] = turn_id
-                invalidated.append(fk)
+        if any(k in cmd_low for k in ("ip route del", "ip route flush", "route delete", "remove-netroute")):
+            for fk, fv in fluents.items():
+                if fv.get("category") == "transient_route" and fv.get("status") in ("ACTIVE", "HOLDING"):
+                    fv["status"] = "STALE_INVALIDATED"
+                    fv["invalidated_by"] = command[:80]
+                    fv["updated_turn"] = turn_id
+                    invalidated.append(fk)
+
+        if any(k in cmd_low for k in ("ip addr del", "ip addr flush", "ip -4 addr flush")):
+            for fk, fv in fluents.items():
+                if fv.get("category") == "transient_ip_alias" and fv.get("status") in ("ACTIVE", "HOLDING"):
+                    fv["status"] = "STALE_INVALIDATED"
+                    fv["invalidated_by"] = command[:80]
+                    fv["updated_turn"] = turn_id
+                    invalidated.append(fk)
+
+        if re.search(r"\biptables\b[^;&|]*(?:\s-f\b|\s--flush\b)|\bnft\s+flush\b|\bnetsh\s+advfirewall\s+reset\b", cmd_low):
+            for fk, fv in fluents.items():
+                if fv.get("category") == "firewall" and fv.get("status") in ("ACTIVE", "HOLDING"):
+                    fv["status"] = "STALE_INVALIDATED"
+                    fv["invalidated_by"] = command[:80]
+                    fv["updated_turn"] = turn_id
+                    invalidated.append(fk)
 
     # 2. Check for State-Initiating Events (Last-Write-Wins on `(entity, attribute)`)
     if returncode == 0:
+        # Transient IP alias added/replaced (`ip addr add/replace <cidr> dev <iface>`)
+        m_ip_alias = re.search(
+            r"\bip\s+(?:-\d\s+)?addr(?:ess)?\s+(?:add|replace)\s+([0-9./]+)\s+(?:.*?\b)?dev\s+([a-z0-9_.\-@]+)",
+            cmd_low,
+        )
+        if m_ip_alias:
+            cidr_val, iface_val = m_ip_alias.group(1), m_ip_alias.group(2)
+            key = f"ip_alias:{iface_val}:{cidr_val}"
+            fluents[key] = {
+                "entity": iface_val,
+                "attribute": "ip_alias_configured",
+                "value": cidr_val,
+                "fluent": f"HoldsAt(ip_alias_configured({iface_val}, {cidr_val}), T)",
+                "category": "transient_ip_alias",
+                "persistence": "transient",
+                "status": "HOLDING",
+                "updated_turn": turn_id,
+                "timestamp": now_str,
+            }
+            initiated.append(key)
+
         # Static route added/replaced (Linux `ip route add` or Windows `route add` / `New-NetRoute`)
         m_route = re.search(r"ip\s+route\s+(?:add|replace)\s+([0-9./]+)\s+via\s+([0-9.]+)", cmd_low)
         if not m_route:
@@ -151,7 +187,7 @@ def record_command_event(command: str, output: str, returncode: int = 0) -> Dict
         if (
             "net.ipv4.ip_forward=1" in cmd_low
             or "net.ipv4.ip_forward = 1" in out_low
-            or ("ipenableRouter" in cmd_low and "1" in cmd_low)
+            or ("ipenablerouter" in cmd_low and "1" in cmd_low)
         ):
             key = "sysctl:ip_forward"
             fluents[key] = {

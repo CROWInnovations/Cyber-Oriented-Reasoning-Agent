@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from .mdp_tactical import (
     MDP_STORE_FILE,
+    _MDP_SOLVED_CACHE,
     _MDP_STORE_RAM_CACHE,
     _split_unquoted_segments,
     flush_mdp_store_if_dirty,
@@ -119,6 +120,21 @@ def set_continual_learning_mode(mode: str) -> Dict[str, Any]:
     return save_continual_learning_state(st)
 
 
+def _build_cbr_regex_pattern(err_snip: str) -> str:
+    """Convert a parameterized error snippet into a regex pattern that matches concrete IPs, subnets, and paths."""
+    pat = re.escape(err_snip[:64])
+    for ph, rgx in (
+        (re.escape("<REMOTE_SUBNET>"), r"\d+\.\d+\.\d+\.\d+/\d{1,2}"),
+        (re.escape("<LOCAL_SUBNET>"), r"\d+\.\d+\.\d+\.\d+/\d{1,2}"),
+        (re.escape("<GATEWAY_IP>"), r"\d+\.\d+\.\d+\.\d+"),
+        (re.escape("<TARGET_IP>"), r"\d+\.\d+\.\d+\.\d+"),
+        (re.escape("$PROJECT_DIR"), r"\S+"),
+        (re.escape("$USER"), r"\S+"),
+    ):
+        pat = pat.replace(ph, rgx)
+    return pat
+
+
 def apply_dirichlet_forgetting_factor(forgetting_lambda: float = 0.96) -> Dict[str, Any]:
     """
     Applies exponential forgetting factor `lambda` in `[0.88, 0.999]` to `mdp_transitions.json`
@@ -134,14 +150,18 @@ def apply_dirichlet_forgetting_factor(forgetting_lambda: float = 0.96) -> Dict[s
             if isinstance(transitions, list):
                 for tr in transitions:
                     if isinstance(tr, dict):
-                        tr["alpha_success"] = round(max(1.5, float(tr.get("alpha_success", 5.0)) * lam), 3)
-                        tr["alpha_fail"] = round(max(1.0, float(tr.get("alpha_fail", 1.0)) * lam), 3)
+                        a_s = float(tr.get("alpha_success", 5.0))
+                        a_f = float(tr.get("alpha_fail", 1.0))
+                        tr["alpha_success"] = round(max(1.5, 2.0 + (a_s - 2.0) * lam), 3)
+                        tr["alpha_fail"] = round(max(0.5, 0.5 + (a_f - 0.5) * lam), 3)
                         mdp_updated += 1
                 mdp_data["last_forgetting_decay_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
                 save_json_state(str(MDP_STORE_FILE), mdp_data)
                 _MDP_STORE_RAM_CACHE["data"] = mdp_data
                 _MDP_STORE_RAM_CACHE["mtime"] = os.path.getmtime(MDP_STORE_FILE)
                 _MDP_STORE_RAM_CACHE["dirty_count"] = 0
+                _MDP_SOLVED_CACHE["mtime"] = -1.0
+                _MDP_SOLVED_CACHE["stratified_pool"] = None
         except Exception:
             pass
     return {
@@ -330,7 +350,7 @@ def record_live_command_experience(
         if same_or_related_domain and len(err_snip) >= 6 and param_cmd != pending_fail.get("failed_command"):
             cbr_store = load_json_state(LEARNED_CBR_FILE, {"cases": []})
             cases = cbr_store.get("cases", []) if isinstance(cbr_store, dict) else []
-            escaped_pat = re.escape(err_snip[:48])
+            escaped_pat = _build_cbr_regex_pattern(err_snip)
             already_exists = any(
                 (c.get("stderr_pattern") == escaped_pat or c.get("error_pattern") == escaped_pat)
                 for c in cases
@@ -421,16 +441,22 @@ def run_iterative_reasoning_refinement(
     res["refinement_loop_passes"] = 2
     res["refinement_applied"] = True
 
-    # Determine the conflict-reconciling Pass-2 command
+    # Determine the conflict-reconciling Pass-2 command without clobbering Layer-5 Bayesian EIG probes
     branch_forecast = res.get("speculative_branch_forecast", {}) or {}
     fail_branch = branch_forecast.get("on_failure_branch", {}) if isinstance(branch_forecast, dict) else {}
-    pivot_cmd = str(stopping.get("recommended_command") or fail_branch.get("pivot_command") or "")
-
-    if conflict_k >= 0.35 and not pivot_cmd:
-        if is_windows:
-            pivot_cmd = f"arp -a {resolved_target} & powershell -NoProfile -Command \"Test-NetConnection -ComputerName {resolved_target} -Port 80 -InformationLevel Detailed\""
-        else:
-            pivot_cmd = f"ip neigh show {resolved_target} && nmap -Pn -sT -p 22,80,443,8080,8443 --open {resolved_target}"
+    eig_probe = res.get("highest_eig_next_probe", {}) if isinstance(res.get("highest_eig_next_probe"), dict) else {}
+    pivot_cmd = ""
+    if stop_dec == "PIVOT_TACTIC_IMMEDIATELY":
+        pivot_cmd = str(stopping.get("recommended_command") or fail_branch.get("pivot_command") or "")
+    elif somatic_v <= -0.25:
+        pivot_cmd = str(fail_branch.get("pivot_command") or eig_probe.get("probe_cmd") or "")
+    elif conflict_k >= 0.35:
+        pivot_cmd = str(eig_probe.get("probe_cmd") or "")
+        if not pivot_cmd:
+            if is_windows:
+                pivot_cmd = f"arp -a {resolved_target} & powershell -NoProfile -Command \"Test-NetConnection -ComputerName {resolved_target} -Port 80 -InformationLevel Detailed\""
+            else:
+                pivot_cmd = f"ip neigh show {resolved_target} && nmap -Pn -sT -p 22,80,443,8080,8443 --open {resolved_target}"
 
     if pivot_cmd:
         pivot_cmd = render_command_template(pivot_cmd, ctx)

@@ -26,7 +26,7 @@
   let isolationLevel: 'red' | 'blue' | 'white' = 'red';
   let allowedInterfaces = 'Wi-Fi';
   let selectedModel = '3.8';
-  let inferenceProvider: 'llama-server' | 'ollama' = 'llama-server';
+  let inferenceProvider: 'llama-server' = 'llama-server';
   let thinkingEnabled = false;
   let permissionMode: 'confirm' | 'auto' = 'confirm';
   let activeGoal = '';
@@ -97,7 +97,6 @@
     last_error?: string;
   } = { online: false, state: 'offline', api_url: 'http://127.0.0.1:8080/v1', active_model: '', last_error: '' };
   let startingLlm = false;
-  let ollamaStatus = { online: false, api_url: 'http://127.0.0.1:11434', model_count: 0 };
   let hardware: HardwareMetrics | null = null;
   let messages: ChatMessage[] = [];
   let systemTools: SystemToolsInventory | null = null;
@@ -685,7 +684,6 @@
       projectFilesPayload = data.files || null;
       models = data.models?.models || [];
       llamaServerStatus = data.models?.llama_server || llamaServerStatus;
-      ollamaStatus = data.models?.ollama || ollamaStatus;
       hardware = data.hardware || null;
       systemTools = data.system_tools || null;
       hostInterfaces = data.host_interfaces || [];
@@ -2555,19 +2553,6 @@
       </button>
 
       <span
-        class="hidden 2xl:inline-block px-2 py-1 rounded font-mono text-[11px] border {ollamaStatus.online
-          ? isDark
-            ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
-            : 'bg-emerald-100 border-emerald-500 text-emerald-900 font-semibold'
-          : isDark
-          ? 'bg-slate-900/90 border-slate-700 text-slate-400'
-          : 'bg-white/90 border-slate-300 text-slate-600'}"
-        title="Ollama ({ollamaStatus.api_url})"
-      >
-        Ollama: {ollamaStatus.online ? `ONLINE (${ollamaStatus.model_count})` : 'OFFLINE'}
-      </span>
-
-      <span
         class="hidden sm:inline-block px-2.5 py-1 rounded font-mono text-[11px] font-semibold border {isDark
           ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
           : 'bg-emerald-100 border-emerald-500 text-emerald-900'}"
@@ -2787,7 +2772,7 @@
                   {selectedModel} ({inferenceProvider})
                 </div>
                 <div class="text-[10px] opacity-75 mt-0.5">
-                  Status: {llamaServerStatus.online || ollamaStatus.online ? 'ONLINE & READY' : 'ENGAGING / LOADING...'}
+                  Status: {llamaServerStatus.online ? 'ONLINE & READY' : 'ENGAGING / LOADING...'}
                 </div>
               </div>
 
@@ -3188,7 +3173,7 @@
           </div>
         </div>
 
-        <!-- 4. Model Connection Selector (CORA GGUF Models + Ollama Models) -->
+        <!-- 4. Model Connection Selector (CORA GGUF Models) -->
         <div class="flex flex-col gap-1">
           <label
             for="cora-model-select"

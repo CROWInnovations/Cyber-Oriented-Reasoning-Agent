@@ -48,6 +48,7 @@ DEFAULT_ENGINE_FAMILIES: Dict[str, Dict[str, Any]] = {
         "weight": 1.15,
         "predictions": 12,
         "successes": 11,
+        "conf_sum": 10.56,
         "brier_sum": 1.08,
     },
     "bayesian_eig": {
@@ -55,6 +56,7 @@ DEFAULT_ENGINE_FAMILIES: Dict[str, Dict[str, Any]] = {
         "weight": 1.10,
         "predictions": 12,
         "successes": 10,
+        "conf_sum": 10.08,
         "brier_sum": 1.32,
     },
     "cbr_fingerprints": {
@@ -62,6 +64,7 @@ DEFAULT_ENGINE_FAMILIES: Dict[str, Dict[str, Any]] = {
         "weight": 1.20,
         "predictions": 8,
         "successes": 8,
+        "conf_sum": 7.20,
         "brier_sum": 0.48,
     },
     "vsa_somatic": {
@@ -69,6 +72,7 @@ DEFAULT_ENGINE_FAMILIES: Dict[str, Dict[str, Any]] = {
         "weight": 1.05,
         "predictions": 10,
         "successes": 9,
+        "conf_sum": 8.60,
         "brier_sum": 1.10,
     },
     "rl_network_policy": {
@@ -76,6 +80,7 @@ DEFAULT_ENGINE_FAMILIES: Dict[str, Dict[str, Any]] = {
         "weight": 1.15,
         "predictions": 12,
         "successes": 11,
+        "conf_sum": 10.56,
         "brier_sum": 1.02,
     },
     "spectral_manifold_pca": {
@@ -83,6 +88,7 @@ DEFAULT_ENGINE_FAMILIES: Dict[str, Dict[str, Any]] = {
         "weight": 1.12,
         "predictions": 10,
         "successes": 9,
+        "conf_sum": 8.70,
         "brier_sum": 0.96,
     },
 }
@@ -93,6 +99,7 @@ DEFAULT_CHANNEL_HEALTH: Dict[str, Dict[str, Any]] = {
         "last_tx_epoch": 0.0,
         "last_delta_sec": 999.0,
         "consecutive_drops": 0,
+        "consecutive_clean_sessions": 0,
         "total_drops_detected": 0,
         "total_serial_sessions": 0,
         "last_tx_subcommands": 0,
@@ -131,6 +138,10 @@ def load_or_init_meta_weights() -> Dict[str, Any]:
         for k, default_v in DEFAULT_ENGINE_FAMILIES.items():
             if k not in engines_dict or not isinstance(engines_dict[k], dict):
                 engines_dict[k] = dict(default_v)
+                modified = True
+            elif "conf_sum" not in engines_dict[k]:
+                preds_k = int(engines_dict[k].get("predictions", default_v["predictions"]))
+                engines_dict[k]["conf_sum"] = round(preds_k * 0.85, 4)
                 modified = True
         for retired_k in ("asp_planner", "evolutionary_map_elites"):
             if retired_k in engines_dict:
@@ -272,6 +283,7 @@ def analyze_and_record_channel_telemetry(
     if console_drop_detected or (burst_overload_risk and rx_payload_bytes < 4):
         ser_ch["status"] = "CONGESTED_DROP_DETECTED"
         ser_ch["consecutive_drops"] = int(ser_ch.get("consecutive_drops", 0)) + 1
+        ser_ch["consecutive_clean_sessions"] = 0
         ser_ch["total_drops_detected"] = int(ser_ch.get("total_drops_detected", 0)) + 1
         ser_ch["recommended_output_delay_ms"] = 15
         ser_ch["recommended_line_delay_ms"] = 120
@@ -286,9 +298,11 @@ def analyze_and_record_channel_telemetry(
             "(4) Do not spam multiple serial tool calls in the same turn."
         )
     else:
-        if ser_ch.get("status") in ("CONGESTED_DROP_DETECTED", "PACING_ENFORCED") or int(ser_ch.get("total_drops_detected", 0)) > 0:
+        clean_streak = int(ser_ch.get("consecutive_clean_sessions", 0)) + 1
+        ser_ch["consecutive_clean_sessions"] = clean_streak
+        ser_ch["consecutive_drops"] = 0
+        if ser_ch.get("status") in ("CONGESTED_DROP_DETECTED", "PACING_ENFORCED") and clean_streak < 2:
             ser_ch["status"] = "PACING_ENFORCED"
-            ser_ch["consecutive_drops"] = 0
             ser_ch["min_cooldown_sec"] = 1.6
             ser_ch["meta_directive"] = (
                 "[META-MIND PACING ACTIVE]: Paced UART command succeeded "
@@ -297,7 +311,7 @@ def analyze_and_record_channel_telemetry(
             )
         else:
             ser_ch["status"] = "HEALTHY"
-            ser_ch["consecutive_drops"] = 0
+            ser_ch["meta_directive"] = ""
             if not has_hw_pacing and tx_subcommands >= 2:
                 ser_ch["meta_directive"] = (
                     "[META-MIND PACING ADVISORY]: Use `tio -b 115200 -o 15 -O 120` and limit to 1-2 commands per session "
@@ -330,8 +344,8 @@ def analyze_and_record_channel_telemetry(
 def get_meta_mind_channel_directive(problem: str = "") -> Dict[str, Any]:
     """
     Return the current META-MIND Channel Health & Pacing directive, auto-activating
-    `CONGESTED_DROP_DETECTED` if the problem description explicitly reports serial/console drops
-    or command bombardment.
+    `CONGESTED_DROP_DETECTED` in the returned directive if the problem description explicitly reports
+    serial/console drops or command bombardment (without mutating persistent state on read-only queries).
     """
     state = load_or_init_meta_weights()
     ch_all = state.get("channel_health", DEFAULT_CHANNEL_HEALTH)
@@ -350,9 +364,6 @@ def get_meta_mind_channel_directive(problem: str = "") -> Dict[str, Any]:
                 "send ONLY ONE command per session (`write(\"\\r\"); msleep(500); write(\"<single_cmd>\\r\"); while read(4096, 600) > 0 do end; exit(0)`), "
                 "and wait >=1.8s between consecutive `/dev/ttyUSB*` connections."
             )
-            ch_all["serial_oob"] = ser_ch
-            state["channel_health"] = ch_all
-            save_json_state(META_WEIGHTS_FILE, state)
     return ser_ch
 
 
@@ -387,15 +398,15 @@ def record_engine_forecast_outcome(
     brier_loss = (p - y) ** 2
     eta = float(state.get("learning_rate_eta", 0.12))
 
-    # Center loss around 0.18 so accurate predictions (>75% hit rate) increase weight,
-    # with gentle mean-reversion (2%) toward 1.0 to prevent lockstep weight runaway
-    centered_loss = brier_loss - 0.18
+    # Center loss around rolling ensemble baseline Brier score and normalize across active engine families
+    baseline_brier = max(0.05, min(0.20, float(state.get("rolling_brier_score", 0.12))))
+    centered_loss = brier_loss - baseline_brier
     old_w = float(entry.get("weight", 1.0))
     raw_w = old_w * math.exp(-eta * centered_loss)
-    new_w = max(0.35, min(2.25, round(0.98 * raw_w + 0.02 * 1.0, 4)))
+    new_w = max(0.35, min(2.25, round(0.95 * raw_w + 0.05 * 1.12, 4)))
 
     old_preds = int(entry.get("predictions", 0))
-    old_conf_sum = float(entry.get("conf_sum", old_preds * 0.80))
+    old_conf_sum = float(entry.get("conf_sum", old_preds * 0.85))
     entry["weight"] = new_w
     entry["predictions"] = old_preds + 1
     if succeeded:
@@ -404,7 +415,28 @@ def record_engine_forecast_outcome(
     entry["brier_sum"] = round(float(entry.get("brier_sum", 0.0)) + brier_loss, 4)
     engines[fam] = entry
 
-    # Recompute global Brier score and true empirical Expected Calibration Error (ECE) across all engine families
+    # Normalize Hedge weights across active engine families around mean 1.12 so all weights cannot drift to 2.25
+    if engines:
+        mean_w = sum(float(v.get("weight", 1.0)) for v in engines.values()) / len(engines)
+        if mean_w > 0.1:
+            scale = 1.12 / mean_w
+            for ek, ev_d in engines.items():
+                w_cur = float(ev_d.get("weight", 1.0))
+                w_norm = max(0.35, min(2.25, round(0.80 * w_cur + 0.20 * (w_cur * scale), 4)))
+                ev_d["weight"] = w_norm
+            new_w = float(engines[fam]["weight"])
+
+    # Maintain windowed calibration history and compute binned Expected Calibration Error (ECE)
+    hist_win = max(50, int(state.get("meta_history_window", 500)))
+    n_bins = max(5, int(state.get("meta_calibration_bins", 15)))
+    cal_hist: List[Dict[str, Any]] = state.get("calibration_history", [])
+    if not isinstance(cal_hist, list):
+        cal_hist = []
+    cal_hist.append({"p": round(p, 4), "y": y, "engine": fam})
+    cal_hist = cal_hist[-hist_win:]
+    state["calibration_history"] = cal_hist
+
+    # Recompute global Brier score and binned + family Expected Calibration Error (ECE)
     total_preds = sum(max(1, int(v.get("predictions", 1))) for v in engines.values())
     total_brier = sum(float(v.get("brier_sum", 0.0)) for v in engines.values())
     avg_brier = round(total_brier / max(1, total_preds), 4)
@@ -413,9 +445,27 @@ def record_engine_forecast_outcome(
     for v in engines.values():
         n_e = max(1, int(v.get("predictions", 1)))
         acc_e = float(v.get("successes", 0)) / n_e
-        conf_e = float(v.get("conf_sum", n_e * 0.80)) / n_e
+        conf_e = float(v.get("conf_sum", n_e * 0.85)) / n_e
         weighted_cal_gap += (n_e / max(1, total_preds)) * abs(acc_e - conf_e)
-    ece_pct = round(min(25.0, weighted_cal_gap * 100.0), 2)
+
+    if len(cal_hist) >= 10:
+        bin_ece = 0.0
+        n_hist = len(cal_hist)
+        for b_idx in range(n_bins):
+            lo = b_idx / n_bins
+            hi = (b_idx + 1) / n_bins
+            bucket = [
+                item for item in cal_hist
+                if (lo <= float(item.get("p", 0.8)) < hi) or (b_idx == n_bins - 1 and float(item.get("p", 0.8)) == hi)
+            ]
+            if bucket:
+                b_conf = sum(float(x["p"]) for x in bucket) / len(bucket)
+                b_acc = sum(float(x["y"]) for x in bucket) / len(bucket)
+                bin_ece += (len(bucket) / n_hist) * abs(b_acc - b_conf)
+        combined_ece = 0.5 * bin_ece + 0.5 * weighted_cal_gap
+    else:
+        combined_ece = weighted_cal_gap
+    ece_pct = round(min(25.0, combined_ece * 100.0), 2)
 
     state["engines"] = engines
     state["total_outcomes_recorded"] = int(state.get("total_outcomes_recorded", 0)) + 1

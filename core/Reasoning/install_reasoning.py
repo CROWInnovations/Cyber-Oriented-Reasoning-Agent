@@ -194,8 +194,17 @@ def check_missing_modules() -> List[Tuple[str, str, bool]]:
 
 def _is_airgap_or_readonly_active() -> bool:
     """Check whether WHITE network isolation or ANALYST read-only mode is active."""
-    env_iso = os.environ.get("CORA_NETWORK_ISOLATION", "").strip().upper()
-    env_mode = os.environ.get("CORA_OPERATIONAL_MODE", "").strip().upper()
+    env_iso = (
+        os.environ.get("CORA_NETWORK_ISOLATION")
+        or os.environ.get("LLM_ISOLATION_MODE")
+        or os.environ.get("LLM_POSTURE_OVERRIDE")
+        or ""
+    ).strip().upper()
+    env_mode = (
+        os.environ.get("CORA_OPERATIONAL_MODE")
+        or os.environ.get("CORA_PERSONALITY_MODE")
+        or ""
+    ).strip().upper()
     if env_iso == "WHITE" or env_mode in ("2", "ANALYST"):
         return True
     posture_file = CORA_CORE_DIR / "Network_Isolation" / "console_posture.json"
