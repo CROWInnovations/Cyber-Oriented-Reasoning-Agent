@@ -1,7 +1,7 @@
 # C.O.R.A. Custom Web Interface (`core/webui/`)
 
 **Author:** CROW Innovations  
-**Version:** `5.20.18`  
+**Version:** `5.21.19`  
 
 Replaces the third-party Docker `open-webui` container with a native, zero-Docker **Svelte + TypeScript + Tailwind CSS** dashboard backed by a local **Python + FastAPI + WebSockets + SQLite + psutil + NVIDIA NVML** service (`core/webui/server.py`).
 

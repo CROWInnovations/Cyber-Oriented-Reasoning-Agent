@@ -673,6 +673,7 @@ def run_neuro_symbolic_pipeline(
         elif env_mode == "analyst":
             active_team_role = "hunt_team"
     _role_pb_map = {
+        "lolbins": "reasoning/LOLBINS",
         "cyber_threat_intel": "reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook",
         "windows_internals": "reasoning/windows_kernel_and_userspace_enumeration_strategy_playbook",
         "windows_forensics": "reasoning/windows_digital_forensics_strategy_playbook",

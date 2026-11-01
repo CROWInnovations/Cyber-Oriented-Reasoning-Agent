@@ -1,10 +1,10 @@
 {
   "major_cli": 5,
-  "engine_rev": 20,
-  "patch_rev": 18,
-  "version": "5.20.18",
-  "updated_at": "2026-11-01 01:08:16",
-  "engine_tree_sha256": "c79abb692a4f647592b98960ff2bab3b9ea4741359eaf22aec02490352c67ec4",
-  "patch_tree_sha256": "08e1ae3abac9a7f0616de777e9772cc3667f110e7b05c99f1205e556664d7395",
-  "last_update_reason": "End-to-end 15-Engine reasoning/logic audit fixes, LLM KV-cache reuse, and CPU/GPU resource balance"
+  "engine_rev": 21,
+  "patch_rev": 19,
+  "version": "5.21.19",
+  "updated_at": "2026-11-01 02:12:01",
+  "engine_tree_sha256": "8273e7c017aeb1848888c448d535a673a55b01fee899f417bda5a7914e5f72f2",
+  "patch_tree_sha256": "e57b43e375a42d6bf721017abb1c39d7785f2ea3bb66af1257e2c412691d2d09",
+  "last_update_reason": "LOLBINS Reasoning Vault (CROWInnovations/LOLBAS), NIST NVD 2.0 & OpenCVE intelligence, and web_intel.py fixes"
 }

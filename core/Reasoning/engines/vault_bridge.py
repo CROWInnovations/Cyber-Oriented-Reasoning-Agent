@@ -860,6 +860,8 @@ def _rotate_reasoning_vault_notes(max_hot_notes: int = 60) -> int:
         "rl_network_policy_playbooks",
         "spectral_pca_kmeans_manifold",
         "meta_learning_audit",
+        "LOLBINS",
+        "lolbins",
     }
     try:
         session_files = sorted(
@@ -910,6 +912,7 @@ def save_reasoning_to_vault(
         "rl_network_policy_playbooks",
         "spectral_pca_kmeans_manifold",
         "meta_learning_audit",
+        "lolbins",
     }
     is_long_term = persist_long_term or (slug in canonical_long_term_stems) or slug.endswith("_strategy_playbook")
     if is_long_term:

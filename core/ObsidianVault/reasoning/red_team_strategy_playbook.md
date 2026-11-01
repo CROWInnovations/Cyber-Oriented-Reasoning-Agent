@@ -81,17 +81,17 @@ Activate `[[reasoning/red_team_strategy_playbook]]` whenever the query, goal, or
 
 ---
 
-## 4. Verified Live CVE, Exploit & Offensive Tooling Intelligence (`fetch_webpage`, `web_search` & `curl`)
-> **Master Hub:** [[reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook]] | **HTTP/API Reference:** [[commands/curl_playbook]]
+## 4. Verified Live CVE, Exploit & Offensive Tooling Intelligence (`fetch_webpage`, `query_cve.py`, `web_search` & `curl`)
+> **Master Hub:** [[reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook]] | **LOLBINS Hub:** [[reasoning/LOLBINS]] | **HTTP/API Reference:** [[commands/curl_playbook]]
 
-When service banners, OS versions, SUID/sudo binaries, or kernel drivers are discovered during Phases 1–3, use CORA's Tier-1 `fetch_webpage` / `web_search` tools (easiest, works in all modes) or `curl -sSL ... | jq` via `run_shell`:
+When service banners, OS versions, SUID/sudo binaries, or kernel drivers are discovered during Phases 1–3, use CORA's Tier-1 `fetch_webpage` / `web_search` tools or the local NVD 2.0 repository (`~/Projects/CVEs/query_cve.py`):
 
-| Offensive Objective | Easiest CORA Tool (`fetch_webpage` / `web_search`) | Shell CLI Alternative (`curl` / `jq`) |
+| Offensive Objective | Easiest CORA Tool (`fetch_webpage` / `web_search` / `vault_read_note`) | Shell CLI Alternative (`query_cve.py` / `curl` + `python3`) |
 | :--- | :--- | :--- |
-| **Passive Zero-Packet Public IP Recon (Ports + CPEs + CVEs)** | `fetch_webpage(url="https://internetdb.shodan.io/<PUBLIC_IPV4>")` | `curl -sSL --max-time 15 "https://internetdb.shodan.io/<PUBLIC_IPV4>" \| jq '.'` |
-| **NIST NVD Official CVE & CVSS Lookup** | `fetch_webpage(url="https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN", query_filter="descriptions")` | `curl -sSL --max-time 15 "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN" \| jq '.vulnerabilities[0].cve'` |
-| **CISA KEV (Exploited in Wild) & FIRST EPSS** | `fetch_webpage(url="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", query_filter="CVE-YYYY-NNNN")` | `curl -sSL --max-time 15 "https://api.first.org/data/v1/epss?cve=CVE-YYYY-NNNN" \| jq '.data[0]'` |
+| **Passive Zero-Packet Public IP Recon (Ports + CPEs + CVEs)** | `fetch_webpage(url="https://internetdb.shodan.io/<PUBLIC_IPV4>")` | `curl -sSL --max-time 15 "https://internetdb.shodan.io/<PUBLIC_IPV4>" \| python3 -m json.tool` |
+| **NIST NVD 2.0 Full CVE & CVSS Lookup (Local `~/Projects/CVEs/` + Live API)** | `fetch_webpage(url="https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-YYYY-NNNN")` | `python3 ~/Projects/CVEs/query_cve.py CVE-YYYY-NNNN` *(or `--live` / `--json`)* |
+| **CISA KEV (Exploited in Wild) & FIRST EPSS** | `fetch_webpage(url="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", query_filter="CVE-YYYY-NNNN")` | `curl -sSL --max-time 15 "https://api.first.org/data/v1/epss?cve=CVE-YYYY-NNNN" \| python3 -m json.tool` |
 | **Public Exploit PoCs (`Exploit-DB`) & `Nuclei` YAML** | `web_search(query="CVE-YYYY-NNNN", site="exploit-db.com")` *(or)* `fetch_webpage(url="https://www.exploit-db.com/raw/<EDB_ID>")` | `curl -sSL --max-time 15 -A "Mozilla/5.0" "https://www.exploit-db.com/raw/<EDB_ID>" -o /tmp/exploit.py` |
 | **Linux SUID / Sudo / Capability Escalation (`GTFOBins`)** | `fetch_webpage(url="https://gtfobins.github.io/gtfobins/<binary>/", query_filter="sudo suid")` | `curl -sSL --max-time 15 "https://raw.githubusercontent.com/GTFOBins/GTFOBins.github.io/master/_gtfobins/<binary>.md"` |
-| **Windows Native LOLBins & Vulnerable Drivers (`LOLBAS` / `LOLDrivers`)** | `fetch_webpage(url="https://lolbas-project.github.io/api/lolbas.json", query_filter="Certutil.exe")` | `curl -sSL --max-time 15 "https://www.loldrivers.io/api/drivers.json" \| jq '.[] \| select(.Tags[]? == "<driver.sys>")'` |
+| **Windows Native LOLBins & Vulnerable Drivers (`LOLBINS` / `LOLDrivers`)** | `vault_read_note(note="reasoning/LOLBINS")` *(or)* `fetch_webpage(url="https://raw.githubusercontent.com/CROWInnovations/LOLBAS/master/yml/OSBinaries/Certutil.yml")` | `fetch_webpage(url="https://www.loldrivers.io/api/drivers.json", query_filter="<driver.sys>")` |
 | **Kali Linux Tool Syntax & PayloadsAllTheThings** | `fetch_webpage(url="https://www.kali.org/tools/<tool>/")` or `web_search(query="<technique>", site="book.hacktricks.xyz")` | `curl -sSL --max-time 15 "https://www.kali.org/tools/<tool>/" \| grep -E "Usage\|-" \| head -n 35` |
