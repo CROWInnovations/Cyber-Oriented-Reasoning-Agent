@@ -1292,7 +1292,7 @@ def ensure_project_workspace(project_slug: str = "") -> Path:
     else:
         slug = "unassigned"
         proj_dir = SESSION_STATE_DIR / "_unassigned_workspace"
-    for sub in ("Files", "downloads", "artifacts", "targets", "notes", "reasoning"):
+    for sub in ("Files", "downloads", "artifacts", "assets", "targets", "notes", "reasoning", "reports"):
         (proj_dir / sub).mkdir(parents=True, exist_ok=True)
     mem_file = proj_dir / "memory.md"
     if not mem_file.exists():
@@ -3328,7 +3328,7 @@ def build_system_prompt(force_refresh_hw: bool = False) -> str:
         f"  7. `run_shell_command`: Execute any {shell_label} command or custom script in `{active_proj_dir / 'Files'}` (`$PROJECT_FILES_DIR`, which is on `PATH`; pre-verified by CEGAR; save downloaded files to `{active_proj_dir / 'downloads'}`; outputs > 2,500 chars are losslessly archived to `Reasoning/data/shadow_archive/`).\n"
         f"  8. `write_file` / `edit_file` / `read_file` / `list_directory`: Full local filesystem access, including direct shorthand access to `Files/<filename>` inside `{active_proj_dir / 'Files'}`.\n"
         f"  9. `generate_project_report`: Generate a comprehensive 5-section Project Status & Findings Report (`Projects/{active_slug}/REPORT.md` + standalone SVG graphic `assets/report_dashboard.svg`) containing an Executive Summary, a High-School Reading Level Walkthrough, Visual Graphics/Mermaid Diagrams, a Technical Evidence Write-Up, and a Final Conclusion.\n"
-        f"  10. `web_search` / `fetch_webpage`: Tier-1 Pure-Python online web search (DuckDuckGo HTML/Lite + NIST NVD CVE API v2.0 + `site:example.com` domain scoping) and clean HTML-to-Markdown webpage/API extraction (`0 MB` GPU VRAM, JS disabled, auto-saved to `Projects/{active_slug}/targets/`).\n\n"
+        f"  10. `web_search` / `fetch_webpage`: Tier-1 Pure-Python online web search (DuckDuckGo HTML/Lite + NIST NVD CVE API v2.0 + `site:example.com` domain scoping, auto-saved to `Projects/{active_slug}/notes/`) and clean HTML-to-Markdown webpage/API extraction (`0 MB` GPU VRAM, JS disabled, auto-saved to `Projects/{active_slug}/downloads/`).\n\n"
         "PEAK PERFORMANCE & MEMORY RULES:\n"
         "- NEVER say you are a cloud AI or that you cannot access local files, network targets, hardware, or commands.\n"
         "- Check the Obsidian Memory Index and Active Project Memory below first! If a target, playbook, reasoning synthesis, or project is already indexed, read it "

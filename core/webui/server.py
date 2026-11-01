@@ -1385,7 +1385,7 @@ def get_project_files_context_block(
     }
     mentions_files_dir = bool(
         re.search(
-            r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded\s+files?|custom\s+scripts?|in\s+files|from\s+files|project\s+files)\b",
+            r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded\s+files?|custom\s+scripts?|in\s+files|from\s+files|project\s+files|python\s+script|exploit\s+script|call\s*back|\.py\b|\.sh\b|\.ps1\b)\b",
             q_low,
         )
     )
@@ -1406,22 +1406,22 @@ def get_project_files_context_block(
         if is_attached or is_named_in_query:
             preview_targets.append(f)
 
-    if not preview_targets and (mentions_files_dir or len(all_files) <= 3):
+    if not preview_targets and mentions_files_dir:
         for f in all_files[:4]:
             if _is_likely_text_file(f) and f.stat().st_size <= 120000:
                 preview_targets.append(f)
 
     total_preview_chars = 0
     for f in preview_targets[:5]:
-        if total_preview_chars >= 12000:
+        if total_preview_chars >= 14000:
             break
         rel_in_files = f.relative_to(files_dir).as_posix()
         if _is_likely_text_file(f):
             try:
                 raw_txt = f.read_text(encoding="utf-8", errors="replace")
-                snippet = raw_txt[:5000]
+                snippet = raw_txt[:6500]
                 total_preview_chars += len(snippet)
-                trunc_note = f" (truncated from {len(raw_txt)} chars)" if len(raw_txt) > 5000 else ""
+                trunc_note = f" (truncated from {len(raw_txt)} chars)" if len(raw_txt) > 6500 else ""
                 lines.append(
                     f"\n#### File Preview: `Projects/{slug}/Files/{rel_in_files}`{trunc_note}\n"
                     f"```text\n{snippet}\n```"
@@ -2604,6 +2604,34 @@ WEBUI_AGENT_TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_project_note",
+            "description": (
+                "Save a structured research, vulnerability, OSINT, or operational note into the active project's "
+                "`notes` directory (`Projects/<project>/notes/<title>.md`) and index it in `memory.md`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title or filename slug for the note (e.g. 'fortios_6_2_1_vuln_analysis').",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One-line summary of the note for the project memory index.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full Markdown body of the note.",
+                    },
+                },
+                "required": ["title", "content"],
+            },
+        },
+    },
 ]
 
 
@@ -2760,6 +2788,16 @@ def _execute_webui_write_project_file(
                     "(e.g. `{\"filename\": \"Files/CVE-2024-21762_Exploit.py\", \"content\": \"...\"}`)."
                 ),
             }
+        if not (content_arg or "").strip():
+            return {
+                "executed": False,
+                "blocked": False,
+                "exit_code": 1,
+                "output": (
+                    f"Error: Empty `content` passed to `write_project_file({clean_name})`. "
+                    "Refusing to overwrite file with 0 bytes. Provide the full script/text in `content`."
+                ),
+            }
         target = (files_dir / clean_name).resolve()
         if not str(target).startswith(str(files_dir)):
             return {"executed": False, "blocked": True, "reason": "Target file must reside inside `Projects/<project>/Files/`."}
@@ -2777,64 +2815,155 @@ def _execute_webui_write_project_file(
         return {"executed": False, "blocked": False, "exit_code": 1, "output": f"Error writing `{filename_arg}`: {exc}"}
 
 
+def _execute_webui_save_project_note(
+    title_arg: str,
+    summary_arg: str,
+    content_arg: str,
+    mode_info: Dict[str, Any],
+    project_slug: str,
+) -> Dict[str, Any]:
+    if mode_info.get("read_only"):
+        return {
+            "executed": False,
+            "blocked": True,
+            "reason": "Blocked by [2] Analyst (Read-Only) mode: saving notes is disabled.",
+        }
+    try:
+        proj_dir = ensure_project_structure(project_slug)
+        notes_dir = (proj_dir / "notes").resolve()
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        clean_title = (title_arg or "project_note").strip()
+        slug_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", clean_title.lower()).strip("_")[:64] or "project_note"
+        if slug_name.endswith("_md"):
+            slug_name = slug_name[:-3]
+        note_path = notes_dir / f"{slug_name}.md"
+        now_str = _now_iso()
+        summary_txt = (summary_arg or clean_title).strip()
+        full_md = (
+            "---\n"
+            f"title: {clean_title}\n"
+            "category: notes\n"
+            f"project: {proj_dir.name}\n"
+            f"summary: {summary_txt}\n"
+            f"updated: {now_str}\n"
+            "---\n"
+            f"# {clean_title}\n\n"
+            f"> **Summary:** {summary_txt}  \n"
+            f"> **Project Workspace:** `Projects/{proj_dir.name}/notes/{slug_name}.md` | **Updated:** `{now_str}`\n\n"
+            f"{(content_arg or '').strip()}\n"
+        )
+        _atomic_write_text(note_path, full_md)
+        try:
+            from Reasoning.engines.vault_bridge import update_project_memory_index
+
+            update_project_memory_index(proj_dir, f"notes/{slug_name}", summary_txt, ["note", "analysis"])
+        except Exception:
+            pass
+        return {
+            "executed": True,
+            "blocked": False,
+            "exit_code": 0,
+            "output": f"Saved project note `Projects/{proj_dir.name}/notes/{slug_name}.md` ({note_path.stat().st_size} bytes).",
+        }
+    except Exception as exc:
+        return {"executed": False, "blocked": False, "exit_code": 1, "output": f"Error saving project note `{title_arg}`: {exc}"}
+
+
+def _resolve_default_project_script_filename(active_proj: str, query_text: str, last_read_file: str = "") -> str:
+    """Resolve the best target filename inside `Projects/<active_proj>/Files/` for script creation or fixing."""
+    q_str = (query_text or "").strip()
+    m_qfile = re.search(r"\b([A-Za-z0-9_.\-]+\.(?:py|sh|ps1|txt|json|yaml|yml|md|c|cpp|rs|js|html))\b", q_str)
+    if m_qfile:
+        return m_qfile.group(1)
+    if last_read_file:
+        lr = last_read_file.replace("\\", "/").split("/")[-1].strip()
+        if lr and lr.lower() not in ("readme.md", "memory.md", "goals.md") and "." in lr:
+            return lr
+    if active_proj:
+        try:
+            files_dir = ensure_project_structure(active_proj) / "Files"
+            all_f = [f for f in files_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
+            if re.search(r"\b(?:python|\.py\b)", q_str, flags=re.I):
+                py_only = [f.name for f in all_f if f.suffix.lower() == ".py"]
+                if len(py_only) == 1 and re.search(r"\b(?:fix|update|edit|modify|patch|debug|call\s*back|exploit)\b", q_str, flags=re.I):
+                    return py_only[0]
+            if len(all_f) == 1 and re.search(r"\b(?:fix|update|edit|modify|patch|debug)\b", q_str, flags=re.I):
+                return all_f[0].name
+        except Exception:
+            pass
+    # Derive a clean filename when the operator asks to create a new script
+    if re.search(r"\b(?:create|write|make|generate|build|save)\b", q_str, flags=re.I):
+        ext = ".py"
+        if re.search(r"\b(?:bash|shell|\.sh\b)\b", q_str, flags=re.I):
+            ext = ".sh"
+        elif re.search(r"\b(?:powershell|\.ps1\b)\b", q_str, flags=re.I):
+            ext = ".ps1"
+        words = [
+            w.lower()
+            for w in re.findall(r"[A-Za-z0-9]+", q_str)
+            if w.lower() not in ("create", "write", "make", "generate", "build", "save", "a", "an", "the", "simple", "python", "script", "file", "in", "files", "to", "for", "that", "please", "can", "you")
+        ]
+        stem = "_".join(words[:4]) if words else "cora_script"
+        return f"{stem}{ext}"
+    return ""
+
+
 def _recover_tool_args(
     fn_name: str,
     raw_args: Any,
     active_proj: str = "",
     query_text: str = "",
+    last_read_file: str = "",
 ) -> Dict[str, Any]:
     """
     Robustly parse tool call arguments even when Qwen/llama-server emits slightly malformed
     or token-truncated JSON (e.g., when writing a multi-line script via `write_project_file`).
     """
-    if isinstance(raw_args, dict):
-        return dict(raw_args)
-    raw_str = str(raw_args or "{}").strip()
-    try:
-        parsed = json.loads(raw_str)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-
     recovered: Dict[str, Any] = {}
-    for key in ("filename", "path", "file", "file_path", "target", "command", "query", "keyword", "url", "subdir", "note", "site", "query_filter"):
-        m = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
-        if m:
-            try:
-                recovered[key] = json.loads(f'"{m.group(1)}"')
-            except Exception:
-                recovered[key] = m.group(1)
+    if isinstance(raw_args, dict):
+        recovered = dict(raw_args)
+    else:
+        raw_str = str(raw_args or "{}").strip()
+        try:
+            parsed = json.loads(raw_str)
+            if isinstance(parsed, dict):
+                recovered = dict(parsed)
+        except Exception:
+            pass
+
+        if not recovered:
+            for key in ("filename", "path", "file", "file_path", "target", "command", "query", "keyword", "url", "subdir", "note", "site", "query_filter", "title", "summary"):
+                m = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
+                if m:
+                    try:
+                        recovered[key] = json.loads(f'"{m.group(1)}"')
+                    except Exception:
+                        recovered[key] = m.group(1)
+
+        if fn_name in ("write_project_file", "save_project_note") and not recovered.get("content"):
+            m_content = re.search(r'"content"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
+            if m_content:
+                try:
+                    recovered["content"] = json.loads(f'"{m_content.group(1)}"')
+                except Exception:
+                    recovered["content"] = m_content.group(1).replace("\\n", "\n").replace('\\"', '"')
+            else:
+                # Handle truncated content string at the end of raw_str
+                m_trunc = re.search(r'"content"\s*:\s*"(.*)$', raw_str, flags=re.S)
+                if m_trunc:
+                    tail = re.sub(r'"\s*\}\s*$', "", m_trunc.group(1))
+                    recovered["content"] = tail.replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
 
     if fn_name == "write_project_file":
-        m_content = re.search(r'"content"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
-        if m_content:
-            try:
-                recovered["content"] = json.loads(f'"{m_content.group(1)}"')
-            except Exception:
-                recovered["content"] = m_content.group(1).replace("\\n", "\n").replace('\\"', '"')
-        else:
-            # Handle truncated content string at the end of raw_str
-            m_trunc = re.search(r'"content"\s*:\s*"(.*)$', raw_str, flags=re.S)
-            if m_trunc:
-                tail = re.sub(r'"\s*\}\s*$', "", m_trunc.group(1))
-                recovered["content"] = tail.replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
         if not (recovered.get("filename") or recovered.get("path") or recovered.get("file")):
-            # Check if a single file in Projects/<active_proj>/Files/ was referenced in query_text
-            m_qfile = re.search(r"\b([A-Za-z0-9_.\-]+\.(?:py|sh|ps1|txt|json|yaml|yml|md|c|cpp|rs))\b", query_text or "")
-            if m_qfile:
-                recovered["filename"] = m_qfile.group(1)
-            elif active_proj:
-                try:
-                    files_dir = ensure_project_structure(active_proj) / "Files"
-                    py_files = [f.name for f in files_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
-                    if len(py_files) == 1:
-                        recovered["filename"] = py_files[0]
-                except Exception:
-                    pass
+            default_fn = _resolve_default_project_script_filename(active_proj, query_text, last_read_file)
+            if default_fn:
+                recovered["filename"] = default_fn
 
-    if not recovered:
-        recovered = {"command": raw_str}
+    if not recovered and not isinstance(raw_args, dict):
+        raw_s = str(raw_args or "").strip()
+        if raw_s and raw_s != "{}":
+            recovered = {"command": raw_s}
     return recovered
 
 
@@ -3078,6 +3207,447 @@ def _post_json_cancellable(
             pass
 
 
+def _lookup_host_mac_and_neigh(host_ip: str) -> Tuple[str, str, str]:
+    """Query the local OS ARP / L2 neighbor table for `host_ip` and return `(mac_address, interface, state)`."""
+    if not re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", host_ip or ""):
+        return "", "", ""
+    try:
+        if os.name != "nt" and shutil.which("ip"):
+            p = subprocess.run(
+                ["ip", "neigh", "show", host_ip],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            out = (p.stdout or "").strip()
+            if out:
+                m_mac = re.search(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", out)
+                m_dev = re.search(r"\bdev\s+([A-Za-z0-9_.\-@]+)", out)
+                m_state = re.search(r"\b(REACHABLE|STALE|DELAY|PERMANENT|PROBE|FAILED|INCOMPLETE)\b", out, flags=re.I)
+                return (
+                    m_mac.group(1).lower() if m_mac else "",
+                    m_dev.group(1) if m_dev else "",
+                    m_state.group(1).upper() if m_state else "",
+                )
+        p_arp = subprocess.run(
+            ["arp", "-a", host_ip] if os.name == "nt" else ["arp", "-n", host_ip],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        out_arp = (p_arp.stdout or "").strip()
+        m_mac2 = re.search(r"\b([0-9a-fA-F]{2}(?:[:\-][0-9a-fA-F]{2}){5})\b", out_arp)
+        if m_mac2:
+            return m_mac2.group(1).replace("-", ":").lower(), "", "REACHABLE"
+    except Exception:
+        pass
+    return "", "", ""
+
+
+def _is_trackable_target_host(host_str: str) -> bool:
+    h = (host_str or "").strip().lower()
+    if not h or h in ("localhost", "0.0.0.0", "255.255.255.255"):
+        return False
+    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", h):
+        octets = [int(x) for x in h.split(".") if x.isdigit()]
+        if len(octets) != 4 or any(o > 255 for o in octets):
+            return False
+        if octets[0] in (0, 127) or octets[0] >= 224 or octets[3] == 255:
+            return False
+        return True
+    return bool(re.match(r"^[a-z0-9][a-z0-9.\-]+\.[a-z]{2,}$", h))
+
+
+def _persist_target_and_telemetry_to_workspace(
+    project_slug: str,
+    command_str: str,
+    output_text: str,
+    exit_code: int = 0,
+    sygus_facts: Optional[Dict[str, Any]] = None,
+    primary_host: str = "",
+    open_ports_override: Optional[List[int]] = None,
+    discovered_urls_override: Optional[List[str]] = None,
+    discovered_assets_override: Optional[List[str]] = None,
+    tls_certs_override: Optional[List[str]] = None,
+    os_type_override: str = "",
+    architecture_override: str = "",
+    hardware_model_override: str = "",
+) -> List[str]:
+    """
+    Route live scan, curl, and command telemetry into the appropriate project workspace subdirectories:
+      1. `Projects/<project>/targets/`   : Equipment & Host Inventory ONLY (IPs, MACs, URLs, Open Ports, OS Type/Firmware, Architecture/Model/Serial).
+      2. `Projects/<project>/artifacts/` : Timestamped raw execution logs from scans, curl queries, nmap, ARP/neighbor probes, and scripts.
+      3. `Projects/<project>/assets/`    : Extracted target web/static assets (`/<hash>/lang/en.json`), `Last-Modified`/`ETag` build headers, and TLS certificate metadata.
+      4. `Projects/<project>/downloads/` : Downloaded JSON/XML/HTML payloads from curl/HTTP probes.
+    Returns a list of relative workspace paths updated or created.
+    """
+    saved_paths: List[str] = []
+    try:
+        proj_dir = ensure_project_structure(project_slug)
+        targets_dir = proj_dir / "targets"
+        artifacts_dir = proj_dir / "artifacts"
+        assets_dir = proj_dir / "assets"
+        downloads_dir = proj_dir / "downloads"
+        for d in (targets_dir, artifacts_dir, assets_dir, downloads_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        now_iso = _now_iso()
+        stamp_compact = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        cmd_clean = (command_str or "").strip()
+        out_clean = (output_text or "").strip()
+        facts = sygus_facts if isinstance(sygus_facts, dict) else {}
+
+        # 1. Save raw command/scan/curl output to `Projects/<project>/artifacts/`
+        is_scan_or_network_or_script = bool(
+            cmd_clean.startswith("scan_target")
+            or re.search(
+                r"\b(?:curl|wget|nmap|ping|arp|ip\s+(?:neigh|addr|route)|ss|netstat|openssl|python3?|bash|sh|powershell|pwsh|tio|ssh|nc|ncat|dig|nslookup|traceroute|tracepath)\b",
+                cmd_clean,
+                flags=re.I,
+            )
+        )
+        if is_scan_or_network_or_script and out_clean:
+            if cmd_clean.startswith("scan_target"):
+                art_prefix = "scan"
+            elif re.search(r"\bcurl\b", cmd_clean, flags=re.I):
+                art_prefix = "curl"
+            elif re.search(r"\bnmap\b", cmd_clean, flags=re.I):
+                art_prefix = "nmap"
+            elif re.search(r"\bpython3?\b|\.py\b", cmd_clean, flags=re.I):
+                art_prefix = "script"
+            else:
+                art_prefix = "probe"
+            slug_part = re.sub(r"[^a-zA-Z0-9_.\-]+", "_", primary_host or cmd_clean[:36]).strip("_")[:42] or "cmd"
+            art_file = artifacts_dir / f"{art_prefix}_{slug_part}_{stamp_compact}.log"
+            art_content = (
+                f"# CORA Execution Artifact\n"
+                f"# Project  : {proj_dir.name}\n"
+                f"# Timestamp: {now_iso}\n"
+                f"# Command  : {cmd_clean}\n"
+                f"# Exit Code: {exit_code}\n"
+                + (f"# SyGuS    : {facts.get('summary_header')}\n" if facts.get("summary_header") else "")
+                + "=" * 72
+                + "\n"
+                + out_clean
+                + "\n"
+            )
+            _atomic_write_text(art_file, art_content)
+            rel_art = f"Projects/{proj_dir.name}/artifacts/{art_file.name}"
+            saved_paths.append(rel_art)
+
+        # 2. If `curl` fetched a structured payload (JSON/XML/HTML/config), archive payload in `Projects/<project>/downloads/`
+        if re.search(r"\bcurl\b", cmd_clean, flags=re.I) and len(out_clean) > 80:
+            url_m = re.search(r"(https?://[^\s\"'`]+)", cmd_clean, flags=re.I)
+            if url_m:
+                u_str = url_m.group(1)
+                u_slug = re.sub(r"[^a-zA-Z0-9_.\-]+", "_", re.sub(r"^https?://", "", u_str))[:48].strip("_")
+                body_part = out_clean
+                if "\r\n\r\n" in body_part:
+                    body_part = body_part.split("\r\n\r\n", 1)[-1].strip()
+                elif "\n\n" in body_part and body_part.startswith("HTTP/"):
+                    body_part = body_part.split("\n\n", 1)[-1].strip()
+                ext = ".txt"
+                if body_part.startswith("{") or body_part.startswith("["):
+                    ext = ".json"
+                elif "<html" in body_part[:300].lower() or "<!doctype html" in body_part[:300].lower():
+                    ext = ".html"
+                dl_file = downloads_dir / f"curl_{u_slug}_{stamp_compact}{ext}"
+                _atomic_write_text(dl_file, out_clean)
+                saved_paths.append(f"Projects/{proj_dir.name}/downloads/{dl_file.name}")
+
+        # 3. Extract & Merge Target Equipment Intelligence into `Projects/<project>/targets/`
+        db_path = targets_dir / ".equipment_db.json"
+        equip_db: Dict[str, Dict[str, Any]] = {}
+        if db_path.is_file():
+            try:
+                loaded_db = json.loads(db_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(loaded_db, dict):
+                    equip_db = loaded_db
+            except Exception:
+                equip_db = {}
+
+        def _ensure_host_rec(h_key: str) -> Dict[str, Any]:
+            rec = equip_db.get(h_key)
+            if not isinstance(rec, dict):
+                rec = {
+                    "host": h_key,
+                    "mac_address": "",
+                    "interface": "",
+                    "neighbor_state": "",
+                    "open_ports": [],
+                    "urls": [],
+                    "os_type": "",
+                    "architecture": "",
+                    "hardware_model": "",
+                    "tls_certificates": [],
+                    "assets": [],
+                    "first_seen": now_iso,
+                    "last_seen": now_iso,
+                }
+                equip_db[h_key] = rec
+            rec["last_seen"] = now_iso
+            return rec
+
+        updated_hosts: List[str] = []
+
+        # 3a.Ingest ARP / L2 neighbors from SyGuS facts
+        for neigh in facts.get("arp_neighbors", []) or []:
+            if isinstance(neigh, dict):
+                n_ip = str(neigh.get("ip") or "").strip()
+                n_state = str(neigh.get("state") or "").upper()
+                n_mac = str(neigh.get("mac") or "").lower()
+                if _is_trackable_target_host(n_ip) and (n_mac or n_state in ("REACHABLE", "STALE", "DELAY", "PERMANENT")):
+                    rec = _ensure_host_rec(n_ip)
+                    if n_mac and n_mac != "none":
+                        rec["mac_address"] = n_mac
+                    if neigh.get("dev"):
+                        rec["interface"] = str(neigh["dev"])
+                    if n_state:
+                        rec["neighbor_state"] = n_state
+                    if n_ip not in updated_hosts:
+                        updated_hosts.append(n_ip)
+
+        # 3b. Determine candidate target hosts from primary_host, URLs, and command string
+        candidate_hosts: List[str] = []
+        if primary_host and _is_trackable_target_host(primary_host):
+            candidate_hosts.append(primary_host)
+        for u_match in re.findall(r"https?://([^\s/:,\"'`>]+)", f"{cmd_clean}\n{out_clean}", flags=re.I):
+            if _is_trackable_target_host(u_match) and u_match not in candidate_hosts:
+                candidate_hosts.append(u_match)
+        for ip_match in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cmd_clean):
+            if _is_trackable_target_host(ip_match) and ip_match not in candidate_hosts:
+                candidate_hosts.append(ip_match)
+
+        combined_text = f"{cmd_clean}\n{out_clean}"
+        fgt_serial_m = re.search(r"\b(FG[A-Z0-9]{2,6}[A-Z0-9]{8,12})\b", combined_text)
+        fortios_ver_m = re.search(r"\bFortiOS\s+v?(\d+\.\d+\.\d+)\b", combined_text, flags=re.I)
+        last_mod_m = re.search(r"Last-Modified[^:\n]*:\s*([A-Za-z]{3},\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+[\d:]+\s+GMT)", combined_text, flags=re.I)
+        ssh_banner_m = re.search(r"\b(SSH-\d+\.\d+-[^\s\r\n|]+)", combined_text)
+        server_hdr_m = re.search(r"(?im)^\s*Server:\s*([^\r\n]+)", combined_text)
+
+        for chost in candidate_hosts:
+            rec = _ensure_host_rec(chost)
+            if chost not in updated_hosts:
+                updated_hosts.append(chost)
+            # Lookup MAC from kernel ARP/neighbor cache if not yet recorded
+            if not rec.get("mac_address"):
+                mac_v, dev_v, st_v = _lookup_host_mac_and_neigh(chost)
+                if mac_v:
+                    rec["mac_address"] = mac_v
+                if dev_v and not rec.get("interface"):
+                    rec["interface"] = dev_v
+                if st_v and not rec.get("neighbor_state"):
+                    rec["neighbor_state"] = st_v
+
+            # Open ports
+            cur_ports = set(rec.get("open_ports") or [])
+            for p_num in open_ports_override or []:
+                cur_ports.add(f"{p_num}/tcp")
+            for p_obj in facts.get("open_ports", []) or []:
+                if isinstance(p_obj, dict) and p_obj.get("state", "open") == "open":
+                    cur_ports.add(f"{p_obj.get('port')}/{p_obj.get('proto', 'tcp')}")
+            for pm in re.finditer(r"PORT\s+(\d+)/(tcp|udp):\s*OPEN", out_clean, flags=re.I):
+                cur_ports.add(f"{pm.group(1)}/{pm.group(2).lower()}")
+            rec["open_ports"] = sorted(cur_ports, key=lambda s: int(re.sub(r"\D", "", s) or "0"))
+
+            # Discovered URLs
+            cur_urls = [u.rstrip("].,;)") for u in (rec.get("urls") or []) if u]
+            for u_ov in discovered_urls_override or []:
+                u_c = u_ov.rstrip("].,;)")
+                if u_c and u_c not in cur_urls:
+                    cur_urls.append(u_c)
+            for um in re.findall(r"(https?://[^\s\]\"'<>]+)", combined_text, flags=re.I):
+                u_c = um.rstrip("].,;)")
+                if chost in u_c and u_c not in cur_urls:
+                    cur_urls.append(u_c)
+            rec["urls"] = list(dict.fromkeys(cur_urls))[:25]
+
+            # Discovered static/XHR assets
+            cur_assets = [a.rstrip("].,;)") for a in (rec.get("assets") or []) if a]
+            for a_ov in discovered_assets_override or []:
+                a_c = a_ov.rstrip("].,;)")
+                if a_c and a_c not in cur_assets:
+                    cur_assets.append(a_c)
+            for am in re.findall(r"(/[0-9a-fA-F]{16,64}/[^\s\]\"'<>\\,]+)", out_clean):
+                a_c = am.rstrip("].,;)")
+                if a_c not in cur_assets:
+                    cur_assets.append(a_c)
+            rec["assets"] = list(dict.fromkeys(cur_assets))[:30]
+
+            # TLS Certificates
+            cur_certs = list(rec.get("tls_certificates") or [])
+            for c_ov in tls_certs_override or []:
+                if c_ov and c_ov not in cur_certs:
+                    cur_certs.append(c_ov)
+            for cm in re.findall(r"(PORT\s+\d+/tls:\s*[^\r\n]+)", out_clean):
+                if cm not in cur_certs:
+                    cur_certs.append(cm.strip())
+            rec["tls_certificates"] = cur_certs[:10]
+
+            # OS Type, Firmware & Architecture
+            if os_type_override:
+                rec["os_type"] = os_type_override
+            if architecture_override:
+                rec["architecture"] = architecture_override
+            if hardware_model_override:
+                rec["hardware_model"] = hardware_model_override
+
+            if fgt_serial_m or "fortigate" in combined_text.lower() or "fortios" in combined_text.lower() or "xxxxxxxx-xxxxx" in combined_text.lower():
+                serial_val = fgt_serial_m.group(1) if fgt_serial_m else ""
+                model_val = serial_val[:6] if serial_val else "FortiGate"
+                fver = fortios_ver_m.group(1) if fortios_ver_m else ("6.2.1 / 6.0.6" if "jul 2019" in combined_text.lower() else "6.x/7.x")
+                compile_note = f" (Compile Timestamp: {last_mod_m.group(1)})" if last_mod_m else ""
+                rec["os_type"] = f"Fortinet FortiOS {fver}{compile_note}"
+                if serial_val:
+                    rec["hardware_model"] = f"Fortinet {model_val} (Serial: {serial_val})"
+                elif not rec.get("hardware_model"):
+                    rec["hardware_model"] = "Fortinet FortiGate SSL-VPN / Appliance"
+                if not rec.get("architecture"):
+                    rec["architecture"] = "x86_64 / Fortinet NP6/SoC Appliance (Linux-based FortiOS Kernel)"
+            elif ssh_banner_m and not rec.get("os_type"):
+                rec["os_type"] = f"SSH Service ({ssh_banner_m.group(1)})"
+            elif server_hdr_m and not rec.get("os_type"):
+                rec["os_type"] = f"HTTP Server ({server_hdr_m.group(1).strip()})"
+
+            # Save target web/TLS assets file into `Projects/<project>/assets/` whenever assets or TLS certs are present
+            if rec.get("assets") or rec.get("tls_certificates") or last_mod_m:
+                host_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", chost)
+                asset_md_path = assets_dir / f"assets_{host_slug}.md"
+                asset_lines = [
+                    "---",
+                    f"title: Target Assets & TLS Fingerprints ({chost})",
+                    "category: assets",
+                    f"project: {proj_dir.name}",
+                    f"target_host: {chost}",
+                    f"updated: {now_iso}",
+                    "---",
+                    f"# Target Web Assets, Headers & TLS Certificates (`{chost}`)",
+                    "",
+                    f"- **Target Host / IP:** `{chost}`",
+                    f"- **Identified OS / Firmware:** `{rec.get('os_type') or 'Unknown'}`",
+                    f"- **Hardware / Serial:** `{rec.get('hardware_model') or 'Unknown'}`",
+                    f"- **Last Updated:** `{now_iso}`",
+                    "",
+                    "## 1. TLS / SSL Certificate Telemetry",
+                ]
+                if rec.get("tls_certificates"):
+                    for tc_line in rec["tls_certificates"]:
+                        asset_lines.append(f"- `{tc_line}`")
+                else:
+                    asset_lines.append("- *(No TLS certificates recorded yet)*")
+                asset_lines.append("")
+                asset_lines.append("## 2. Discovered Static & XHR Web Assets")
+                if rec.get("assets"):
+                    for a_item in rec["assets"]:
+                        asset_lines.append(f"- `{a_item}`")
+                else:
+                    asset_lines.append("- *(No static asset paths extracted yet)*")
+                asset_lines.append("")
+                asset_lines.append("## 3. Discovered HTTP/HTTPS Endpoints")
+                for u_item in rec.get("urls") or []:
+                    asset_lines.append(f"- `{u_item}`")
+                _atomic_write_text(asset_md_path, "\n".join(asset_lines) + "\n")
+                rel_asset = f"Projects/{proj_dir.name}/assets/{asset_md_path.name}"
+                if rel_asset not in saved_paths:
+                    saved_paths.append(rel_asset)
+
+        # 3c. Persist `.equipment_db.json`, individual `target_<host>.md` files, and `equipment_inventory.md`
+        if updated_hosts:
+            _atomic_write_text(db_path, json.dumps(equip_db, indent=2, sort_keys=True))
+            for u_host in updated_hosts:
+                rec = equip_db[u_host]
+                h_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", u_host)
+                t_path = targets_dir / f"target_{h_slug}.md"
+                ports_str = ", ".join(rec.get("open_ports") or []) or "None detected yet"
+                urls_list = rec.get("urls") or []
+                t_lines = [
+                    "---",
+                    f"title: Target Equipment Profile ({u_host})",
+                    "category: targets",
+                    f"project: {proj_dir.name}",
+                    f"ip_address: {u_host}",
+                    f"mac_address: {rec.get('mac_address') or 'Unknown'}",
+                    f"os_type: {rec.get('os_type') or 'Unknown'}",
+                    f"architecture: {rec.get('architecture') or 'Unknown'}",
+                    f"updated: {now_iso}",
+                    "---",
+                    f"# Target Equipment Profile: `{u_host}`",
+                    "",
+                    "## 1. Equipment & Network Identity",
+                    f"- **IP Address / Hostname:** `{u_host}`",
+                    f"- **MAC Address (L2):** `{rec.get('mac_address') or 'Not resolved / off-link'}`",
+                    f"- **Network Interface & Neighbor State:** `{rec.get('interface') or 'N/A'}` (`{rec.get('neighbor_state') or 'N/A'}`)",
+                    f"- **System OS Type / Firmware:** `{rec.get('os_type') or 'Pending deep fingerprint'}`",
+                    f"- **System Architecture:** `{rec.get('architecture') or 'Pending identification'}`",
+                    f"- **Hardware Model / Serial:** `{rec.get('hardware_model') or 'Pending identification'}`",
+                    f"- **Open TCP/UDP Ports:** `{ports_str}`",
+                    f"- **First Discovered:** `{rec.get('first_seen', now_iso)}`",
+                    f"- **Last Verified:** `{rec.get('last_seen', now_iso)}`",
+                    "",
+                    "## 2. Discovered URLs & Management Endpoints",
+                ]
+                if urls_list:
+                    for u_str in urls_list:
+                        t_lines.append(f"- `{u_str}`")
+                else:
+                    t_lines.append("- *(No HTTP/HTTPS URLs discovered on this host yet)*")
+                if rec.get("tls_certificates"):
+                    t_lines.append("")
+                    t_lines.append("## 3. TLS Certificate & Cryptographic Identity")
+                    for c_str in rec["tls_certificates"]:
+                        t_lines.append(f"- `{c_str}`")
+                if rec.get("assets"):
+                    t_lines.append("")
+                    t_lines.append("## 4. Static Web Assets & Build Fingerprints")
+                    for a_str in rec["assets"]:
+                        t_lines.append(f"- `{a_str}`")
+                _atomic_write_text(t_path, "\n".join(t_lines) + "\n")
+                rel_t = f"Projects/{proj_dir.name}/targets/{t_path.name}"
+                if rel_t not in saved_paths:
+                    saved_paths.append(rel_t)
+                try:
+                    from Reasoning.engines.vault_bridge import update_project_memory_index
+
+                    update_project_memory_index(
+                        proj_dir,
+                        f"targets/{t_path.stem}",
+                        f"Target {u_host} | MAC={rec.get('mac_address') or 'N/A'} | Ports={ports_str} | OS={rec.get('os_type') or 'Unknown'}",
+                        ["target", "equipment", h_slug],
+                    )
+                except Exception:
+                    pass
+
+            # Regenerate master `Projects/<project>/targets/equipment_inventory.md`
+            inv_path = targets_dir / "equipment_inventory.md"
+            inv_lines = [
+                "---",
+                f"title: Discovered Equipment & Target Inventory ({proj_dir.name})",
+                "category: targets",
+                f"project: {proj_dir.name}",
+                f"updated: {now_iso}",
+                "---",
+                f"# Discovered Equipment & Target Inventory (`Projects/{proj_dir.name}/targets/`)",
+                "",
+                "| IP / Host | MAC Address | Interface / State | Open Ports | System OS / Firmware | Architecture / Hardware Model | Discovered URLs |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            ]
+            for h_key in sorted(equip_db.keys()):
+                r_item = equip_db[h_key]
+                mac_s = f"`{r_item.get('mac_address')}`" if r_item.get("mac_address") else "—"
+                if_s = f"{r_item.get('interface') or ''} ({r_item.get('neighbor_state') or ''})".strip(" ()") or "—"
+                p_s = ", ".join(r_item.get("open_ports") or []) or "—"
+                os_s = r_item.get("os_type") or "—"
+                arch_s = " / ".join(x for x in (r_item.get("hardware_model"), r_item.get("architecture")) if x) or "—"
+                u_s = ", ".join(f"`{u}`" for u in (r_item.get("urls") or [])[:3]) or "—"
+                inv_lines.append(f"| `{h_key}` | {mac_s} | {if_s} | {p_s} | {os_s} | {arch_s} | {u_s} |")
+            _atomic_write_text(inv_path, "\n".join(inv_lines) + "\n")
+    except Exception:
+        pass
+    return saved_paths
+
+
 def _execute_webui_target_scan(
     target: str,
     mode_info: Dict[str, Any],
@@ -3298,7 +3868,10 @@ def _execute_webui_target_scan(
     # Prepend high-signal executive fingerprint summary at the very top so truncation never hides model/serial/firmware date
     full_text_tmp = "\n".join(report_lines)
     fgt_serial_m = re.search(r"\b(FG[A-Z0-9]{2,6}[A-Z0-9]{8,12})\b", full_text_tmp)
+    mac_addr_scan, dev_if_scan, neigh_state_scan = _lookup_host_mac_and_neigh(host_only)
     summary_top = [f"=== [0] High-Confidence Target Fingerprint Summary ({host_only}) ==="]
+    if mac_addr_scan:
+        summary_top.append(f"• L2 MAC Address & Interface: {mac_addr_scan} (dev={dev_if_scan or 'LAN'}, state={neigh_state_scan or 'REACHABLE'})")
     summary_top.append(f"• Open TCP Ports: {', '.join(str(p) for p in open_ports) if open_ports else 'None detected'}")
     if fgt_serial_m:
         serial_str = fgt_serial_m.group(1)
@@ -3317,6 +3890,19 @@ def _execute_webui_target_scan(
     sygus_facts = extract_structured_facts(f"scan_target {host_only}", combined_out)
     if not mode_info.get("read_only"):
         try:
+            saved_ws = _persist_target_and_telemetry_to_workspace(
+                project_slug=project_slug,
+                command_str=f"scan_target({host_only})",
+                output_text=combined_out,
+                exit_code=0,
+                sygus_facts=sygus_facts,
+                primary_host=host_only,
+                open_ports_override=open_ports,
+                discovered_urls_override=probe_urls[:6],
+                discovered_assets_override=discovered_assets,
+            )
+            if saved_ws:
+                combined_out += "\n\n[Saved to Project Workspace]: " + ", ".join(f"`{p}`" for p in saved_ws)
             record_command_event(f"scan_target {host_only}", combined_out, 0)
             record_live_command_experience(f"scan_target {host_only}", 0, combined_out)
             facts_cnt = (
@@ -3473,14 +4059,14 @@ def _call_llm_backend(
 
     def _build_payload(
         msgs: List[Dict[str, Any]],
-        max_toks: int = 2560,
+        max_toks: int = 2800,
         include_tools: bool = True,
         think_flag: bool = True,
     ) -> bytes:
         est_prompt_toks = max(256, len(json.dumps(msgs)) // 3)
         if tools and include_tools:
             est_prompt_toks += 650
-        safe_max_toks = max(512, min(max_toks, 7600 - est_prompt_toks)) if est_prompt_toks < 7000 else 640
+        safe_max_toks = max(1536, min(max_toks, 8192 - est_prompt_toks)) if est_prompt_toks < 6800 else 1536
         payload_dict: Dict[str, Any] = {
             "model": effective_alias,
             "messages": msgs,
@@ -3558,7 +4144,11 @@ def _call_llm_backend(
                     if isinstance(a_raw, str):
                         try:
                             d = json.loads(a_raw)
-                            if fn_o.get("name") == "write_project_file" and not (d.get("filename") or d.get("path")):
+                            if not isinstance(d, dict):
+                                return True
+                            if fn_o.get("name") == "write_project_file" and (
+                                not (d.get("filename") or d.get("path")) or not d.get("content")
+                            ):
                                 return True
                         except Exception:
                             return True
@@ -3571,10 +4161,10 @@ def _call_llm_backend(
                 cur_thinking_flag
                 and (
                     (not res["content"].strip() and not tool_calls)
-                    or (finish_reason == "length" and _has_truncated_tool_call(tool_calls))
+                    or _has_truncated_tool_call(tool_calls)
                 )
                 and res.get("thinking")
-                and (finish_reason == "length" or len(res["thinking"]) > 200)
+                and (finish_reason == "length" or len(res["thinking"]) > 120)
                 and not _is_execution_cancelled(exec_gen)
             ):
                 saved_thinking = res["thinking"]
@@ -3923,6 +4513,14 @@ def execute_safe_shell_command(
     t0 = time.perf_counter()
     try:
         exec_cmd_str = cmd_clean
+        if "/tmp/" in exec_cmd_str:
+            dl_dir = proj_dir / "downloads"
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            exec_cmd_str = re.sub(
+                r"((?:-o|-O|--output|--output-document|>|>>|\btee\s+(?:-a\s+)?)\s*['\"]?)/tmp/([a-zA-Z0-9_.\-]+)",
+                lambda m: f"{m.group(1)}{dl_dir}/{m.group(2)}",
+                exec_cmd_str,
+            )
         if os.name == "nt" and "tio " not in exec_cmd_str:
             exec_cmd_str = re.sub(r"\barp\s+-accepteula\b", "arp -a", exec_cmd_str, flags=re.I)
             exec_cmd_str = re.sub(r"\bping\s+-c\s+(\d+)\s+-W\s+\d+\b", r"ping -n \1 -w 1200", exec_cmd_str)
@@ -4056,6 +4654,15 @@ def execute_safe_shell_command(
                             combined_out.rstrip()
                             + f"\n[CBR Engine 11 Verified Fix ({cbr_match.get('case_id')})]: {cbr_match.get('verified_fix')}"
                         )
+                saved_ws_cmd = _persist_target_and_telemetry_to_workspace(
+                    project_slug=project_slug,
+                    command_str=cmd_clean,
+                    output_text=combined_out,
+                    exit_code=proc.returncode,
+                    sygus_facts=sygus_facts,
+                )
+                if saved_ws_cmd:
+                    combined_out = combined_out.rstrip() + "\n\n[Saved to Project Workspace]: " + ", ".join(f"`{p}`" for p in saved_ws_cmd)
                 record_command_event(cmd_clean, combined_out, proc.returncode)
                 record_live_command_experience(cmd_clean, proc.returncode, combined_out)
                 open_ports_only = [
@@ -6082,10 +6689,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 + ", ".join(f"`{a}`" for a in clean_attached)
                 + f"\n{project_files_block}"
             )
-    elif re.search(r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded|custom\s+scripts?|in\s+files|from\s+files|exploit\s+script|python\s+script)\b", effective_query_text, flags=re.I):
-        user_prompt += f"\n\n{project_files_block}"
     elif project_files_block:
-        user_prompt += f"\n\n{project_files_block[:1600]}"
+        user_prompt += f"\n\n{project_files_block}"
 
     if reasoning_guidance_block and not is_short_followup:
         user_prompt += f"\n{reasoning_guidance_block}"
@@ -6125,6 +6730,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     seen_tool_calls: Dict[str, int] = {}
     web_intel_executed = False
     target_scan_executed = False
+    last_read_file = ""
+    file_written_in_turn = False
     relentless_continuations = 0
     auto_run_nudges = 0
     max_relentless_continuations = 8 if (relentless_active and cur_rel_max_int == 0) else (max(1, cur_rel_max_int // 2) if relentless_active else 0)
@@ -6132,10 +6739,12 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     queued_for_confirmation: List[Dict[str, Any]] = []
 
     async def _dispatch_single_tool(fn_name: str, parsed_args: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
-        nonlocal target_scan_executed, web_intel_executed
+        nonlocal target_scan_executed, web_intel_executed, last_read_file, file_written_in_turn
         if fn_name == "read_project_file":
             p_val = str(parsed_args.get("path") or parsed_args.get("filename") or parsed_args.get("file") or "Files").strip()
             t_r = await asyncio.to_thread(_execute_webui_read_project_file, p_val, active_proj)
+            if t_r.get("executed") and p_val.lower() not in ("files", "files/", "readme.md", "files/readme.md"):
+                last_read_file = p_val
             return t_r, f"read_project_file({p_val})"
         if fn_name == "list_project_files_tool":
             s_val = str(parsed_args.get("subdir") or "Files").strip()
@@ -6160,7 +6769,15 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             ).strip()
             c_txt = str(parsed_args.get("content") or "")
             t_r = await asyncio.to_thread(_execute_webui_write_project_file, f_val, c_txt, mode_info, active_proj)
+            if t_r.get("executed") and t_r.get("exit_code") == 0:
+                file_written_in_turn = True
             return t_r, f"write_project_file({f_val})"
+        if fn_name == "save_project_note":
+            t_val = str(parsed_args.get("title") or parsed_args.get("filename") or "project_note").strip()
+            s_val = str(parsed_args.get("summary") or t_val).strip()
+            c_val = str(parsed_args.get("content") or "").strip()
+            t_r = await asyncio.to_thread(_execute_webui_save_project_note, t_val, s_val, c_val, mode_info, active_proj)
+            return t_r, f"save_project_note({t_val})"
         if fn_name == "scan_target":
             t_val = str(parsed_args.get("target") or "").strip()
             t_r = await asyncio.to_thread(
@@ -6342,7 +6959,13 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             fn_obj = tc.get("function") or {}
             fn_name = str(fn_obj.get("name") or "")
             raw_args = fn_obj.get("arguments") or "{}"
-            parsed_args = _recover_tool_args(fn_name, raw_args, active_proj=active_proj, query_text=effective_query_text)
+            parsed_args = _recover_tool_args(
+                fn_name,
+                raw_args,
+                active_proj=active_proj,
+                query_text=effective_query_text,
+                last_read_file=last_read_file,
+            )
 
             # Compute normalized signature to prevent the LLM from repeating identical tool calls across waves
             if fn_name == "scan_target":
@@ -6402,10 +7025,12 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             if label_cmd:
                 executed_cmds_list.append(label_cmd)
             raw_out = str(t_res.get("output") or "(no output)")
-            if len(raw_out) > 4200:
+            max_tool_chars = 16000 if fn_name == "read_project_file" else 4200
+            if len(raw_out) > max_tool_chars:
+                head_c = max_tool_chars - 1400
                 preserved_out = (
-                    raw_out[:2600]
-                    + f"\n... [{len(raw_out) - 3800} middle chars omitted; head+tail preserved] ...\n"
+                    raw_out[:head_c]
+                    + f"\n... [{len(raw_out) - max_tool_chars} middle chars omitted; head+tail preserved] ...\n"
                     + raw_out[-1200:]
                 )
             else:
@@ -6425,13 +7050,13 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 if t_res.get("blocked")
                 else f"Exit Code: {t_res.get('exit_code', 0)}\n{hdr_prefix}{preserved_out}"
             )
-            executed_outs_list.append(f"=== Tool Executed: `{label_cmd}` ===\n{out_txt[:5000]}")
+            executed_outs_list.append(f"=== Tool Executed: `{label_cmd}` ===\n{out_txt[:max_tool_chars]}")
             wire_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc_id,
                     "name": fn_name,
-                    "content": out_txt[:3800],
+                    "content": out_txt[:max_tool_chars],
                 }
             )
 
@@ -6675,6 +7300,64 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             llm_error=llm_error,
             cmd_res=cmd_res,
         )
+
+    # Automatic Code-Block-to-`Files/` Persistence Guard:
+    # When the operator asks CORA to create, write, save, or fix a script/file and the LLM outputs a fenced
+    # code block in its response without completing `write_project_file`, automatically persist the script
+    # into `Projects/<active_proj>/Files/`!
+    wants_script_or_file_write = bool(
+        re.search(
+            r"\b(?:create|write|make|generate|build|save|fix|update|edit|modify|patch)\b.*\b(?:script|file|code|\.py\b|\.sh\b|\.ps1\b|python|bash|powershell)\b"
+            r"|\b(?:python|bash|shell|powershell|exploit)\s+script\b",
+            effective_query_text,
+            flags=re.I,
+        )
+    )
+    if (
+        wants_script_or_file_write
+        and not file_written_in_turn
+        and not queued_for_confirmation
+        and not mode_info.get("read_only")
+        and reply_content
+    ):
+        code_blocks = re.findall(r"```([a-zA-Z0-9_+\-]*)\s*\n(.*?)```", reply_content, flags=re.S)
+        best_code = ""
+        best_lang = ""
+        for lang_tag, c_body in code_blocks:
+            lt = (lang_tag or "").strip().lower()
+            cb = (c_body or "").strip()
+            if lt in ("text", "plaintext", "output", "console") and not (
+                "import " in cb or "def " in cb or "#!/" in cb
+            ):
+                continue
+            if len(cb) > len(best_code) and len(cb) >= 20:
+                best_code = cb
+                best_lang = lt
+        if best_code:
+            auto_fn = _resolve_default_project_script_filename(active_proj, effective_query_text, last_read_file)
+            if not auto_fn:
+                ext_auto = ".sh" if best_lang in ("bash", "sh", "shell") else (".ps1" if best_lang in ("ps1", "powershell") else ".py")
+                auto_fn = f"cora_script{ext_auto}"
+            w_auto = await asyncio.to_thread(
+                _execute_webui_write_project_file,
+                auto_fn,
+                best_code + "\n",
+                mode_info,
+                active_proj,
+            )
+            if w_auto.get("executed") and w_auto.get("exit_code") == 0:
+                file_written_in_turn = True
+                lbl_w_auto = f"write_project_file({auto_fn})"
+                executed_cmds_list.append(lbl_w_auto)
+                executed_outs_list.append(f"=== Tool Executed: `{lbl_w_auto}` ===\n{w_auto.get('output')}")
+                cmd_res = {
+                    "executed": True,
+                    "blocked": False,
+                    "command": " ; ".join(executed_cmds_list),
+                    "exit_code": 0,
+                    "output": "\n\n".join(executed_outs_list)[:12000],
+                }
+                reply_content += f"\n\n---\n✅ **Saved to Project `Files` Directory:** `{w_auto.get('output')}`"
 
     return _persist_and_return_turn(
         conversation_id=req.conversation_id or f"conv-{active_proj}",
