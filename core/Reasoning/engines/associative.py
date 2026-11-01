@@ -65,7 +65,10 @@ KNOWN_TECH_CONCEPTS = {
     "srm", "seaccesscheck", "sddl", "dacl", "sacl", "mic", "wdigest", "cloudap", "dsregcmd", "cmdkey",
     "vaultcmd", "runasppl", "ppl", "eprocess", "ethread", "peb", "teb", "ssdt", "patchguard", "byovd",
     "ring0", "ring3",
-    "cve", "nvd", "cisa", "kev", "epss", "osv", "exploit-db", "nuclei", "gtfobins", "lolbas", "loldrivers",
+    "cve", "nvd", "cisa", "kev", "epss", "osv", "exploit-db", "nuclei", "gtfobins", "lolbas", "lolbins", "lolbin",
+    "lolscript", "lolscripts", "lollib", "lollibs", "loldrivers", "rundll32", "regsvr32", "mshta", "msbuild",
+    "installutil", "cmstp", "bitsadmin", "mavinject", "odbcconf", "comsvcs", "ntdsutil", "dsdbutil", "diskshadow",
+    "pcalua", "pubprn", "syncappvpublishingserver", "msiexec", "regasm", "regsvcs", "csc", "cscript", "wscript",
     "shodan", "internetdb", "psirt", "malwarebazaar", "threatfox", "urlhaus", "feodotracker", "greynoise",
     "web_search", "fetch_webpage",
 }
@@ -139,8 +142,17 @@ _CYBER_INTEL_INTENT_RE = re.compile(
 )
 
 
+_LOLBINS_INTENT_RE = re.compile(
+    r"\b(?:lolbins?|lolbas|lolscripts?|lollibs?|living[\s_\-]+off[\s_\-]+the[\s_\-]+land|"
+    r"crowinnovations/lolbas|certutil|rundll32|regsvr32|mshta|msbuild|installutil|cmstp|bitsadmin|"
+    r"mavinject|odbcconf|comsvcs|ntdsutil|dsdbutil|diskshadow|pcalua|pubprn|syncappvpublishingserver|"
+    r"awl[\s_\-]+bypass|squiblydoo)\b",
+    re.I,
+)
+
+
 def infer_team_role_from_query(query: str) -> str:
-    """Infer whether a query/problem primarily aligns with `cyber_threat_intel`, `windows_internals`, `blue_team`, `red_team`, `hunt_team`, `reverse_engineering`, `windows_forensics`, or `linux_forensics`."""
+    """Infer whether a query/problem primarily aligns with `lolbins`, `cyber_threat_intel`, `windows_internals`, `blue_team`, `red_team`, `hunt_team`, `reverse_engineering`, `windows_forensics`, or `linux_forensics`."""
     q_low = (query or "").lower()
     if not q_low:
         return ""
@@ -152,13 +164,16 @@ def infer_team_role_from_query(query: str) -> str:
     lin_dfir_hits = len(_LINUX_FORENSICS_INTENT_RE.findall(q_low))
     win_int_hits = len(_WINDOWS_INTERNALS_INTENT_RE.findall(q_low))
     intel_hits = len(_CYBER_INTEL_INTENT_RE.findall(q_low))
+    lolbins_hits = len(_LOLBINS_INTENT_RE.findall(q_low))
     if "blue team" in q_low or "blue_team" in q_low:
         blue_hits += 4
     if "red team" in q_low or "red_team" in q_low:
         red_hits += 4
     if "hunt team" in q_low or "hunt_team" in q_low or "threat hunt" in q_low:
         hunt_hits += 4
-    if any(k in q_low for k in ("cve-", "cve ", "cisa kev", "nvd", "epss", "gtfobins", "lolbas", "loldrivers", "shodan", "internetdb", "exploit-db", "psirt", "fortiguard")):
+    if any(k in q_low for k in ("lolbin", "lolbins", "lolbas", "lolscript", "lollib", "living off the land", "crowinnovations/lolbas")):
+        lolbins_hits += 6
+    if any(k in q_low for k in ("cve-", "cve ", "cisa kev", "nvd", "epss", "gtfobins", "loldrivers", "shodan", "internetdb", "exploit-db", "psirt", "fortiguard")):
         intel_hits += 5
     if any(k in q_low for k in ("reverse engineer", "reverse_engineer", "revengai", "reveng.ai", "reait")):
         reveng_hits += 5
@@ -174,6 +189,7 @@ def infer_team_role_from_query(query: str) -> str:
         lin_dfir_hits += 5
     best_role, best_score = "", 0
     for role, sc in (
+        ("lolbins", lolbins_hits),
         ("cyber_threat_intel", intel_hits),
         ("windows_internals", win_int_hits),
         ("windows_forensics", win_dfir_hits),
@@ -371,7 +387,12 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
 
         note_id = f"note:{rel_str.lower()}"
         category = rel_Obj.parts[0] if len(rel_Obj.parts) > 1 else "root"
-        is_team_playbook = rel_str.lower().endswith("_strategy_playbook")
+        rel_low = rel_str.lower()
+        is_team_playbook = (
+            rel_low.endswith("_strategy_playbook")
+            or rel_low == "reasoning/lolbins"
+            or rel_low.startswith("reasoning/lolbins/")
+        )
         # Curated strategy playbooks (`blue/red/hunt_team_strategy_playbook`, `reverse_engineering_strategy_playbook`)
         # and operational notes have higher edge authority than auto-generated `reasoning/` reports.
         cat_mult = 1.65 if is_team_playbook else (0.65 if category == "reasoning" else 1.35)
@@ -464,7 +485,11 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
         label_tokens = set(re.findall(r"[a-z0-9]+", label_low))
         summary_tokens = set(re.findall(r"[a-z0-9]+", summary_low))
         cat_low = str(ndata.get("category", "")).lower()
-        is_team_playbook = label_low.endswith("_strategy_playbook")
+        is_team_playbook = (
+            label_low.endswith("_strategy_playbook")
+            or label_low == "reasoning/lolbins"
+            or label_low.startswith("reasoning/lolbins/")
+        )
         is_hub_or_master = bool(
             re.search(
                 r"(?:^|/)(?:0[1-9]_|10_|windows_master_|linux_master_|curl_playbook|tio_serial_playbook|revengai_and_binary_reversing_playbook|(?:windows|linux)_digital_forensics_playbook|(?:blue_team|red_team|hunt_team|reverse_engineering|windows_digital_forensics|linux_digital_forensics)_strategy_playbook)",
@@ -620,6 +645,7 @@ def run_associative_vault_reasoning(
 
         inferred_team_role = infer_team_role_from_query(query)
         role_to_playbook = {
+            "lolbins": "lolbins",
             "cyber_threat_intel": "cyber_threat_cve_and_tools_intelligence_strategy_playbook",
             "windows_internals": "windows_kernel_and_userspace_enumeration_strategy_playbook",
             "windows_forensics": "windows_digital_forensics_strategy_playbook",

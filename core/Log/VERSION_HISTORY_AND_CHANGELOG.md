@@ -1,7 +1,7 @@
 # C.O.R.A. Master Version History & Architectural Changelog (`core/Log/VERSION_HISTORY_AND_CHANGELOG.md`)
 
 **Author:** CROW Innovations  
-**Current Semantic Version:** `5.20.18` ([`cora_version.json`](./cora_version.json))  
+**Current Semantic Version:** `5.21.19` ([`cora_version.json`](./cora_version.json))  
 
 ---
 
@@ -9,12 +9,22 @@
 
 `C.O.R.A.` tracks its version deterministically in [`core/Log/cora_version.json`](./cora_version.json):
 - **`major_cli` (`5`)**: Major CLI, Custom WebUI, and Two-Tier Project/Vault Architecture generation.
-- **`engine_rev` (`20`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
-- **`patch_rev` (`18`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
+- **`engine_rev` (`21`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
+- **`patch_rev` (`19`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
 
 ---
 
 ## 2. Release History & Root-Cause Fix Ledger
+
+### `v5.21.19` — LOLBINS Reasoning Vault (`CROWInnovations/LOLBAS`), NIST NVD 2.0 & OpenCVE Intelligence & `web_intel.py` Fixes
+- **LOLBINS Living-Off-The-Land Binaries, Scripts & Libraries Reasoning Suite (`core/ObsidianVault/reasoning/LOLBINS.md` & `core/ObsidianVault/reasoning/LOLBINS/`)**:
+  - Ingested the complete [`https://github.com/CROWInnovations/LOLBAS`](https://github.com/CROWInnovations/LOLBAS) repository (**202 entries** across `OSBinaries` (`117`), `OSScripts` (`10`), `OSLibraries` (`16`), `OtherMSBinaries` (`57`), and `HonorableMentions` (`2`), totaling **414 verified commands** across `15` tactical categories: `Execute`, `Download`, `Upload`, `AWL Bypass`, `UAC Bypass`, `Dump`, `Credentials`, `ADS`, `Compile`, `Copy`, `Encode`/`Decode`, `Reconnaissance`, and `Tamper`).
+  - Wired `reasoning/LOLBINS` and its 5 sub-playbooks (`lolbins_os_binaries_a_to_l.md`, `lolbins_os_binaries_m_to_z.md`, `lolbins_os_scripts_and_libraries.md`, `lolbins_other_ms_binaries.md`, `lolbins_tactical_categories_and_detections.md`) into [`00_MEMORY_INDEX.md`](../ObsidianVault/00_MEMORY_INDEX.md), [`vault_bridge.py`](../Reasoning/engines/vault_bridge.py), Engine 1 (`associative.py`), and the 15-Engine Orchestrator (`pipeline.py`).
+- **NIST NVD API 2.0, Local `~/Projects/CVEs/` Repository & OpenCVE Integration (`core/Reasoning/engines/web_intel.py` & [`cyber_threat_cve_and_tools_intelligence_strategy_playbook.md`](../ObsidianVault/reasoning/cyber_threat_cve_and_tools_intelligence_strategy_playbook.md))**:
+  - **Fixed DuckDuckGo HTML Snippet Extraction**: Updated `execute_tier1_web_search()` to split on top-level `<div class="result ...">` boundaries so nested `result__extras` divs never truncate the block before `<a class="result__snippet">` is parsed (resolving `Snippet: (no snippet)` on web search results).
+  - **Automatic Result CVE Enrichment**: Updated `execute_tier1_web_search()` to extract `CVE-YYYY-NNNN` identifiers from both the query string and the returned search result titles/URLs/snippets, automatically enriching top CVEs with complete NVD 2.0 telemetry (Descriptions, CVSS v4.0/v3.1/v3.0/v2.0, CWEs, CISA KEV status/deadlines, CPE 2.3 version ranges, and tagged references).
+  - **Point-Version CPE 2.3 Range Matching (`_search_local_nvd_by_product_version` & `_cpe_version_matches`)**: Added automatic CPE 2.3 `versionStartIncluding`/`versionStartExcluding`/`versionEndIncluding`/`versionEndExcluding` range evaluation against `~/Projects/CVEs/nvd_cves.sqlite` (`417,614` CVEs, `958,619` product/vendor mappings) so point-version queries (e.g., `FortiOS 6.2.1` or `FortiOS 6.0.6`) immediately return all matching CVEs even when search engines only index range strings (`6.2.0 through 6.2.15`).
+  - **Smart NVD Angular SPA & OpenCVE (`app.opencve.io`) Interception**: Updated `execute_tier1_fetch_webpage()` to rewrite `nvd.nist.gov/vuln/detail/CVE-*` Angular shells to `services.nvd.nist.gov/rest/json/cves/2.0?cveId=...`, handle `nvd.nist.gov/vuln/data-feeds`, support `OPENCVE_API_TOKEN` bearer auth on `app.opencve.io/api/v2/*`, and automatically route unauthenticated `app.opencve.io/api/v2/cves` calls to OpenCVE's zero-auth server-rendered `app.opencve.io/cve/` endpoints.
 
 ### `v5.20.18` — End-to-End 15-Engine Mathematical & Logic Audit, LLM KV-Cache Reuse & CPU/GPU Resource Balance
 - **15-Engine Neuro-Symbolic & Mathematical Fixes (`core/Reasoning/engines/`)**:
