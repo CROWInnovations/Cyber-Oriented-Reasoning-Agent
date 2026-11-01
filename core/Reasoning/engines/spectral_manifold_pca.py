@@ -160,7 +160,10 @@ def extract_feature_vector_from_context(
         if (
             ev.get("target_outside_local_24_cidr")
             or bool(ctx.get("secondary_target_ip"))
-            or any(k in p_low for k in ("cross-subnet", "disjoint", "isolated", "pivot", "203.0.113", "network is unreachable", "no route to host"))
+            or (
+                not (ev.get("alt_port_open_in_scan") or ev.get("icmp_ping_responds") or ev.get("open_tcp_port"))
+                and any(k in p_low for k in ("cross-subnet", "disjoint", "isolated", "203.0.113", "network is unreachable", "no route to host"))
+            )
         )
         else 1.0
     )
@@ -195,7 +198,17 @@ def extract_feature_vector_from_context(
         )
         else 0.0
     )
-    f9_serial = 1.0 if (ctx.get("has_serial_oob") and (f7_refused >= 0.5 or bool(re.search(r"\b(?:ttyusb\d*|ttyacm\d*|serial|tio|uart|oob|console)\b", p_low)))) else 0.0
+    f9_serial = (
+        1.0
+        if (
+            ctx.get("has_serial_oob")
+            and (
+                f7_refused >= 0.5
+                or bool(re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low))
+            )
+        )
+        else 0.0
+    )
     f10_auth = (
         1.0
         if (

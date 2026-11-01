@@ -339,6 +339,77 @@ DEFAULT_CYBER_PROFILES: Dict[str, Any] = {
             },
         },
     },
+    "exploit_callback_or_script_failure": {
+        "description": "Root-cause abduction when a local exploit script, PoC payload, or reverse shell callback executes without receiving a callback.",
+        "hypotheses": {
+            "lhost_callback_ip_or_port_mismatch": {
+                "prior": 0.38,
+                "alpha_count": 9.5,
+                "description": "Hardcoded LHOST / callback IP or port inside the exploit script does not match the operator's active host interface IP (`ip -4 addr`) or listener port.",
+                "remediation": "Inspect the script in `$PROJECT_FILES_DIR` (`Files/`), compare hardcoded callback IP/port against `ip -4 -br addr show`, and update LHOST/LPORT to the active host IP.",
+            },
+            "reverse_shell_listener_not_bound_or_egress_filtered": {
+                "prior": 0.24,
+                "alpha_count": 6.0,
+                "description": "No active TCP listener (`ss -tulpn` / `nc -lvnp`) is bound on the callback port, or host/target egress firewall blocks the reverse connection.",
+                "remediation": "Verify active listeners (`ss -tulpn`) and test reverse reachability before firing the exploit payload.",
+            },
+            "target_patched_or_endpoint_path_mismatch": {
+                "prior": 0.22,
+                "alpha_count": 5.5,
+                "description": "Target firmware/version is outside the vulnerable build window, the vulnerable endpoint URI is disabled, or ROP/heap offsets differ.",
+                "remediation": "Verify exact target firmware build timestamp/version via TLS cert + static asset `Last-Modified` headers and confirm endpoint reachability.",
+            },
+            "payload_syntax_or_framing_error": {
+                "prior": 0.16,
+                "alpha_count": 4.0,
+                "description": "Exploit script has a Python/shell syntax error, malformed HTTP chunked encoding, or premature socket close before payload delivery completes.",
+                "remediation": "Run `python3 -m py_compile` and inspect raw request framing, chunked headers, and TLS socket read/write timing in `$PROJECT_FILES_DIR`.",
+            },
+        },
+        "evidence_likelihoods": {
+            "lhost_mismatch_detected_in_script": {
+                "probe_cmd": "ip -4 -br addr show; ls -la $PROJECT_FILES_DIR",
+                "description": "Exploit script in `$PROJECT_FILES_DIR` contains a hardcoded callback IP that differs from the host's active interface IPv4 address",
+                "p_given_h": {
+                    "lhost_callback_ip_or_port_mismatch": 0.97,
+                    "reverse_shell_listener_not_bound_or_egress_filtered": 0.10,
+                    "target_patched_or_endpoint_path_mismatch": 0.05,
+                    "payload_syntax_or_framing_error": 0.10,
+                },
+            },
+            "listener_port_not_listening_locally": {
+                "probe_cmd": "ss -tulpn",
+                "description": "`ss -tulpn` shows no local listener bound to the exploit's callback port",
+                "p_given_h": {
+                    "lhost_callback_ip_or_port_mismatch": 0.20,
+                    "reverse_shell_listener_not_bound_or_egress_filtered": 0.94,
+                    "target_patched_or_endpoint_path_mismatch": 0.05,
+                    "payload_syntax_or_framing_error": 0.05,
+                },
+            },
+            "target_endpoint_returns_403_or_patched_build": {
+                "probe_cmd": "curl -sS -k -L -i --connect-timeout 5 https://<target_ip>/remote/login",
+                "description": "Target SSL-VPN / endpoint returns 403/404 or firmware compile date predates/postdates the CVE's vulnerable branch",
+                "p_given_h": {
+                    "lhost_callback_ip_or_port_mismatch": 0.10,
+                    "reverse_shell_listener_not_bound_or_egress_filtered": 0.10,
+                    "target_patched_or_endpoint_path_mismatch": 0.95,
+                    "payload_syntax_or_framing_error": 0.15,
+                },
+            },
+            "script_syntax_or_exception_on_dry_run": {
+                "probe_cmd": "ls -la $PROJECT_FILES_DIR",
+                "description": "Static inspection or syntax check of the exploit script reveals malformed framing or runtime exception",
+                "p_given_h": {
+                    "lhost_callback_ip_or_port_mismatch": 0.10,
+                    "reverse_shell_listener_not_bound_or_egress_filtered": 0.05,
+                    "target_patched_or_endpoint_path_mismatch": 0.10,
+                    "payload_syntax_or_framing_error": 0.96,
+                },
+            },
+        },
+    },
 }
 
 
