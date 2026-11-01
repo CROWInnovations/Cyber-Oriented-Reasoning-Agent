@@ -15,6 +15,7 @@ core/Reasoning/wheelhouse/
 core/Reasoning/data/hardware_profile.json
 core/Reasoning/data/hardware_resource_profile.json
 Projects/*
+Projects/.*
 !Projects/README.md
 core/ObsidianVault/targets/*.md
 core/ObsidianVault/projects/*.md

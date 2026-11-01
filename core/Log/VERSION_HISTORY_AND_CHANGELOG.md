@@ -1,7 +1,7 @@
 # C.O.R.A. Master Version History & Architectural Changelog (`core/Log/VERSION_HISTORY_AND_CHANGELOG.md`)
 
 **Author:** CROW Innovations  
-**Current Semantic Version:** `5.22.19` ([`cora_version.json`](./cora_version.json))  
+**Current Semantic Version:** `5.22.20` ([`cora_version.json`](./cora_version.json))  
 
 ---
 
@@ -10,11 +10,21 @@
 `C.O.R.A.` tracks its version deterministically in [`core/Log/cora_version.json`](./cora_version.json):
 - **`major_cli` (`5`)**: Major CLI, Custom WebUI, and Two-Tier Project/Vault Architecture generation.
 - **`engine_rev` (`22`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
-- **`patch_rev` (`19`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
+- **`patch_rev` (`20`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
 
 ---
 
 ## 2. Release History & Root-Cause Fix Ledger
+
+### `v5.22.20` — Workspace Subdirectory Routing (`targets/`, `notes/`, `downloads/`, `artifacts/`, `assets/`, `Files/`), Equipment Inventory Tracking & Auto-Persist Script Guard
+- **Structured Project Workspace Routing (`core/webui/server.py`, `core/Reasoning/engines/web_intel.py`, `core/Reasoning/engines/vault_bridge.py`)**:
+  - **`targets/` (Equipment & Host Inventory Only)**: Added `_persist_target_and_telemetry_to_workspace()` and `_lookup_host_mac_and_neigh()` to automatically maintain per-host equipment profiles (`target_<host>.md`) and a master inventory table (`equipment_inventory.md`) tracking IP Address, L2 MAC Address & Interface, Open TCP/UDP Ports, System OS/Firmware, Hardware Model/Architecture/Serial, and Discovered URLs.
+  - **`notes/` (Web Search & Analytical Notes)**: Updated `execute_tier1_web_search()` to persist `search_*.md` OSINT reports into `Projects/<project>/notes/` (instead of `targets/`) and added `save_project_note` to `WEBUI_AGENT_TOOLS`.
+  - **`downloads/` (Fetched Webpages, JSON Feeds & Payloads)**: Updated `execute_tier1_fetch_webpage()` and `execute_safe_shell_command()` to save fetched pages (`page_*.md`), JSON feeds, `curl` HTML/JSON bodies, and redirected `/tmp/<file>` downloads into `Projects/<project>/downloads/`.
+  - **`artifacts/` & `assets/` (Raw Scan/Query Logs & Target Web/TLS Assets)**: Automatically records timestamped scan, `curl`, probe, and script execution transcripts into `Projects/<project>/artifacts/` and saves extracted static web asset paths, `Last-Modified`/`ETag` build headers, and TLS certificate metadata into `Projects/<project>/assets/assets_<host>.md`.
+- **Reliable `Files/` Script Creation & Editing (`core/webui/server.py`)**:
+  - Fixed `_recover_tool_args()` and `_resolve_default_project_script_filename()` to resolve target script filenames even when `llama-server` emits empty `{}` arguments, increased `read_project_file` retention to `16,000` chars, and added an Automatic Code-Block-to-`Files/` Persistence Guard when the operator requests creating or fixing a script.
+- **Repository Sanitization**: Hardened `.gitignore` and sanitized all remaining legacy `172.24.X.XXX` templates in `mdp_transitions.json` and `trained_rules.json` to `{target_ip}`.
 
 ### `v5.22.19` — `AUTO-RUN` & `CONFIRM` Permission Enforcement, Short-Reply Resolution, Local Exploit Callback Abduction & Tool-Call Recovery
 - **WebUI `AUTO-RUN` & `CONFIRM` Enforcement (`core/webui/server.py`)**:

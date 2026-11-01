@@ -2617,7 +2617,7 @@ WEBUI_AGENT_TOOLS: List[Dict[str, Any]] = [
                 "properties": {
                     "title": {
                         "type": "string",
-                        "description": "Short title or filename slug for the note (e.g. 'fortios_6_2_1_vuln_analysis').",
+                        "description": "Short title or filename slug for the note (e.g. 'target_service_vuln_analysis').",
                     },
                     "summary": {
                         "type": "string",
@@ -2785,7 +2785,7 @@ def _execute_webui_write_project_file(
                 "output": (
                     f"Error: Missing or invalid target filename (`{filename_arg}`). "
                     "When calling `write_project_file`, always place `\"filename\"` FIRST in the JSON arguments "
-                    "(e.g. `{\"filename\": \"Files/CVE-2024-21762_Exploit.py\", \"content\": \"...\"}`)."
+                    "(e.g. `{\"filename\": \"Files/custom_script.py\", \"content\": \"...\"}`)."
                 ),
             }
         if not (content_arg or "").strip():
