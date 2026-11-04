@@ -1383,6 +1383,10 @@ def get_project_files_context_block(
         for a in (attached_files or [])
         if str(a).strip()
     }
+    is_create_new_only = bool(
+        re.search(r"\b(?:create|write|make|generate|build)\b", q_low)
+        and not re.search(r"\b(?:fix|update|edit|modify|patch|debug|analyze|review|inspect|read|check|verify|why|run|execute)\b", q_low)
+    )
     mentions_files_dir = bool(
         re.search(
             r"\b(?:files?\s+dir(?:ectory)?|local\s+files?|uploaded\s+files?|custom\s+scripts?|in\s+files|from\s+files|project\s+files|python\s+script|exploit\s+script|call\s*back|\.py\b|\.sh\b|\.ps1\b)\b",
@@ -1406,8 +1410,28 @@ def get_project_files_context_block(
         if is_attached or is_named_in_query:
             preview_targets.append(f)
 
-    if not preview_targets and mentions_files_dir:
-        for f in all_files[:4]:
+    if not preview_targets and mentions_files_dir and not is_create_new_only:
+        wants_py = "python" in q_low or ".py" in q_low
+        wants_sh = "bash" in q_low or "shell" in q_low or ".sh" in q_low
+        code_exts = {".py", ".sh", ".ps1", ".rb", ".pl", ".js", ".ts", ".c", ".cpp", ".go", ".rs", ".lua"}
+
+        def _preview_priority(fp: Path) -> Tuple[int, int, float]:
+            ext = fp.suffix.lower()
+            is_doc = fp.name.lower().startswith("readme") or ext in {".md", ".txt", ".rst"}
+            matches_lang = (wants_py and ext == ".py") or (wants_sh and ext == ".sh")
+            is_code = ext in code_exts
+            try:
+                mtime_neg = -fp.stat().st_mtime
+            except OSError:
+                mtime_neg = 0.0
+            return (
+                0 if matches_lang else (1 if is_code else (3 if is_doc else 2)),
+                0 if not is_doc else 1,
+                mtime_neg,
+            )
+
+        ranked_files = sorted(all_files, key=_preview_priority)
+        for f in ranked_files[:4]:
             if _is_likely_text_file(f) and f.stat().st_size <= 120000:
                 preview_targets.append(f)
 
@@ -1419,9 +1443,9 @@ def get_project_files_context_block(
         if _is_likely_text_file(f):
             try:
                 raw_txt = f.read_text(encoding="utf-8", errors="replace")
-                snippet = raw_txt[:6500]
+                snippet = raw_txt[:8500]
                 total_preview_chars += len(snippet)
-                trunc_note = f" (truncated from {len(raw_txt)} chars)" if len(raw_txt) > 6500 else ""
+                trunc_note = f" (truncated from {len(raw_txt)} chars)" if len(raw_txt) > 8500 else ""
                 lines.append(
                     f"\n#### File Preview: `Projects/{slug}/Files/{rel_in_files}`{trunc_note}\n"
                     f"```text\n{snippet}\n```"
@@ -2777,6 +2801,8 @@ def _execute_webui_write_project_file(
             clean_name = clean_name[len(f"projects/{proj_dir.name.lower()}/files/"):]
         elif clean_name.lower().startswith("files/"):
             clean_name = clean_name[6:]
+        if not clean_name and (content_arg or "").strip():
+            clean_name = _resolve_default_project_script_filename(project_slug, content_arg[:600]) or "cora_script.py"
         if not clean_name or ".." in clean_name.split("/"):
             return {
                 "executed": False,
@@ -2875,35 +2901,48 @@ def _resolve_default_project_script_filename(active_proj: str, query_text: str, 
     m_qfile = re.search(r"\b([A-Za-z0-9_.\-]+\.(?:py|sh|ps1|txt|json|yaml|yml|md|c|cpp|rs|js|html))\b", q_str)
     if m_qfile:
         return m_qfile.group(1)
-    if last_read_file:
+    is_fix_request = bool(re.search(r"\b(?:fix|update|edit|modify|patch|debug|call\s*back)\b", q_str, flags=re.I))
+    is_create_request = bool(re.search(r"\b(?:create|write|make|generate|build|save)\b", q_str, flags=re.I))
+    if last_read_file and (is_fix_request or not is_create_request):
         lr = last_read_file.replace("\\", "/").split("/")[-1].strip()
         if lr and lr.lower() not in ("readme.md", "memory.md", "goals.md") and "." in lr:
             return lr
-    if active_proj:
+    if active_proj and is_fix_request and not is_create_request:
         try:
             files_dir = ensure_project_structure(active_proj) / "Files"
             all_f = [f for f in files_dir.iterdir() if f.is_file() and not f.name.startswith(".")]
             if re.search(r"\b(?:python|\.py\b)", q_str, flags=re.I):
                 py_only = [f.name for f in all_f if f.suffix.lower() == ".py"]
-                if len(py_only) == 1 and re.search(r"\b(?:fix|update|edit|modify|patch|debug|call\s*back|exploit)\b", q_str, flags=re.I):
+                if len(py_only) == 1:
                     return py_only[0]
-            if len(all_f) == 1 and re.search(r"\b(?:fix|update|edit|modify|patch|debug)\b", q_str, flags=re.I):
+            if len(all_f) == 1:
                 return all_f[0].name
         except Exception:
             pass
     # Derive a clean filename when the operator asks to create a new script
-    if re.search(r"\b(?:create|write|make|generate|build|save)\b", q_str, flags=re.I):
+    if is_create_request or re.search(r"\b(?:script|scanner|tool)\b", q_str, flags=re.I):
         ext = ".py"
         if re.search(r"\b(?:bash|shell|\.sh\b)\b", q_str, flags=re.I):
             ext = ".sh"
         elif re.search(r"\b(?:powershell|\.ps1\b)\b", q_str, flags=re.I):
             ext = ".ps1"
+        stopwords = {
+            "create", "write", "make", "generate", "build", "save", "put", "place",
+            "a", "an", "the", "simple", "basic", "quick", "new", "custom",
+            "python", "python3", "bash", "shell", "powershell", "script", "file", "code", "program",
+            "in", "into", "inside", "to", "for", "from", "on", "at", "with", "using", "by", "of",
+            "local", "files", "directory", "dir", "folder", "project", "workspace",
+            "that", "which", "please", "can", "could", "would", "you", "me", "my", "our", "it", "do", "so",
+        }
         words = [
             w.lower()
-            for w in re.findall(r"[A-Za-z0-9]+", q_str)
-            if w.lower() not in ("create", "write", "make", "generate", "build", "save", "a", "an", "the", "simple", "python", "script", "file", "in", "files", "to", "for", "that", "please", "can", "you")
+            for w in re.findall(r"[A-Za-z][A-Za-z0-9]*", q_str)
+            if w.lower() not in stopwords and len(w) >= 2
         ]
-        stem = "_".join(words[:4]) if words else "cora_script"
+        if "nmap" in words and ("scanning" in words or "scan" in words or "scanner" in words):
+            stem = "nmap_scanner"
+        else:
+            stem = "_".join(words[:3]) if words else "cora_script"
         return f"{stem}{ext}"
     return ""
 
@@ -2933,28 +2972,28 @@ def _recover_tool_args(
 
         if not recovered:
             for key in ("filename", "path", "file", "file_path", "target", "command", "query", "keyword", "url", "subdir", "note", "site", "query_filter", "title", "summary"):
-                m = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
+                m = re.search(rf'"{key}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw_str, flags=re.S)
                 if m:
                     try:
                         recovered[key] = json.loads(f'"{m.group(1)}"')
                     except Exception:
                         recovered[key] = m.group(1)
 
-        if fn_name in ("write_project_file", "save_project_note") and not recovered.get("content"):
-            m_content = re.search(r'"content"\s*:\s*"((?:\\.|[^"\\])*)"', raw_str, flags=re.S)
+        if fn_name in ("write_project_file", "write_file", "save_project_note") and not recovered.get("content"):
+            m_content = re.search(r'"content"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw_str, flags=re.S)
             if m_content:
                 try:
                     recovered["content"] = json.loads(f'"{m_content.group(1)}"')
                 except Exception:
-                    recovered["content"] = m_content.group(1).replace("\\n", "\n").replace('\\"', '"')
+                    recovered["content"] = m_content.group(1).replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
             else:
-                # Handle truncated content string at the end of raw_str
+                # Handle truncated or raw unescaped content string at the end of raw_str
                 m_trunc = re.search(r'"content"\s*:\s*"(.*)$', raw_str, flags=re.S)
                 if m_trunc:
-                    tail = re.sub(r'"\s*\}\s*$', "", m_trunc.group(1))
+                    tail = re.sub(r'"\s*\}\s*(?:\}\s*)?$', "", m_trunc.group(1))
                     recovered["content"] = tail.replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
 
-    if fn_name == "write_project_file":
+    if fn_name in ("write_project_file", "write_file"):
         if not (recovered.get("filename") or recovered.get("path") or recovered.get("file")):
             default_fn = _resolve_default_project_script_filename(active_proj, query_text, last_read_file)
             if default_fn:
@@ -2968,20 +3007,28 @@ def _recover_tool_args(
 
 
 def _extract_xml_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """Parse `<tool_call>...</tool_call>` blocks (both JSON and Qwen3.5 `<function=...><parameter=...>` XML formats)."""
+    """Parse `<tool_call>...</tool_call>` blocks (including unclosed token-truncated blocks, JSON, and Qwen XML formats)."""
     calls: List[Dict[str, Any]] = []
-    for idx, m in enumerate(re.finditer(r"(?is)<tool_call>\s*(.*?)\s*</tool_call>", text or "")):
-        inner = m.group(1).strip()
+    raw_text = text or ""
+    blocks = [m.group(1).strip() for m in re.finditer(r"(?is)<tool_call>\s*(.*?)\s*</tool_call>", raw_text)]
+    if not blocks and "<tool_call>" in raw_text.lower():
+        m_unclosed = re.search(r"(?is)<tool_call>\s*(.+)$", raw_text)
+        if m_unclosed:
+            blocks.append(m_unclosed.group(1).strip())
+
+    for idx, inner in enumerate(blocks):
         if not inner:
             continue
         # Format A: Qwen3.5 XML `<function=name><parameter=k>v</parameter></function>`
-        fn_xml = re.search(r"(?is)<function=([a-zA-Z0-9_.\-]+)>\s*(.*?)\s*</function>", inner)
+        fn_xml = re.search(r"(?is)<function=([a-zA-Z0-9_.\-]+)>\s*(.*?)(?:</function>|$)", inner)
         if fn_xml:
             fn_name = fn_xml.group(1).strip()
             fn_body = fn_xml.group(2)
             fn_args: Dict[str, Any] = {}
-            for pm in re.finditer(r"(?is)<parameter=([a-zA-Z0-9_.\-]+)>\s*(.*?)\s*</parameter>", fn_body):
+            for pm in re.finditer(r"(?is)<parameter=([a-zA-Z0-9_.\-]+)>\s*(.*?)(?:</parameter>|$)", fn_body):
                 fn_args[pm.group(1).strip()] = pm.group(2)
+            if fn_name == "write_file":
+                fn_name = "write_project_file"
             if fn_name:
                 calls.append(
                     {
@@ -2994,10 +3041,12 @@ def _extract_xml_tool_calls(text: str) -> List[Dict[str, Any]]:
                     }
                 )
             continue
-        # Format B: JSON `{"name": ..., "arguments": ...}`
+        # Format B: JSON `{"name": ..., "arguments": ...}` (including fallback regex recovery if truncated/unescaped)
         try:
             obj = json.loads(inner)
             fn_name = str(obj.get("name") or "")
+            if fn_name == "write_file":
+                fn_name = "write_project_file"
             fn_args_raw = obj.get("arguments") or {}
             if isinstance(fn_args_raw, str):
                 fn_args_dict = _recover_tool_args(fn_name, fn_args_raw)
@@ -3017,6 +3066,23 @@ def _extract_xml_tool_calls(text: str) -> List[Dict[str, Any]]:
                     }
                 )
         except Exception:
+            m_name = re.search(r'"name"\s*:\s*"([a-zA-Z0-9_.\-]+)"', inner)
+            if m_name:
+                fn_name = m_name.group(1).strip()
+                if fn_name == "write_file":
+                    fn_name = "write_project_file"
+                fn_args_dict = _recover_tool_args(fn_name, inner)
+                if fn_args_dict:
+                    calls.append(
+                        {
+                            "id": f"call_xml_{idx}",
+                            "type": "function",
+                            "function": {
+                                "name": fn_name,
+                                "arguments": json.dumps(fn_args_dict),
+                            },
+                        }
+                    )
             continue
     return calls
 
@@ -3246,9 +3312,37 @@ def _lookup_host_mac_and_neigh(host_ip: str) -> Tuple[str, str, str]:
     return "", "", ""
 
 
+_NON_TARGET_BANNER_DOMAINS = (
+    "nmap.org",
+    "github.com",
+    "githubusercontent.com",
+    "gnu.org",
+    "openssl.org",
+    "python.org",
+    "pypi.org",
+    "curl.se",
+    "haxx.se",
+    "ubuntu.com",
+    "debian.org",
+    "kali.org",
+    "mitre.org",
+    "nist.gov",
+    "cve.org",
+    "exploit-db.com",
+    "w3.org",
+    "iana.org",
+    "mozilla.org",
+    "apache.org",
+    "nginx.org",
+    "fortinet.com",
+)
+
+
 def _is_trackable_target_host(host_str: str) -> bool:
-    h = (host_str or "").strip().lower()
+    h = (host_str or "").strip().lower().rstrip(".")
     if not h or h in ("localhost", "0.0.0.0", "255.255.255.255"):
+        return False
+    if any(h == dom or h.endswith(f".{dom}") for dom in _NON_TARGET_BANNER_DOMAINS):
         return False
     if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", h):
         octets = [int(x) for x in h.split(".") if x.isdigit()]
@@ -3409,11 +3503,12 @@ def _persist_target_and_telemetry_to_workspace(
                     if n_ip not in updated_hosts:
                         updated_hosts.append(n_ip)
 
-        # 3b. Determine candidate target hosts from primary_host, URLs, and command string
+        # 3b. Determine candidate target hosts from primary_host, URLs in command/overrides, and command string
         candidate_hosts: List[str] = []
         if primary_host and _is_trackable_target_host(primary_host):
             candidate_hosts.append(primary_host)
-        for u_match in re.findall(r"https?://([^\s/:,\"'`>]+)", f"{cmd_clean}\n{out_clean}", flags=re.I):
+        url_sources = "\n".join([cmd_clean, *(discovered_urls_override or [])])
+        for u_match in re.findall(r"https?://([^\s/:,\"'`>]+)", url_sources, flags=re.I):
             if _is_trackable_target_host(u_match) and u_match not in candidate_hosts:
                 candidate_hosts.append(u_match)
         for ip_match in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cmd_clean):
@@ -3972,11 +4067,30 @@ def _compact_messages_for_llama_context(
         return cleaned
 
     sys_msg = cleaned[0] if (cleaned and cleaned[0].get("role") == "system") else None
+    user_indices = [i for i, m in enumerate(cleaned) if m.get("role") == "user"]
+    last_user_idx = user_indices[-1] if user_indices else (1 if sys_msg else 0)
+
+    # Phase 1: Drop older history turns BEFORE `last_user_idx` first so the active turn's `user` prompt
+    # and `tool` outputs (like `read_project_file`) are NEVER prematurely flattened or truncated to 1600 chars!
+    if not force_flatten and last_user_idx > (1 if sys_msg is not None else 0):
+        current_turn_tail = cleaned[last_user_idx:]
+        hist_slice = cleaned[(1 if sys_msg is not None else 0) : last_user_idx]
+        while hist_slice:
+            cand = ([sys_msg] if sys_msg is not None else []) + hist_slice + current_turn_tail
+            if len(json.dumps(cand)) <= max(max_chars, 16500):
+                return cand
+            hist_slice.pop(0)
+            while hist_slice and hist_slice[0].get("role") == "tool":
+                hist_slice.pop(0)
+        cand_no_hist = ([sys_msg] if sys_msg is not None else []) + current_turn_tail
+        if len(json.dumps(cand_no_hist)) <= max(max_chars, 16500):
+            return cand_no_hist
+        cleaned = cand_no_hist
+        last_user_idx = 1 if sys_msg is not None else 0
+
     if sys_msg is not None and len(str(sys_msg.get("content") or "")) > 4500:
         sys_msg = {"role": "system", "content": str(sys_msg.get("content") or "")[:4500]}
 
-    user_indices = [i for i, m in enumerate(cleaned) if m.get("role") == "user"]
-    last_user_idx = user_indices[-1] if user_indices else (1 if sys_msg else 0)
     base_user_content = str(cleaned[last_user_idx].get("content") or "Analyze active project telemetry.").strip()
 
     # Collect any tool outputs and assistant findings that occurred after `last_user_idx`
@@ -3987,7 +4101,8 @@ def _compact_messages_for_llama_context(
             t_name = str(m.get("name") or "tool")
             t_out = str(m.get("content") or "").strip()
             if t_out:
-                tool_summaries.append(f"[{t_name} output]:\n{t_out[:1600]}")
+                t_cap = 8000 if t_name in ("read_project_file", "read_file") else 2800
+                tool_summaries.append(f"[{t_name} output]:\n{t_out[:t_cap]}")
         elif r == "assistant":
             t_calls = m.get("tool_calls") or []
             c_txt = str(m.get("content") or "").strip()
@@ -3998,13 +4113,15 @@ def _compact_messages_for_llama_context(
                 if any(fn_names):
                     tool_summaries.append(f"[Assistant called tools]: {', '.join(f for f in fn_names if f)}")
 
-    budget_for_user = max(1800, max_chars - (len(str((sys_msg or {}).get("content") or "")) + 400))
+    budget_for_user = max(2400, max_chars - (len(str((sys_msg or {}).get("content") or "")) + 400))
     if tool_summaries:
         joined_tools = "\n\n".join(tool_summaries)
+        tools_budget = min(len(joined_tools), max(1600, int(budget_for_user * 0.55)))
+        user_budget = max(1600, budget_for_user - tools_budget)
         combined_user = (
-            f"{base_user_content[: max(1200, budget_for_user // 2)]}\n\n"
+            f"{base_user_content[:user_budget]}\n\n"
             f"### Live Tool Telemetry Collected So Far:\n"
-            f"```text\n{joined_tools[: max(1000, budget_for_user // 2)]}\n```\n\n"
+            f"```text\n{joined_tools[:tools_budget]}\n```\n\n"
             "Using the telemetry collected above, either call the next required tool or provide your complete final analysis."
         )
     else:
@@ -5146,6 +5263,11 @@ async def api_create_project(req: ProjectCreateRequest) -> Dict[str, Any]:
     if not slug or slug.lower() in _INVALID_PROJECT_NAMES:
         raise HTTPException(status_code=400, detail="Invalid project name. Please choose a specific project name.")
     proj_dir = ensure_project_structure(slug)
+    os.environ["CORA_ACTIVE_PROJECT"] = slug
+    # Ensure a newly created project starts with a completely clean Event-Calculus fluent store
+    proj_fluent_file = proj_dir / "reasoning" / "live_fluents.json"
+    if not proj_fluent_file.is_file():
+        _atomic_write_text(proj_fluent_file, json.dumps({"turn_counter": 0, "fluents": {}, "events_log": []}, indent=2) + "\n")
     if req.goal and req.goal.strip():
         append_project_goal(proj_dir, req.goal.strip())
     cfg = update_settings_dict({"active_project": slug, "active_goal": (req.goal or "").strip()})
@@ -6587,10 +6709,14 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         )
         if cmd_res.get("output"):
             problem_input += "\n" + str(cmd_res.get("output"))[:1500]
+        should_save_vault = bool(
+            (not mode_info["read_only"])
+            and (is_goal_pursuit or relentless_waves_requested or "/reason" in query_text.lower())
+        )
         reasoning_res = await asyncio.to_thread(
             run_neuro_symbolic_pipeline,
             problem=problem_input,
-            save_to_vault=(not mode_info["read_only"]),
+            save_to_vault=should_save_vault,
         )
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
@@ -6602,6 +6728,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         top_cause = str(reasoning_res.get("top_root_cause") or "General Assessment")
         mdp_tactic = str(reasoning_res.get("mdp_optimal_tactic") or "Reconnaissance")
         rl_state = str(reasoning_res.get("rl_state_key") or "S_0")
+        l5_digest = str(reasoning_res.get("streamlined_layer5_digest") or "").strip()
         assoc_details = reasoning_res.get("associative_activated_notes_details") or []
         vault_lines = []
         for an in assoc_details[:3]:
@@ -6629,13 +6756,36 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             f"- **Top Bayesian Hypothesis:** `{top_cause}` | **H-MDP Optimal Tactic:** `{mdp_tactic}` | **RL State:** `{rl_state}`\n"
             + team_line
             + (f"- **Recommended Consensus Probe:** `{cons_cmd}`\n" if cons_cmd else "")
+            + (f"```text\n{l5_digest}\n```\n" if l5_digest else "")
             + vault_guidance_str
         )
+
+    # Detect standalone script/file creation vs. modification requests
+    is_script_write_request = bool(
+        re.search(
+            r"\b(?:create|write|make|generate|build|save|fix|update|edit|modify|patch)\b.*\b(?:script|file|code|scanner|\.py\b|\.sh\b|\.ps1\b|python|bash|powershell)\b"
+            r"|\b(?:python|bash|shell|powershell|exploit|scanning|nmap)\s+script\b",
+            effective_query_text,
+            flags=re.I,
+        )
+    )
+    is_new_script_create_request = bool(
+        is_script_write_request
+        and re.search(r"\b(?:create|write|make|generate|build|save)\b", effective_query_text, flags=re.I)
+        and not re.search(r"\b(?:fix|update|edit|modify|patch|debug|analyze|review|why\s+did)\b", effective_query_text, flags=re.I)
+        and not is_goal_pursuit
+        and not relentless_waves_requested
+    )
+    suggested_script_fn = (
+        _resolve_default_project_script_filename(active_proj, effective_query_text) or "cora_script.py"
+        if is_script_write_request
+        else ""
+    )
 
     # Build KV-cache-friendly static system prompt + clean multi-turn history
     mem_excerpt = ""
     mem_file = proj_dir / "memory.md"
-    if mem_file.is_file():
+    if mem_file.is_file() and not is_new_script_create_request:
         mem_excerpt = mem_file.read_text(encoding="utf-8", errors="replace")[:900]
     host_os_label = "Windows (PowerShell / CMD / Sysinternals)" if os.name == "nt" else "Linux (Bash / iproute2)"
     project_files_block = get_project_files_context_block(
@@ -6658,28 +6808,40 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             "(`run_shell_command`, `write_project_file`, `scan_target`, `web_search`, `fetch_webpage`) is needed, emit the tool call so the server can queue it for operator confirmation.\n\n"
         )
 
+    effective_sys_goal = (
+        f"Create `{suggested_script_fn}` in `Projects/{active_proj}/Files/`"
+        if is_new_script_create_request
+        else (active_goal or "General interactive session")
+    )
     sys_prompt = (
         f"You are C.O.R.A. (Cyber Oriented Reasoning Agent) v{get_cora_version().get('version', '5.15.12')}, "
         f"an elite cybersecurity, network reconnaissance, and incident response agent running on {host_os_label}.\n"
         f"- Active Project Workspace: `Projects/{active_proj}/`\n"
         f"- Local Project `Files` Directory (`$PROJECT_FILES_DIR`): `Projects/{active_proj}/Files/` (full path: `{proj_dir / 'Files'}`)\n"
-        f"- Active Goal: `{active_goal or 'General interactive session'}`\n"
+        f"- Active Goal: `{effective_sys_goal}`\n"
         f"- Session Personality Mode: `[{mode_info['number']}] {mode_info['label']}` — {mode_info['system_directive']}\n"
         f"- Network Isolation Posture: `{posture.get('hud_badge')}` ({posture.get('description')})\n"
         + perm_directive_line
         + "### Operational Directives:\n"
         "1. Directly address the operator's specific request, target IP/hostname, and Active Goal in clear, comprehensive detail.\n"
-        "2. When the operator asks to probe, scan, ping, verify, or execute a script/service/appliance and live command output is not yet attached, call `scan_target`, `read_project_file`, `write_project_file`, or `run_shell_command` to execute and gather real telemetry first. "
+        "2. When the operator asks to create, write, or save a script/file in the local `Files` directory, call `write_project_file(filename=\"<name>\", content=\"...\")` IMMEDIATELY in your first turn (placing `\"filename\"` FIRST in JSON arguments) without running pre-check shell commands first. "
+        "When the operator asks to probe, scan, ping, verify, or execute a script/service/appliance and live command output is not yet attached, call `scan_target`, `read_project_file`, `write_project_file`, or `run_shell_command` to execute and gather real telemetry first. "
         "When the operator asks to search the internet, query a specific website (`site:example.com`), or read a specific webpage/URL/API, call `web_search` or `fetch_webpage`.\n"
         "3. When live command/probe output IS provided, analyze the exact findings (open/closed ports, TLS certificate serial/model strings, "
         "HTTP headers, `Last-Modified` firmware build dates, static asset hashes, script bugs/callback mismatches, relevant CVEs, and concrete "
         "remediation procedures) and provide copy-pasteable commands.\n"
-        f"4. **Local Project `Files` Directory (`Projects/{active_proj}/Files/`)**: Every project has a dedicated `Files` directory at `Projects/{active_proj}/Files/`. Anything placed or uploaded into `Projects/{active_proj}/Files/` is directly visible and usable by you. When the operator tells you to go to the local `Files` or `File` directory to look at, analyze, fix, or run a custom script or file, inspect `Projects/{active_proj}/Files/` using `read_project_file`, `list_project_files_tool`, `write_project_file` (always placing `\"filename\"` FIRST in JSON arguments), or execute scripts there via `run_shell_command`.\n"
+        f"4. **Local Project `Files` Directory (`Projects/{active_proj}/Files/`)**: Every project has a dedicated `Files` directory at `Projects/{active_proj}/Files/`. Anything placed or uploaded into `Projects/{active_proj}/Files/` is directly visible and usable by you. When the operator tells you to go to the local `Files` or `File` directory to create, look at, analyze, fix, or run a custom script or file, use `write_project_file` (always placing `\"filename\"` FIRST in JSON arguments), `read_project_file`, `list_project_files_tool`, or execute scripts there via `run_shell_command`.\n"
         "5. Keep your output clean, structured, and easy to read. Do NOT dump internal reasoning engine numbers or raw thought processes into your main response unless the operator explicitly runs `/reason`.\n"
     )
 
     user_prompt = effective_query_text
-    if mem_excerpt.strip() and not is_short_followup:
+    if is_new_script_create_request and suggested_script_fn:
+        user_prompt += (
+            f"\n\n### Direct File Creation Instruction (`Projects/{active_proj}/Files/{suggested_script_fn}`):\n"
+            f"- Call `write_project_file` IMMEDIATELY in this turn with `\"filename\": \"{suggested_script_fn}\"` placed FIRST in the JSON arguments and `\"content\"` containing the complete, runnable script.\n"
+            "- Do NOT call `run_shell_command` to check `which nmap` or `python3 --version` before writing the file—write the file to `Files/` FIRST!"
+        )
+    if mem_excerpt.strip() and not is_short_followup and not is_new_script_create_request:
         user_prompt += f"\n\n### Active Project Memory (`Projects/{active_proj}/memory.md`)\n{mem_excerpt}"
     if req.attached_files:
         clean_attached = [str(a).strip() for a in req.attached_files if str(a).strip()]
@@ -6692,10 +6854,16 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     elif project_files_block:
         user_prompt += f"\n\n{project_files_block}"
 
-    if reasoning_guidance_block and not is_short_followup:
+    if reasoning_guidance_block and not is_short_followup and not is_new_script_create_request:
         user_prompt += f"\n{reasoning_guidance_block}"
 
-    if active_goal and not is_goal_pursuit and not is_short_followup and active_goal.lower() not in effective_query_text.lower():
+    if (
+        active_goal
+        and not is_goal_pursuit
+        and not is_short_followup
+        and not is_new_script_create_request
+        and active_goal.lower() not in effective_query_text.lower()
+    ):
         user_prompt += f"\n\n[Active Project Goal Context]: {active_goal}"
     if cmd_res.get("command"):
         if cmd_res.get("blocked"):
@@ -6710,7 +6878,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             )
 
     wire_messages: List[Dict[str, Any]] = [{"role": "system", "content": sys_prompt}]
-    wire_messages.extend(history_msgs)
+    if not is_new_script_create_request:
+        wire_messages.extend(history_msgs)
     wire_messages.append({"role": "user", "content": user_prompt})
 
     agent_tools = WEBUI_AGENT_TOOLS if not mode_info["read_only"] else WEBUI_READONLY_AGENT_TOOLS
@@ -6720,9 +6889,14 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
 
     llm_res: Dict[str, Any] = {}
     last_round_called_tools = False
-    relentless_active = bool(relentless_waves_requested or is_goal_pursuit or cfg.get("relentless_mode") == "true")
+    relentless_active = bool(
+        (relentless_waves_requested or is_goal_pursuit or cfg.get("relentless_mode") == "true")
+        and not is_new_script_create_request
+    )
     cur_rel_max_int = int(cfg.get("relentless_max_waves") if cfg.get("relentless_max_waves") is not None else 12)
-    if relentless_active:
+    if is_new_script_create_request:
+        max_tool_rounds = 2
+    elif relentless_active:
         max_tool_rounds = 64 if cur_rel_max_int == 0 else max(8, min(64, cur_rel_max_int * 4))
     else:
         max_tool_rounds = 6
@@ -6732,6 +6906,9 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     target_scan_executed = False
     last_read_file = ""
     file_written_in_turn = False
+    last_written_file_name = ""
+    last_written_file_content = ""
+    last_written_file_summary = ""
     relentless_continuations = 0
     auto_run_nudges = 0
     max_relentless_continuations = 8 if (relentless_active and cur_rel_max_int == 0) else (max(1, cur_rel_max_int // 2) if relentless_active else 0)
@@ -6740,6 +6917,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
 
     async def _dispatch_single_tool(fn_name: str, parsed_args: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
         nonlocal target_scan_executed, web_intel_executed, last_read_file, file_written_in_turn
+        nonlocal last_written_file_name, last_written_file_content, last_written_file_summary
         if fn_name == "read_project_file":
             p_val = str(parsed_args.get("path") or parsed_args.get("filename") or parsed_args.get("file") or "Files").strip()
             t_r = await asyncio.to_thread(_execute_webui_read_project_file, p_val, active_proj)
@@ -6758,19 +6936,23 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             n_val = str(parsed_args.get("note") or parsed_args.get("path") or "").strip()
             t_r = await asyncio.to_thread(_execute_webui_vault_read_note, n_val, active_proj)
             return t_r, f"vault_read_note({n_val})"
-        if fn_name == "write_project_file":
+        if fn_name in ("write_project_file", "write_file"):
             f_val = str(
                 parsed_args.get("filename")
                 or parsed_args.get("path")
                 or parsed_args.get("file")
                 or parsed_args.get("file_path")
                 or parsed_args.get("target")
+                or suggested_script_fn
                 or ""
             ).strip()
             c_txt = str(parsed_args.get("content") or "")
             t_r = await asyncio.to_thread(_execute_webui_write_project_file, f_val, c_txt, mode_info, active_proj)
             if t_r.get("executed") and t_r.get("exit_code") == 0:
                 file_written_in_turn = True
+                last_written_file_name = f_val.replace("\\", "/").split("/")[-1] or f_val
+                last_written_file_content = c_txt
+                last_written_file_summary = str(t_r.get("output") or "")
             return t_r, f"write_project_file({f_val})"
         if fn_name == "save_project_note":
             t_val = str(parsed_args.get("title") or parsed_args.get("filename") or "project_note").strip()
@@ -6861,12 +7043,15 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     for tool_round in range(max_tool_rounds):
         if _is_execution_cancelled(exec_gen):
             return _build_cancelled_response()
+        # Disable `<think>` overhead on script creation/editing requests and on follow-up tool rounds (`tool_round >= 1`)
+        # so multi-line `write_project_file` JSON payloads never get truncated or stall at ~2.7 tokens/sec.
+        round_thinking_on = bool(thinking_on and tool_round == 0 and not is_script_write_request)
         llm_res = await asyncio.to_thread(
             _call_llm_backend,
             messages=wire_messages,
             model_id=model_id,
             cfg=cfg,
-            thinking_enabled=thinking_on,
+            thinking_enabled=round_thinking_on,
             tools=agent_tools,
             exec_gen=exec_gen,
         )
@@ -6919,6 +7104,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             if (
                 relentless_active
                 and effective_auto_run
+                and not (file_written_in_turn and is_script_write_request)
                 and relentless_continuations < max_relentless_continuations
                 and tool_round < (max_tool_rounds - 1)
                 and (len(cur_text) < 450 or not executed_outs_list)
@@ -6958,6 +7144,8 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             tc_id = str(tc.get("id") or f"call_{tool_round}")
             fn_obj = tc.get("function") or {}
             fn_name = str(fn_obj.get("name") or "")
+            if fn_name == "write_file":
+                fn_name = "write_project_file"
             raw_args = fn_obj.get("arguments") or "{}"
             parsed_args = _recover_tool_args(
                 fn_name,
@@ -7026,6 +7214,19 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 executed_cmds_list.append(label_cmd)
             raw_out = str(t_res.get("output") or "(no output)")
             max_tool_chars = 16000 if fn_name == "read_project_file" else 4200
+            if not t_res.get("blocked") and fn_name in ("run_shell_command", "scan_target"):
+                try:
+                    from Reasoning.engines.context_vm import process_tool_output_zero_loss
+
+                    raw_out = await asyncio.to_thread(
+                        process_tool_output_zero_loss,
+                        fn_name,
+                        label_cmd or fn_name,
+                        raw_out,
+                        int(t_res.get("exit_code", 0)),
+                    )
+                except Exception:
+                    pass
             if len(raw_out) > max_tool_chars:
                 head_c = max_tool_chars - 1400
                 preserved_out = (
@@ -7036,14 +7237,16 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
             else:
                 preserved_out = raw_out
             extra_headers: List[str] = []
-            cbr_m = t_res.get("cbr_match")
-            if isinstance(cbr_m, dict) and cbr_m.get("verified_fix"):
-                extra_headers.append(
-                    f"[Engine 11 CBR Match: {cbr_m.get('case_id', 'CBR')} -> Fix: `{cbr_m.get('verified_fix')}`]"
-                )
-            sygus_m = t_res.get("sygus_facts")
-            if isinstance(sygus_m, dict) and sygus_m.get("summary_header"):
-                extra_headers.append(f"[Engine 13 SyGuS Facts: {sygus_m.get('summary_header')}]")
+            if "[CBR Failure Match" not in preserved_out:
+                cbr_m = t_res.get("cbr_match")
+                if isinstance(cbr_m, dict) and cbr_m.get("verified_fix"):
+                    extra_headers.append(
+                        f"[Engine 11 CBR Match: {cbr_m.get('case_id', 'CBR')} -> Fix: `{cbr_m.get('verified_fix')}`]"
+                    )
+            if "[SyGuS Extracted Facts]" not in preserved_out:
+                sygus_m = t_res.get("sygus_facts")
+                if isinstance(sygus_m, dict) and sygus_m.get("summary_header"):
+                    extra_headers.append(f"[Engine 13 SyGuS Facts: {sygus_m.get('summary_header')}]")
             hdr_prefix = ("\n".join(extra_headers) + "\n") if extra_headers else ""
             out_txt = (
                 f"BLOCKED: {t_res.get('reason')}"
@@ -7085,6 +7288,10 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
                 "content": combined_confirm_reply,
             }
             last_round_called_tools = False
+            break
+
+        # Fast-finish when `write_project_file` has succeeded on a standalone script creation request
+        if file_written_in_turn and is_new_script_create_request:
             break
 
         if duplicate_count_this_round >= len(t_calls) and duplicate_count_this_round >= 2:
@@ -7181,7 +7388,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
 
     # Re-evaluate the 15-Engine Neuro-Symbolic Pipeline in-memory (`save_to_vault=False` to avoid duplicate Vault I/O)
     # with the live tool telemetry when tools were executed
-    if req.run_reasoning and executed_outs_list:
+    if req.run_reasoning and executed_outs_list and not is_new_script_create_request:
         t_pipe2 = time.perf_counter()
         base_prob = (active_goal if (is_goal_pursuit or relentless_waves_requested) and active_goal else effective_query_text) or active_goal
         enriched_problem = f"{base_prob}\n\n" + "\n\n".join(executed_outs_list)[:3500]
@@ -7199,6 +7406,38 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
         reasoning_res["cegar_verification"] = verify_command_cegar(
             str(reasoning_res.get("consensus_immediate_action") or "")
         )
+
+    # If `write_project_file` already succeeded on a standalone script creation request and the LLM ended on the
+    # tool call, build the verified confirmation + code display immediately without waiting on a second LLM call!
+    if (
+        file_written_in_turn
+        and is_new_script_create_request
+        and last_written_file_name
+        and len(str(llm_res.get("content") or "").strip()) < 180
+    ):
+        lang_fence = (
+            "bash"
+            if last_written_file_name.endswith(".sh")
+            else ("powershell" if last_written_file_name.endswith(".ps1") else "python")
+        )
+        run_hint = (
+            f"bash $PROJECT_FILES_DIR/{last_written_file_name}"
+            if lang_fence == "bash"
+            else (
+                f"pwsh $PROJECT_FILES_DIR/{last_written_file_name}"
+                if lang_fence == "powershell"
+                else f"python3 $PROJECT_FILES_DIR/{last_written_file_name}"
+            )
+        )
+        llm_res["online"] = True
+        llm_res["content"] = (
+            f"### Created `Projects/{active_proj}/Files/{last_written_file_name}`\n\n"
+            f"- **Saved File:** `Projects/{active_proj}/Files/{last_written_file_name}` ({last_written_file_summary})\n"
+            f"- **Host Path (`$PROJECT_FILES_DIR`):** `{proj_dir / 'Files' / last_written_file_name}`\n"
+            f"- **Run Command:** `{run_hint} <target>`\n\n"
+            f"```{lang_fence}\n{last_written_file_content.rstrip()}\n```"
+        )
+        last_round_called_tools = False
 
     # Perform the final synthesis call ONLY when the tool loop terminated on a tool call without a final response
     # (or when the response content is empty/short `< 180` chars) and not waiting on a `CONFIRM` prompt.
@@ -7305,14 +7544,7 @@ async def api_submit_query(req: QuerySubmitRequest) -> Dict[str, Any]:
     # When the operator asks CORA to create, write, save, or fix a script/file and the LLM outputs a fenced
     # code block in its response without completing `write_project_file`, automatically persist the script
     # into `Projects/<active_proj>/Files/`!
-    wants_script_or_file_write = bool(
-        re.search(
-            r"\b(?:create|write|make|generate|build|save|fix|update|edit|modify|patch)\b.*\b(?:script|file|code|\.py\b|\.sh\b|\.ps1\b|python|bash|powershell)\b"
-            r"|\b(?:python|bash|shell|powershell|exploit)\s+script\b",
-            effective_query_text,
-            flags=re.I,
-        )
-    )
+    wants_script_or_file_write = is_script_write_request
     if (
         wants_script_or_file_write
         and not file_written_in_turn

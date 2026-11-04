@@ -165,6 +165,18 @@ def process_tool_output_zero_loss(
     header_blocks: List[str] = []
 
     fluent_evt: Dict[str, Any] = {}
+    pre_rl_state_key: str = ""
+    # Snapshot pre-action RL state key BEFORE Engine 9 mutates live fluents so TD(lambda) updates s_t -> s_{t+1}
+    if tool_name in ("run_command", "run_shell_command", "scan_target"):
+        try:
+            from .rl_network_policy import encode_symbolic_rl_state
+
+            pre_rl_state_key = str(
+                encode_symbolic_rl_state(problem=f"{command_or_key} {text[:200]}").get("state_key", "")
+            )
+        except Exception:
+            pre_rl_state_key = ""
+
     # 1. Event Calculus & Temporal Fluent tracking
     if tool_name in ("run_command", "run_shell_command", "scan_target", "reasoning_engine"):
         fluent_evt = record_command_event(command_or_key, text, exit_code)
@@ -267,6 +279,7 @@ def process_tool_output_zero_loss(
                     command=command_or_key,
                     exit_code=eff_exit_code,
                     new_facts_count=facts_cnt,
+                    pre_state_key=pre_rl_state_key,
                     problem_context=text[:300],
                 )
                 if not rl_upd.get("skipped"):
@@ -292,6 +305,10 @@ def process_tool_output_zero_loss(
                     header_blocks.append(
                         f"[L1 World-Model State Register] RL_State=`{rl_upd.get('post_state', 'N/A')}` | {l1_line}"
                     )
+                    try:
+                        GLOBAL_SPECULATIVE_CACHE.invalidate()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -325,11 +342,12 @@ def process_tool_output_zero_loss(
     return prefix_str + body
 
 
-def build_dynamic_l1_state_block(user_query: str = "") -> str:
+def build_dynamic_l1_state_block(user_query: str = "", problem: str = "") -> str:
     """
     Builds a compact L1 Symbolic State Register + Bipartite Graph Page-In block
     (Guardrail 3: injected dynamically without mutating the static prefix of `messages[0]`).
     """
+    user_query = user_query or problem or ""
     fluent_summary = get_l1_state_summary_line()
     fluent_state = load_fluent_state()
     fluents = fluent_state.get("fluents", {})
@@ -364,26 +382,35 @@ def build_dynamic_l1_state_block(user_query: str = "") -> str:
         parts.append(fluent_summary)
     if holding:
         parts.append("[Active Fluents] " + " | ".join(holding[:5]))
-    try:
-        from .rl_network_policy import predict_rl_next_step_rollout
+    import re as _re_l1
 
-        rl_pred = predict_rl_next_step_rollout(problem=user_query or "live_l1_state", horizon=2)
-        imm = rl_pred.get("immediate_action", {})
-        st_info = rl_pred.get("state_info", {})
-        topo_s = st_info.get("topology_summary", {})
-        parts.append(
-            f"[Engine 19/20 Network World-Model & RL Policy] NIC={topo_s.get('primary_interface')} "
-            f"Subnets={topo_s.get('local_subnets')} ARP_Reachable={topo_s.get('reachable_neighbors_count')} | "
-            f"Cluster={st_info.get('cluster_id')} Stage={st_info.get('stage')} -> "
-            f"Next Cmd (Q_LCB={imm.get('q_lcb', imm.get('q_star', 0.0)):+.2f}): `{imm.get('command', '')}`"
-        )
-    except Exception:
-        pass
+    q_low_l1 = (user_query or "").lower()
+    is_local_script_op = bool(
+        _re_l1.search(r"\b(?:create|write|make|build|generate|save|fix|edit|update|patch|review|analyze)\b", q_low_l1)
+        and _re_l1.search(r"\b(?:script|file|files\s+directory|in\s+(?:the\s+)?files|\.py|\.sh|\.ps1)\b", q_low_l1)
+        and not _re_l1.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", q_low_l1)
+    )
+    if not is_local_script_op:
+        try:
+            from .rl_network_policy import predict_rl_next_step_rollout
+
+            rl_pred = predict_rl_next_step_rollout(problem=user_query or "live_l1_state", horizon=2)
+            imm = rl_pred.get("immediate_action", {})
+            st_info = rl_pred.get("state_info", {})
+            topo_s = st_info.get("topology_summary", {})
+            parts.append(
+                f"[Engine 19/20 Network World-Model & RL Policy] NIC={topo_s.get('primary_interface')} "
+                f"Subnets={topo_s.get('local_subnets')} ARP_Reachable={topo_s.get('reachable_neighbors_count')} | "
+                f"Cluster={st_info.get('cluster_id')} Stage={st_info.get('stage')} -> "
+                f"Next Cmd (Q_LCB={imm.get('q_lcb', imm.get('q_star', 0.0)):+.2f}): `{imm.get('command', '')}`"
+            )
+        except Exception:
+            pass
     try:
         from .meta_learner import get_meta_mind_channel_directive
 
         mm_dir = get_meta_mind_channel_directive(problem=user_query)
-        if mm_dir.get("meta_directive"):
+        if mm_dir.get("meta_directive") and not is_local_script_op:
             parts.append(str(mm_dir["meta_directive"]))
     except Exception:
         pass
@@ -410,10 +437,20 @@ class SpeculativeLookaheadCache:
         """Immediately signal any background speculative thread to yield (< 0.01 ms, zero blocking work)."""
         self._active_event.clear()
 
-    def prewarm_async(self, context_hint: str = "system_state") -> None:
+    def invalidate(self) -> None:
+        """Mark cached L1 state block stale in < 0.01 ms without spawning background threads during active execution."""
+        self._active_event.clear()
+        with self._lock:
+            self._cache["timestamp"] = 0.0
+
+    def trigger_speculative_lookahead(self, context_hint: str = "system_state") -> None:
+        """Alias for prewarm_async to satisfy CLI idle-time lookahead hooks."""
+        self.prewarm_async(context_hint=context_hint)
+
+    def prewarm_async(self, context_hint: str = "system_state", force: bool = False) -> None:
         """Schedules a non-blocking background pre-warm of the symbolic state & vault index if stale."""
         with self._lock:
-            if self._running or (time.time() - float(self._cache.get("timestamp", 0.0))) < 15.0:
+            if self._running or (not force and (time.time() - float(self._cache.get("timestamp", 0.0))) < 15.0):
                 return
             self._running = True
         self._active_event.set()
@@ -422,7 +459,7 @@ class SpeculativeLookaheadCache:
             try:
                 if not self._active_event.is_set():
                     return
-                l1_block = build_dynamic_l1_state_block(context_hint)
+                l1_block = build_dynamic_l1_state_block(user_query=context_hint)
                 if not self._active_event.is_set():
                     return
                 with self._lock:
@@ -439,8 +476,9 @@ class SpeculativeLookaheadCache:
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
 
-    def pause_and_get_cached_l1(self, user_query: str = "") -> str:
+    def pause_and_get_cached_l1(self, user_query: str = "", problem: str = "") -> str:
         """Immediately signals any speculative thread to yield and returns the cached L1 state block if fresh."""
+        user_query = user_query or problem or ""
         self._active_event.clear()
         with self._lock:
             cached = self._cache.get("last_l1_block")
@@ -455,9 +493,12 @@ class SpeculativeLookaheadCache:
             h_ips = set(_re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", cached_hint))
             if not (q_ips - h_ips) and len(user_query) < 24:
                 return str(cached)
-        fresh = build_dynamic_l1_state_block(user_query)
+        fresh = build_dynamic_l1_state_block(user_query=user_query)
         with self._lock:
             self._cache["last_l1_block"] = fresh
             self._cache["context_hint"] = user_query
             self._cache["timestamp"] = time.time()
         return fresh
+
+
+GLOBAL_SPECULATIVE_CACHE = SpeculativeLookaheadCache()

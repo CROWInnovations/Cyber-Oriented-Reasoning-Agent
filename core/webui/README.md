@@ -1,7 +1,7 @@
 # C.O.R.A. Custom Web Interface (`core/webui/`)
 
 **Author:** CROW Innovations  
-**Version:** `5.21.19`  
+**Version:** `5.23.21`  
 
 Replaces the third-party Docker `open-webui` container with a native, zero-Docker **Svelte + TypeScript + Tailwind CSS** dashboard backed by a local **Python + FastAPI + WebSockets + SQLite + psutil + NVIDIA NVML** service (`core/webui/server.py`).
 
@@ -12,7 +12,7 @@ Replaces the third-party Docker `open-webui` container with a native, zero-Docke
 | Component | Technology | Purpose |
 | :--- | :--- | :--- |
 | **Interface (`frontend/`)** | **Svelte 4 + TypeScript + Tailwind CSS + Vite** | Full-bleed edge-to-edge Enterprise Dashboard (`p-0 gap-0`), lighter high-contrast **`🤖 C.O.R.A. OUTPUT`** surface vs **`👤 OPERATOR QUERY`**, Antigravity-style **`Ctrl+O` Thought Process & Engine Trace toggle** (hidden by default with live `Thinking / Processing... Press Ctrl+O to expand` indicator), **`⚙️ Settings` customization modal** (Font Style, Font Color, Font Size, Line Spacing, Layout Density), **stacked/scrollable multi-NIC `NET` header display** (`Interface name \| IP/mask \| ↑upload ↓download`), **Console File Uploader & Project `Files/` Manager (`Projects/<project>/Files/`)**, and CLI-equivalent selectors (`Projects`, `Personality Mode`, `Network Isolation`, `Model`). |
-| **Local Backend (`server.py`)** | **Python + FastAPI + WebSockets** | Connects the interface to `CORA/Projects/` (including automatic creation & LLM indexing of `Projects/<project>/Files/`), `core/ObsidianVault/`, hardware telemetry, the 15-Engine Neuro-Symbolic Reasoning Pipeline (`core/Reasoning/`), Engine 9 CEGAR pre-verification, and local inference APIs. |
+| **Local Backend (`server.py`)** | **Python + FastAPI + WebSockets** | Connects the interface to `CORA/Projects/` (including priority `Projects/<project>/Files/` script creation, debugging, and structured `targets/`, `notes/`, `downloads/`, `artifacts/`, and `assets/` routing), `core/ObsidianVault/`, hardware telemetry, the 15-Engine Parallel 4-Wave DAG Reasoning Pipeline (`core/Reasoning/`), Engine 12 CEGAR pre-verification, and local inference APIs. |
 | **Hardware Monitoring** | **`psutil` + NVIDIA `pynvml` (`nvidia-smi` fallback)** | Streams real-time CPU %, per-core load, RAM GB/%, Disk GB & I/O MB/s, Network RX/TX KB/s & NICs, and NVIDIA GPU utilization %, VRAM used/total GB, temperature °C, and power draw over `/ws/metrics`. |
 | **Model Connections** | **Local Inference API (`llama-server`)** | Discovers installed GGUF models in `core/Models/` (`3.8`, `3.5`, `turbo`, `turbo-q6`, `turbo-q8`), probes `llama-server` (`127.0.0.1:8080/v1`), and routes conversations to the selected model. |
 | **Local Storage** | **SQLite (`core/Log/cora_webui.db`)** | Persists operator settings, project metadata, and per-project conversation & 15-Engine reasoning history while synchronizing `core/Log/active-project.txt` and `core/Log/active_session_mode.env` with the CLI. |

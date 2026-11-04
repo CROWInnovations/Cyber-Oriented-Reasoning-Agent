@@ -849,21 +849,26 @@ def execute_tier1_web_search(
     #    a) Collect any explicit CVE IDs from BOTH the query string AND the top web search results (titles/URLs/snippets).
     #    b) If the query is searching for CVEs/vulnerabilities/exploits of a product/version (e.g. "FortiOS 6.2", "FortiOS 6.2.1"),
     #       also run exact CPE 2.3 version-range matching against `~/Projects/CVEs/nvd_cves.sqlite`!
+    explicit_query_cves: List[str] = []
     ordered_cve_ids: List[str] = []
     for cid in re.findall(r"\bCVE-\d{4}-\d{4,7}\b", effective_query, flags=re.I):
         cu = cid.upper()
+        if cu not in explicit_query_cves:
+            explicit_query_cves.append(cu)
         if cu not in ordered_cve_ids:
             ordered_cve_ids.append(cu)
-    for r_item in results:
-        blob_r = f"{r_item.get('title', '')} {r_item.get('url', '')} {r_item.get('snippet', '')}"
-        for cid in re.findall(r"\bCVE-\d{4}-\d{4,7}\b", blob_r, flags=re.I):
-            cu = cid.upper()
-            if cu not in ordered_cve_ids:
-                ordered_cve_ids.append(cu)
+    if not explicit_query_cves:
+        for r_item in results:
+            blob_r = f"{r_item.get('title', '')} {r_item.get('url', '')} {r_item.get('snippet', '')}"
+            for cid in re.findall(r"\bCVE-\d{4}-\d{4,7}\b", blob_r, flags=re.I):
+                cu = cid.upper()
+                if cu not in ordered_cve_ids:
+                    ordered_cve_ids.append(cu)
 
     cve_details: List[str] = []
     enriched_ids: set = set()
-    for cve_upper in ordered_cve_ids[:4]:
+    max_cve_enrich = max(2, len(explicit_query_cves)) if explicit_query_cves else 3
+    for cve_upper in ordered_cve_ids[:max_cve_enrich]:
         if cancel_check_fn and cancel_check_fn():
             break
         cve_obj = _lookup_local_nvd_cve(cve_upper)
@@ -902,7 +907,7 @@ def execute_tier1_web_search(
             enriched_ids.add(cid)
             match_note = c_obj.get("_matched_version_range")
             src_lbl = f"Local NVD 2.0 CPE Range Match ({match_note})" if match_note else f"Local NVD 2.0 Feed ({_LOCAL_CVE_DIR})"
-            if len(cve_details) < 5:
+            if not explicit_query_cves and len(cve_details) < 3:
                 cve_details.append(_format_nvd_cve_20_record(c_obj, source_label=src_lbl))
             # If DuckDuckGo returned 0 web results (e.g., `site:nvd.nist.gov FortiOS 6.2.1`), populate `results` from local NVD 2.0!
             if len(results) < max_res:

@@ -106,6 +106,7 @@ def _propagate_scm_probabilities(
     base_probs: Dict[str, float],
     interventions: Dict[str, float],
     observations: Dict[str, float],
+    topo_nodes: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """
     Propagate structural causal probabilities in topological order.
@@ -115,7 +116,8 @@ def _propagate_scm_probabilities(
     import networkx as nx
 
     probs: Dict[str, float] = {}
-    for node in nx.topological_sort(G):
+    ordered = topo_nodes if topo_nodes is not None else list(nx.topological_sort(G))
+    for node in ordered:
         if node in interventions:
             probs[node] = min(1.0, max(0.0, float(interventions[node])))
             continue
@@ -245,7 +247,9 @@ def run_causal_reasoning(
         outcome_node = sinks[0] if sinks else topo_nodes[-1]
 
     # 1. Observational baseline probabilities P(Y | Observations)
-    baseline_probs = _propagate_scm_probabilities(G, base_probs, interventions={}, observations=observations)
+    baseline_probs = _propagate_scm_probabilities(
+        G, base_probs, interventions={}, observations=observations, topo_nodes=topo_nodes
+    )
 
     # 2. Interventional probabilities P(Y | do(X), Observations) via graph surgery (G_do)
     G_do = G.copy()
@@ -257,7 +261,7 @@ def run_causal_reasoning(
             G_do.remove_edges_from(in_edges)
 
     intervened_probs = _propagate_scm_probabilities(
-        G_do, base_probs, interventions=do_interventions, observations=observations
+        G_do, base_probs, interventions=do_interventions, observations=observations, topo_nodes=topo_nodes
     )
 
     # 3. Single-node Average Causal Effect (ACE) ranking: P(Outcome | do(Node=1)) - P(Outcome | do(Node=0))
@@ -266,10 +270,10 @@ def run_causal_reasoning(
         if candidate == outcome_node:
             continue
         p_do_1 = _propagate_scm_probabilities(
-            G, base_probs, interventions={candidate: 1.0}, observations=observations
+            G, base_probs, interventions={candidate: 1.0}, observations=observations, topo_nodes=topo_nodes
         )[outcome_node]
         p_do_0 = _propagate_scm_probabilities(
-            G, base_probs, interventions={candidate: 0.0}, observations=observations
+            G, base_probs, interventions={candidate: 0.0}, observations=observations, topo_nodes=topo_nodes
         )[outcome_node]
         ace = round(p_do_1 - p_do_0, 4)
         causal_leverage_ranking.append(

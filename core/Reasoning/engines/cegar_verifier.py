@@ -674,17 +674,22 @@ def verify_command_cegar(command: str) -> Dict[str, Any]:
 
     # --- HARD-BLOCK 1: Syntax Verification (`bash -n` for POSIX/Bash; Paren/Quote check for Windows CMD/PS) ---
     if is_win_ps:
-        if cmd.count("(") != cmd.count(")"):
+        unquoted_win = re.sub(r"'[^']*'|\"(?:\\.|[^\"])*\"", "", cmd)
+        if unquoted_win.count("(") != unquoted_win.count(")"):
             return {
                 "blocked": True,
                 "reason": "Unbalanced parentheses in Windows CMD / PowerShell command.",
-                "counterexample": f"`{cmd}` has {cmd.count('(')} '(' vs {cmd.count(')')} ')'.",
+                "counterexample": f"`{cmd}` has {unquoted_win.count('(')} '(' vs {unquoted_win.count(')')} ')'.",
                 "suggested_fix": "Ensure all ACL permission groups like `:(OI)(CI)(F)` and WMI/PowerShell expressions have matching parentheses.",
                 "advisories": advisories,
             }
     elif _is_bash_n_available():
-        # Fast-path syntax check for simple single-line commands with no quotes/parens/braces/subshells/redirections
-        if "\n" not in cmd and not any(ch in cmd for ch in "\"'`()[]{}$<>\\|&;"):
+        # Fast-path syntax check for simple single-line commands with no quotes/parens/braces/backticks
+        if (
+            "\n" not in cmd
+            and not any(ch in cmd for ch in "\"'`()[]{}")
+            and not cmd.endswith(("|", "&", "<", ">", "\\"))
+        ):
             pass
         else:
             try:

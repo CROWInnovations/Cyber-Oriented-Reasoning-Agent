@@ -16,6 +16,7 @@ Capabilities:
   associative synthesis notes to `ObsidianVault/reasoning/`.
 """
 import copy
+import os
 import re
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .vault_bridge import (
     DATA_DIR,
+    PROJECTS_DIR,
     VAULT_DIR,
     ensure_directories,
     get_hardware_reasoning_limits,
@@ -31,6 +33,7 @@ from .vault_bridge import (
     save_json_state,
     save_reasoning_to_vault,
     slugify,
+    slugify_project_name,
 )
 
 VAULT_ENTITIES_CACHE_FILE = str(DATA_DIR / "vault_entities_cache.json")
@@ -294,14 +297,16 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
         return nx.Graph(), {}
 
     now_mono = time.monotonic()
+    active_proj_slug = slugify_project_name(os.environ.get("CORA_ACTIVE_PROJECT", ""))
     if (
         _GRAPH_CACHE.get("graph") is not None
         and _GRAPH_CACHE.get("metadata") is not None
-        and (now_mono - float(_GRAPH_CACHE.get("last_check_ts", 0.0))) < 5.0
+        and _GRAPH_CACHE.get("active_proj_slug") == active_proj_slug
+        and (now_mono - float(_GRAPH_CACHE.get("last_check_ts", 0.0))) < 15.0
     ):
         return _GRAPH_CACHE["graph"], _GRAPH_CACHE["metadata"]
 
-    md_files: List[Tuple[Path, int, int]] = []
+    md_files: List[Tuple[Path, int, int, str]] = []
     sig_parts: List[Tuple[str, int, int]] = []
     for md_path in sorted(VAULT_DIR.rglob("*.md")):
         if ".obsidian" in md_path.parts or "archive" in md_path.parts or md_path.name.startswith("00_"):
@@ -310,14 +315,34 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
             st = md_path.stat()
             mtime_ns = int(st.st_mtime_ns)
             fsize = int(st.st_size)
+            rel_s = str(md_path.relative_to(VAULT_DIR).with_suffix("")).replace("\\", "/")
             sig_parts.append((str(md_path), mtime_ns, fsize))
-            md_files.append((md_path, mtime_ns, fsize))
+            md_files.append((md_path, mtime_ns, fsize, rel_s))
         except Exception:
             continue
+
+    if active_proj_slug and (PROJECTS_DIR / active_proj_slug).is_dir():
+        proj_root = PROJECTS_DIR / active_proj_slug
+        for sub_folder in ("notes", "targets"):
+            sub_p = proj_root / sub_folder
+            if sub_p.is_dir():
+                for md_path in sorted(sub_p.glob("*.md")):
+                    if md_path.name.startswith("."):
+                        continue
+                    try:
+                        st = md_path.stat()
+                        mtime_ns = int(st.st_mtime_ns)
+                        fsize = int(st.st_size)
+                        rel_s = f"Projects/{active_proj_slug}/{sub_folder}/{md_path.stem}"
+                        sig_parts.append((str(md_path), mtime_ns, fsize))
+                        md_files.append((md_path, mtime_ns, fsize, rel_s))
+                    except Exception:
+                        continue
 
     sig = tuple(sig_parts)
     if _GRAPH_CACHE.get("signature") == sig and _GRAPH_CACHE.get("graph") is not None:
         _GRAPH_CACHE["last_check_ts"] = now_mono
+        _GRAPH_CACHE["active_proj_slug"] = active_proj_slug
         return _GRAPH_CACHE["graph"], _GRAPH_CACHE["metadata"]
 
     disk_cache = load_json_state(VAULT_ENTITIES_CACHE_FILE, {"files": {}})
@@ -329,18 +354,16 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
     G = nx.Graph()
     note_metadata: Dict[str, Dict[str, Any]] = {}
     stem_to_rel_map: Dict[str, str] = {}
-    for md_path, _mtime_ns, _fsize in md_files:
-        rel_obj_tmp = md_path.relative_to(VAULT_DIR).with_suffix("")
-        rel_s_tmp = str(rel_obj_tmp).replace("\\", "/").lower()
+    for md_path, _mtime_ns, _fsize, rel_str in md_files:
+        rel_s_tmp = rel_str.lower()
         stem_low = md_path.stem.lower()
         if stem_low not in stem_to_rel_map or not rel_s_tmp.startswith("reasoning/"):
             stem_to_rel_map[stem_low] = rel_s_tmp
 
-    for md_path, mtime_ns, fsize in md_files:
-        rel_Obj = md_path.relative_to(VAULT_DIR).with_suffix("")
-        rel_str = str(rel_Obj).replace("\\", "/")
+    for md_path, mtime_ns, fsize, rel_str in md_files:
         if rel_str == "00_MEMORY_INDEX":
             continue
+        rel_parts = rel_str.split("/")
 
         cache_entry = cached_files_map.get(rel_str)
         if (
@@ -386,7 +409,7 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
             disk_cache_dirty = True
 
         note_id = f"note:{rel_str.lower()}"
-        category = rel_Obj.parts[0] if len(rel_Obj.parts) > 1 else "root"
+        category = rel_parts[0] if len(rel_parts) > 1 else "root"
         rel_low = rel_str.lower()
         is_team_playbook = (
             rel_low.endswith("_strategy_playbook")
@@ -473,17 +496,19 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
     n_nodes = len(node_list)
     node_to_idx = {n: i for i, n in enumerate(node_list)}
     search_index: List[Tuple[int, str, str, str, float, Set[str], Set[str]]] = []
+    inverted_token_index: Dict[str, List[Tuple[int, float]]] = {}
     note_connected_concepts: Dict[str, List[str]] = {}
     concept_connected_notes: Dict[str, List[str]] = {}
 
     for idx, node in enumerate(node_list):
         ndata = G.nodes[node]
         label_low = str(ndata.get("label", node)).lower()
+        label_clean = label_low.lstrip("#")
         summary_low = (
             f"{ndata.get('summary', '')} {ndata.get('when_to_apply', '')} {ndata.get('os_platform', '')}"
         ).lower()
-        label_tokens = set(re.findall(r"[a-z0-9]+", label_low))
-        summary_tokens = set(re.findall(r"[a-z0-9]+", summary_low))
+        label_tokens = set(re.findall(r"[a-z0-9]+", label_low)) | set(re.findall(r"[a-z0-9_.\-/]+", label_low))
+        summary_tokens = set(re.findall(r"[a-z0-9]+", summary_low)) | set(re.findall(r"[a-z0-9_.\-/]+", summary_low))
         cat_low = str(ndata.get("category", "")).lower()
         is_team_playbook = (
             label_low.endswith("_strategy_playbook")
@@ -498,6 +523,19 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
         )
         cat_boost = 2.05 if is_team_playbook else (0.65 if cat_low == "reasoning" else (1.85 if is_hub_or_master else 1.5))
         search_index.append((idx, node, label_low, summary_low, cat_boost, label_tokens, summary_tokens))
+        tok_weights: Dict[str, float] = {}
+        for st_tok in summary_tokens:
+            if len(st_tok) >= 2 and st_tok not in _STOPWORDS:
+                tok_weights[st_tok] = 1.1 * cat_boost
+        for lt_tok in label_tokens:
+            if len(lt_tok) >= 2 and lt_tok not in _STOPWORDS:
+                tok_weights[lt_tok] = 3.2 * cat_boost
+        if len(label_low) >= 2:
+            tok_weights[label_low] = 5.0 * cat_boost
+        if len(label_clean) >= 2:
+            tok_weights[label_clean] = 5.0 * cat_boost
+        for t_k, t_w in tok_weights.items():
+            inverted_token_index.setdefault(t_k, []).append((idx, t_w))
         if ndata.get("bipartite") == 0:
             note_connected_concepts[node] = [
                 G.nodes[nbr].get("label", nbr)
@@ -537,10 +575,13 @@ def build_vault_bipartite_graph() -> Tuple[Any, Dict[str, Dict[str, Any]]]:
         edge_norm_w = edge_w
 
     _GRAPH_CACHE["signature"] = sig
+    _GRAPH_CACHE["active_proj_slug"] = active_proj_slug
     _GRAPH_CACHE["graph"] = G
     _GRAPH_CACHE["metadata"] = note_metadata
     _GRAPH_CACHE["node_list"] = node_list
+    _GRAPH_CACHE["node_to_idx"] = node_to_idx
     _GRAPH_CACHE["search_index"] = search_index
+    _GRAPH_CACHE["inverted_token_index"] = inverted_token_index
     _GRAPH_CACHE["note_connected_concepts"] = note_connected_concepts
     _GRAPH_CACHE["concept_connected_notes"] = concept_connected_notes
     _GRAPH_CACHE["edge_src"] = edge_src
@@ -615,7 +656,9 @@ def run_associative_vault_reasoning(
 
         node_list: List[str] = _GRAPH_CACHE.get("node_list") or list(G.nodes())
         n_nodes = len(node_list)
+        node_to_idx: Dict[str, int] = _GRAPH_CACHE.get("node_to_idx") or {n: i for i, n in enumerate(node_list)}
         search_index = _GRAPH_CACHE.get("search_index") or []
+        inverted_token_index: Dict[str, List[Tuple[int, float]]] = _GRAPH_CACHE.get("inverted_token_index") or {}
         note_connected_concepts = _GRAPH_CACHE.get("note_connected_concepts") or {}
         concept_connected_notes = _GRAPH_CACHE.get("concept_connected_notes") or {}
         edge_src = _GRAPH_CACHE.get("edge_src")
@@ -623,25 +666,26 @@ def run_associative_vault_reasoning(
         edge_norm_w = _GRAPH_CACHE.get("edge_norm_w")
         dangling_mask = _GRAPH_CACHE.get("dangling_mask")
 
-        # Build IDF-weighted Personalized PageRank seed activation vector so specific command/tool
-        # tokens (e.g. `auditpol`, `wevtutil`, `bpf`, `tio`, `netsh`) strongly outweigh generic OS words (`windows`, `linux`).
+        # Build IDF-weighted Personalized PageRank seed activation vector via O(1) inverted token index
         import math
 
-        tok_df: Dict[str, int] = {tok: 0 for tok in raw_tokens}
-        for _idx, _node, label_low, summary_low, _cb, label_tokens, summary_tokens in search_index:
-            for tok in raw_tokens:
-                if len(tok) <= 3:
-                    if tok in label_tokens or tok in summary_tokens:
-                        tok_df[tok] += 1
-                elif tok in label_low or tok in summary_low:
-                    tok_df[tok] += 1
-        tok_idf: Dict[str, float] = {
-            tok: max(0.25, math.log(1.0 + float(max(1, n_nodes)) / float(1 + df)))
-            for tok, df in tok_df.items()
-        }
+        expanded_tokens: set[str] = set()
+        for tok in raw_tokens:
+            if tok in inverted_token_index:
+                expanded_tokens.add(tok)
+            else:
+                for sub_t in re.findall(r"[a-z0-9_]{2,}", tok):
+                    if sub_t not in _STOPWORDS and sub_t in inverted_token_index:
+                        expanded_tokens.add(sub_t)
 
         pers_vec = np.full(n_nodes, 0.002, dtype=np.float64)
-        matched_seed_nodes: List[str] = []
+        active_scores: Dict[int, float] = {}
+        for tok in expanded_tokens:
+            postings = inverted_token_index.get(tok)
+            if postings:
+                idf_w = max(0.25, math.log(1.0 + float(max(1, n_nodes)) / float(1 + len(postings))))
+                for n_idx, base_w in postings:
+                    active_scores[n_idx] = active_scores.get(n_idx, 0.0) + (base_w * idf_w)
 
         inferred_team_role = infer_team_role_from_query(query)
         role_to_playbook = {
@@ -653,6 +697,10 @@ def run_associative_vault_reasoning(
         }
         pb_slug = role_to_playbook.get(inferred_team_role, f"{inferred_team_role}_strategy_playbook")
         target_team_note = f"note:reasoning/{pb_slug}" if inferred_team_role else ""
+        if target_team_note and target_team_note in node_to_idx:
+            t_idx = node_to_idx[target_team_note]
+            t_cb = search_index[t_idx][4] if t_idx < len(search_index) else 2.05
+            active_scores[t_idx] = active_scores.get(t_idx, 0.0) + (18.0 * t_cb)
 
         q_low_os = query.lower()
         explicit_win = bool(
@@ -668,27 +716,12 @@ def run_associative_vault_reasoning(
             )
         )
 
-        for idx, node, label_low, summary_low, cat_boost, label_tokens, summary_tokens in search_index:
-            score = 0.0
-            label_clean = label_low.lstrip("#")
-            for tok in raw_tokens:
-                idf_w = tok_idf.get(tok, 1.0)
-                if tok == label_low or tok == label_clean:
-                    score += 5.0 * cat_boost * idf_w
-                elif len(tok) <= 3:
-                    if tok in label_tokens:
-                        score += 3.2 * cat_boost * idf_w
-                    elif tok in summary_tokens:
-                        score += 1.1 * cat_boost * idf_w
-                elif tok in label_low:
-                    score += 3.2 * cat_boost * idf_w
-                elif tok in summary_low:
-                    score += 1.1 * cat_boost * idf_w
-            if target_team_note:
-                if node == target_team_note:
-                    score += 18.0 * cat_boost
-                elif node.endswith("_strategy_playbook"):
-                    score *= 0.05
+        matched_seed_nodes: List[str] = []
+        for idx, score in active_scores.items():
+            node = node_list[idx]
+            label_low = search_index[idx][2] if idx < len(search_index) else node
+            if target_team_note and node != target_team_note and node.endswith("_strategy_playbook"):
+                score *= 0.05
             if score > 0.0 and node in note_metadata:
                 note_os = str(note_metadata[node].get("os_platform") or "cross-platform").lower()
                 is_win_only_note = (
@@ -721,17 +754,21 @@ def run_associative_vault_reasoning(
                 if float(np.sum(np.abs(p - p_prev))) < 1e-6:
                     break
             final_p = 0.55 * pers_vec + 0.45 * p
-            ppr_scores = {node_list[i]: float(final_p[i]) for i in range(n_nodes)}
         else:
             total_deg = sum(dict(G.degree()).values()) or 1
-            ppr_scores = {n: G.degree(n) / total_deg for n in G.nodes()}
+            final_p = np.array([G.degree(n) / total_deg for n in node_list], dtype=np.float64)
 
-        # Separate ranked notes (`bipartite=0`) and bridge concepts (`bipartite=1`)
+        # Separate top ranked notes (`bipartite=0`) and bridge concepts (`bipartite=1`) via sorted index scan
         activated_notes = []
         bridge_concepts = []
+        max_collect = max(10, int(top_k) + 4)
+        sorted_indices = np.argsort(-final_p)
 
-        for node, act_score in ppr_scores.items():
-            if node in note_metadata:
+        for idx_arr in sorted_indices:
+            i = int(idx_arr)
+            node = node_list[i]
+            act_score = float(final_p[i])
+            if len(activated_notes) < max_collect and node in note_metadata:
                 meta = note_metadata[node]
                 activated_notes.append(
                     {
@@ -743,24 +780,25 @@ def run_associative_vault_reasoning(
                         "os_platform": meta.get("os_platform", "cross-platform"),
                         "domain_hub": meta.get("domain_hub", ""),
                         "team_role": meta.get("team_role", ""),
-                        "activation_score": round(float(act_score), 5),
+                        "activation_score": round(act_score, 5),
                         "shared_concepts": note_connected_concepts.get(node, []),
                     }
                 )
-            elif node in concept_connected_notes:
+            elif len(bridge_concepts) < max_collect and node in concept_connected_notes:
                 ndata = G.nodes[node]
                 c_notes = concept_connected_notes[node]
                 bridge_concepts.append(
                     {
                         "concept": ndata.get("label", node),
                         "type": ndata.get("node_type", "concept"),
-                        "activation_score": round(float(act_score), 5),
+                        "activation_score": round(act_score, 5),
                         "bridged_notes_count": len(c_notes),
                         "bridged_notes": c_notes[:5],
                     }
                 )
+            if len(activated_notes) >= max_collect and len(bridge_concepts) >= max_collect:
+                break
 
-        activated_notes.sort(key=lambda x: -x["activation_score"])
         bridge_concepts.sort(key=lambda x: (-x["activation_score"], -x["bridged_notes_count"]))
 
         # Discover multi-hop Conceptual Leap Paths between top activated notes from different categories

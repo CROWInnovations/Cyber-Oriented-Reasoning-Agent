@@ -139,7 +139,8 @@ _PCA_MANIFOLD_CACHE: Dict[str, Any] = {
 def extract_feature_vector_from_context(
     problem: str = "",
     observed_evidence: Optional[Dict[str, Any]] = None,
-    live_net_bits: Optional[List[int]] = None,
+    live_net_bits: Optional[List[Any]] = None,
+    ctx: Optional[Dict[str, Any]] = None,
 ) -> List[float]:
     """
     Deterministically map a problem description, observed evidence dict, or 12-bit network state
@@ -150,7 +151,7 @@ def extract_feature_vector_from_context(
 
     p_low = (problem or "").lower()
     ev = observed_evidence or {}
-    ctx = resolve_problem_targets(problem=problem)
+    ctx = ctx or resolve_problem_targets(problem=problem)
 
     f0_iface = 1.0 if ctx.get("local_subnets") else 0.5
     f1_route = 1.0 if ("route" not in p_low or "via" in p_low or "replace" in p_low) and "network is unreachable" not in p_low else 0.4
@@ -497,9 +498,13 @@ def record_manifold_observation(feature_vec: List[float]) -> None:
 append_live_feature_observation = record_manifold_observation
 
 
-def analyze_topology_laplacian(ctx: Dict[str, Any]) -> Dict[str, Any]:
+def analyze_topology_laplacian(
+    ctx: Dict[str, Any],
+    live_topology: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Build the local-to-remote network graph `G = (V, E)` and compute:
+    Build the local-to-remote network graph `G = (V, E)` enriched with live discovered topology
+    (interfaces, subnets, gateways, reachable ARP neighbors) and compute:
       - Graph Laplacian `L = D - A` eigenvalues (`Algebraic Connectivity lambda_2`)
       - Fiedler Vector bi-partition
       - Exact Cut-Vertex Chokepoints (Articulation Points) via Tarjan's DFS
@@ -515,6 +520,19 @@ def analyze_topology_laplacian(ctx: Dict[str, Any]) -> Dict[str, Any]:
     G.add_edge("Operator_Host", f"NIC:{iface}", weight=1.0)
     G.add_edge(f"NIC:{iface}", f"Subnet:{local_sub}", weight=1.0)
     G.add_edge(f"Subnet:{local_sub}", f"Node:{prim_ip}", weight=1.0)
+
+    if isinstance(live_topology, dict) and live_topology:
+        for extra_sub in (live_topology.get("local_subnets") or [])[:4]:
+            if extra_sub and str(extra_sub) != local_sub:
+                G.add_edge(f"NIC:{iface}", f"Subnet:{extra_sub}", weight=0.95)
+        gw = str(live_topology.get("default_gateway") or "")
+        if gw and gw != prim_ip:
+            G.add_edge(f"Subnet:{local_sub}", f"Gateway:{gw}", weight=0.95)
+        for nb in (live_topology.get("arp_neighbors") or [])[:6]:
+            if isinstance(nb, dict) and nb.get("ip") and str(nb.get("state", "")).upper() in ("REACHABLE", "STALE", "PERMANENT", "DELAY"):
+                nb_ip = str(nb["ip"])
+                if nb_ip != prim_ip:
+                    G.add_edge(f"Subnet:{local_sub}", f"Neighbor:{nb_ip}", weight=0.85)
 
     if has_serial:
         ser_dev = str(ctx.get("serial_device") or "/dev/ttyUSB0")
@@ -574,7 +592,8 @@ def run_spectral_pca_reasoning(
     target_ip: str = "",
     secondary_target_ip: str = "",
     observed_evidence: Optional[Dict[str, Any]] = None,
-    live_net_bits: Optional[List[int]] = None,
+    live_net_bits: Optional[List[Any]] = None,
+    live_topology: Optional[Dict[str, Any]] = None,
     force_recompute: bool = False,
     export_to_vault: bool = True,
 ) -> Dict[str, Any]:
@@ -589,11 +608,11 @@ def run_spectral_pca_reasoning(
         explicit_target=target_ip,
         explicit_secondary=secondary_target_ip,
     )
-    f_vec = extract_feature_vector_from_context(problem, observed_evidence, live_net_bits)
+    f_vec = extract_feature_vector_from_context(problem, observed_evidence, live_net_bits, ctx=ctx)
     model = load_or_compute_pca_kmeans_model(force_recompute=force_recompute)
     q_cluster = quantize_state_to_cluster(f_vec)
     q_cluster["cluster_label"] = q_cluster["cluster_id"]
-    laplacian_info = analyze_topology_laplacian(ctx)
+    laplacian_info = analyze_topology_laplacian(ctx, live_topology=live_topology)
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
     pc1 = model["pc_loadings"][0] if model["pc_loadings"] else {"explained_variance_pct": 0.0, "top_drivers": []}

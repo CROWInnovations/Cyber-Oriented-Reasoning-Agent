@@ -777,12 +777,18 @@ def save_json_data(subdir: str, name: str, payload: Dict[str, Any]) -> Path:
         **payload,
     }
     _atomic_write_text(path, json.dumps(payload_with_meta, indent=2) + "\n")
+    try:
+        _JSON_STATE_RAM_CACHE[str(path)] = (path.stat().st_mtime, payload_with_meta)
+    except Exception:
+        _JSON_STATE_RAM_CACHE.pop(str(path), None)
     if subdir in EPHEMERAL_ROTATED_SUBDIRS:
         _rotate_subdir_files(out_dir, max(30, _cached_max_files))
     return path
 
 
 def load_json_data(subdir: str, name: str) -> Optional[Dict[str, Any]]:
+    import copy
+
     ensure_directories()
     slug = slugify(name)
     base = DATA_DIR / subdir if subdir else DATA_DIR
@@ -794,7 +800,14 @@ def load_json_data(subdir: str, name: str) -> Optional[Dict[str, Any]]:
     for cand in candidates:
         if cand.is_file():
             try:
-                return json.loads(cand.read_text(encoding="utf-8"))
+                key = str(cand)
+                mtime = cand.stat().st_mtime
+                cached = _JSON_STATE_RAM_CACHE.get(key)
+                if cached is not None and cached[0] == mtime:
+                    return copy.deepcopy(cached[1])
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                _JSON_STATE_RAM_CACHE[key] = (mtime, copy.deepcopy(data))
+                return data
             except Exception:
                 return None
     return None
@@ -968,7 +981,7 @@ def save_reasoning_to_vault(
 
 
 def load_json_state(filepath: str, default: Any = None) -> Any:
-    """Convenience loader for direct file path JSON state with mtime-checked RAM cache."""
+    """Convenience loader for direct file path JSON state with mtime-checked RAM cache for small state files."""
     import copy
 
     ensure_directories()
@@ -976,7 +989,10 @@ def load_json_state(filepath: str, default: Any = None) -> Any:
     p = Path(key)
     if p.is_file():
         try:
-            mtime = p.stat().st_mtime
+            st = p.stat()
+            mtime = st.st_mtime
+            if st.st_size > 65536:
+                return json.loads(p.read_text(encoding="utf-8"))
             cached = _JSON_STATE_RAM_CACHE.get(key)
             if cached is not None and cached[0] == mtime:
                 return copy.deepcopy(cached[1])
@@ -988,16 +1004,32 @@ def load_json_state(filepath: str, default: Any = None) -> Any:
     return default if default is not None else {}
 
 
+_RESOLVE_TARGETS_CACHE: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
+
+
+def invalidate_target_resolution_cache() -> None:
+    """Clear in-RAM target resolution cache whenever temporal fluents or project state mutate."""
+    _RESOLVE_TARGETS_CACHE.clear()
+
+
 def save_json_state(filepath: str, data: Any) -> None:
     """Convenience saver for direct file path JSON state."""
+    import copy
+
     ensure_directories()
     key = str(filepath)
     p = Path(key)
-    _atomic_write_text(p, json.dumps(data, indent=2) + "\n")
-    try:
-        _JSON_STATE_RAM_CACHE[key] = (p.stat().st_mtime, data)
-    except Exception:
+    raw_str = json.dumps(data, indent=2) + "\n"
+    _atomic_write_text(p, raw_str)
+    if len(raw_str) <= 65536:
+        try:
+            _JSON_STATE_RAM_CACHE[key] = (p.stat().st_mtime, copy.deepcopy(data))
+        except Exception:
+            _JSON_STATE_RAM_CACHE.pop(key, None)
+    else:
         _JSON_STATE_RAM_CACHE.pop(key, None)
+    if "live_fluents" in key or "relentless_ledger" in key:
+        _RESOLVE_TARGETS_CACHE.clear()
 
 
 def write_reasoning_note(
@@ -1017,16 +1049,25 @@ def write_reasoning_note(
 
 
 def scan_vault_notes() -> List[Dict[str, str]]:
-    """Returns a list of markdown notes in `ObsidianVault/` for Context VM Bipartite Page-In."""
+    """Returns a list of markdown notes in `ObsidianVault/` and active `Projects/<slug>/` for Context VM Bipartite Page-In."""
     ensure_directories()
     notes: List[Dict[str, str]] = []
-    if not VAULT_DIR.is_dir():
-        return notes
-    for md_file in sorted(VAULT_DIR.rglob("*.md")):
-        if md_file.name.startswith(".") or "archive" in md_file.parts:
-            continue
-        rel = str(md_file.relative_to(VAULT_DIR))
-        notes.append({"title": md_file.stem, "rel_path": rel, "abs_path": str(md_file)})
+    if VAULT_DIR.is_dir():
+        for md_file in sorted(VAULT_DIR.rglob("*.md")):
+            if md_file.name.startswith(".") or "archive" in md_file.parts:
+                continue
+            rel = str(md_file.relative_to(VAULT_DIR))
+            notes.append({"title": md_file.stem, "rel_path": rel, "abs_path": str(md_file)})
+    active_slug = slugify_project_name(os.environ.get("CORA_ACTIVE_PROJECT", ""))
+    if active_slug and (PROJECTS_DIR / active_slug).is_dir():
+        proj_dir = PROJECTS_DIR / active_slug
+        for sub_name in ("notes", "targets"):
+            sub_dir = proj_dir / sub_name
+            if sub_dir.is_dir():
+                for md_file in sorted(sub_dir.glob("*.md")):
+                    if not md_file.name.startswith("."):
+                        rel = f"Projects/{active_slug}/{sub_name}/{md_file.name}"
+                        notes.append({"title": md_file.stem, "rel_path": rel, "abs_path": str(md_file)})
     return notes
 
 
@@ -1306,7 +1347,27 @@ def resolve_problem_targets(
     secondary_ip = secondary_ip or explicit_secondary or secondary_target_ip or ""
     local_subnets = local_subnets or explicit_local_subnets
 
+    import time as _time
+
     host_ctx = detect_host_network_context()
+    active_proj_env = os.environ.get("CORA_ACTIVE_PROJECT", "").strip()
+    cache_key = (
+        problem_text,
+        target_ip,
+        secondary_ip,
+        tuple(local_subnets) if local_subnets else (),
+        active_proj_env,
+        host_ctx.get("_iso_sig", ""),
+    )
+    now_mono = _time.monotonic()
+    cached_hit = _RESOLVE_TARGETS_CACHE.get(cache_key)
+    if cached_hit is not None and (now_mono - cached_hit[0]) < 2.5:
+        res_copy = dict(cached_hit[1])
+        res_copy["local_subnets"] = list(cached_hit[1]["local_subnets"])
+        res_copy["discovered_ips"] = list(cached_hit[1]["discovered_ips"])
+        res_copy["discovered_subnets"] = list(cached_hit[1]["discovered_subnets"])
+        return res_copy
+
     os_family = host_ctx["os_family"]
     prob_low = (problem_text or "").lower()
     explicit_windows_shell = any(
@@ -1459,16 +1520,24 @@ def resolve_problem_targets(
                 except Exception:
                     pass
 
-    # Next inspect active holding fluents in live_fluents.json sorted by most recent turn first
+    # Next inspect active holding fluents in live_fluents.json sorted by most recent turn first (scoped to active_proj)
     if not discovered_ips:
-        fluent_file = DATA_DIR / "temporal_fluents" / "live_fluents.json"
-        if fluent_file.is_file():
+        active_proj = os.environ.get("CORA_ACTIVE_PROJECT", "").strip()
+        proj_fluent_file = (PROJECTS_DIR / active_proj / "reasoning" / "live_fluents.json") if active_proj else None
+        fluent_file = (
+            proj_fluent_file
+            if (proj_fluent_file is not None and proj_fluent_file.is_file())
+            else (None if active_proj else (DATA_DIR / "temporal_fluents" / "live_fluents.json"))
+        )
+        if fluent_file is not None and fluent_file.is_file():
             try:
                 fdata = json.loads(fluent_file.read_text(encoding="utf-8"))
                 fluent_items = [
                     (fk, fv)
                     for fk, fv in (fdata.get("fluents") or {}).items()
-                    if isinstance(fv, dict) and fv.get("status") in ("ACTIVE", "HOLDING")
+                    if isinstance(fv, dict)
+                    and fv.get("status") in ("ACTIVE", "HOLDING")
+                    and (not active_proj or str(fv.get("project") or active_proj).lower() == active_proj.lower())
                 ]
                 fluent_items.sort(key=lambda kv: -int(kv[1].get("updated_turn", 0)))
                 for fk, fv in fluent_items:
@@ -1539,7 +1608,7 @@ def resolve_problem_targets(
 
     local_subnet_str = eff_local_subnets[0] if eff_local_subnets else "<LOCAL_SUBNET>"
     serial_match = re.search(r"(/dev/tty(?:USB|ACM|S)\d+|\bCOM\d+\b)", problem_text or "", re.I)
-    serial_port = serial_match.group(1) if serial_match else host_ctx["primary_serial"]
+    serial_port = serial_match.group(1) if serial_match else (host_ctx["serial_ports"][0] if host_ctx["serial_ports"] else "")
     has_serial_keywords = bool(
         serial_match
         or re.search(
@@ -1554,20 +1623,7 @@ def resolve_problem_targets(
             and bool(re.search(r"exit 7|connection refused", prob_low))
         )
     )
-    non_serial_domain_intent = bool(
-        any(
-            k in prob_low
-            for k in (
-                "mtls", "client.crt", "https://", "http://", "injection", "endpoint", "rest api",
-                "graphql", "cookie", "jwt", "network is unreachable", "no route to host",
-                "cross-subnet", "active directory", "ldap", "smb", "suid", "sudoers", "capabilities",
-                "privesc", "privilege escalation", "www-data", "cve", "fortios", "fortigate", "firewall",
-                "exploit", "callback", "call back", "reverse shell", "python script", "files directory",
-            )
-        )
-        and not explicit_serial_intent
-    )
-    has_serial = bool(explicit_serial_intent or (host_ctx["serial_ports"] and not non_serial_domain_intent))
+    has_serial = bool(explicit_serial_intent)
 
     if via_gateway_ips_in_prompt:
         resolved_gw_ip = via_gateway_ips_in_prompt[0]
@@ -1578,9 +1634,10 @@ def resolve_problem_targets(
     else:
         resolved_gw_ip = primary if (primary != "<TARGET_IP>" and remote_subnet == "<REMOTE_SUBNET>") else "<GATEWAY_IP>"
 
-    return {
+    resolved_out = {
         "os_family": os_family,
         "target_os": target_os,
+        "problem": problem_text,
         "primary_ip": primary,
         "target_ip": primary,
         "secondary_ip": secondary,
@@ -1599,6 +1656,18 @@ def resolve_problem_targets(
         "has_concrete_primary_ip": primary != "<TARGET_IP>",
         "has_concrete_secondary_ip": secondary != "<REMOTE_HOST>",
     }
+    if len(_RESOLVE_TARGETS_CACHE) > 256:
+        _RESOLVE_TARGETS_CACHE.clear()
+    _RESOLVE_TARGETS_CACHE[cache_key] = (
+        now_mono,
+        {
+            **resolved_out,
+            "local_subnets": list(eff_local_subnets),
+            "discovered_ips": list(non_self_ips),
+            "discovered_subnets": list(discovered_subnets),
+        },
+    )
+    return resolved_out
 
 
 def render_command_template(template: str, ctx: Optional[Dict[str, Any]] = None) -> str:

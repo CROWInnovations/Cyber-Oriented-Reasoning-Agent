@@ -1023,10 +1023,11 @@ def load_or_init_mdp_store() -> Dict[str, Any]:
 def infer_current_mdp_state(
     problem: str = "",
     observed_evidence: Optional[Dict[str, bool]] = None,
-    has_serial_oob: bool = True,
+    has_serial_oob: bool = False,
+    rl_stage: str = "",
 ) -> Tuple[str, List[str]]:
     """
-    Map live Problem Context + Engine 9 Temporal Fluents + Observed Evidence
+    Map live Problem Context + Engine 9 Temporal Fluents + Observed Evidence + Engine 19 RL Stage
     into the current Markov state `s_t in S` and return `(current_state, active_fluents_summary)`.
     """
     prob_low = (problem or "").lower()
@@ -1104,12 +1105,28 @@ def infer_current_mdp_state(
         "route" in prob_low
         or "subnet" in prob_low
         or "route_to_" in joined_fluents
-        or "172.24." in prob_low
-        or "10." in prob_low
-        or "172." in prob_low
-        or "192.168." in prob_low
+        or bool(re.search(r"\b(?:192\.168|10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|198\.51\.100|203\.0\.113)\.\d{1,3}\.\d{1,3}\b", prob_low))
     ):
         return "s_passive_topology_mapped", fluent_tags
+
+    if rl_stage:
+        _rl_stage_to_mdp = {
+            "STAGE_7_GOAL_ACHIEVED": "s_goal_verified_complete",
+            "STAGE_7_VERIFIED_COMPLETION": "s_goal_verified_complete",
+            "STAGE_6_L7_SERVICE_GOAL_VERIFY": "s_credentials_or_certs_acquired",
+            "STAGE_6_AUTH_AND_API_INTERACTION": "s_credentials_or_certs_acquired",
+            "STAGE_5_L7_AUTH_OR_HEADER_BYPASS": "s_credentials_or_certs_acquired",
+            "STAGE_5_SERVICE_PORT_EXPOSED": "s_firewall_or_acl_unlocked",
+            "STAGE_4_BYPASS_ICMP_PORT_SCAN": "s_l2_l3_verified",
+            "STAGE_4_OOB_SERIAL_OR_FW_UNLOCK": "s_oob_serial_enumerated",
+            "STAGE_3_CROSS_SUBNET_L3_ROUTE": "s_passive_topology_mapped",
+            "STAGE_2_OOB_SERIAL_UNLOCK": "s_oob_serial_enumerated",
+            "STAGE_2_L2_ARP_VERIFIED": "s_l2_l3_verified",
+            "STAGE_1_L2_NEIGHBOR_DISCOVERY": "s_passive_topology_mapped",
+            "STAGE_1_LOCAL_IFACE_MAPPED": "s_passive_topology_mapped",
+        }
+        if rl_stage in _rl_stage_to_mdp:
+            return _rl_stage_to_mdp[rl_stage], fluent_tags
 
     return "s_init_unknown", fluent_tags
 
@@ -1276,8 +1293,14 @@ def record_mdp_transition_outcome(
             _MDP_STORE_RAM_CACHE["data"] = store
             dirty = int(_MDP_STORE_RAM_CACHE.get("dirty_count", 0)) + 1
             _MDP_STORE_RAM_CACHE["dirty_count"] = dirty
-            _MDP_SOLVED_CACHE["mtime"] = -1.0
-            _MDP_SOLVED_CACHE["stratified_pool"] = None
+            if _MDP_SOLVED_CACHE.get("stratified_pool"):
+                mid = matched_tr.get("id")
+                for ptr in _MDP_SOLVED_CACHE["stratified_pool"]:
+                    if ptr.get("id") == mid:
+                        ptr["alpha_success"] = matched_tr["alpha_success"]
+                        ptr["alpha_fail"] = matched_tr["alpha_fail"]
+                        ptr["transition_prob_success"] = p_succ
+                        break
             if flush or dirty >= 10:
                 flush_mdp_store_if_dirty()
             return {
@@ -1387,12 +1410,17 @@ def _get_cached_solved_mdp(max_iters: int) -> Tuple[Dict[str, Any], Dict[str, fl
     bucket_counts: Dict[Tuple[str, str, bool, bool], int] = {}
     stratified_pool: List[Dict[str, Any]] = []
     for tr in enriched_all:
+        is_seed = tr.get("source") == "seed_core"
         cmd_t = tr.get("command_template", "")
         has_t = ("{target_ip}" in cmd_t) or ("<target_ip>" in cmd_t.lower())
+        pre_s = str(tr.get("pre_state", ""))
+        tac_s = str(tr.get("tactic", ""))
+        if not is_seed and bucket_counts.get((pre_s, tac_s, has_t, True), 0) >= 15 and bucket_counts.get((pre_s, tac_s, has_t, False), 0) >= 15:
+            continue
         linux_ok = _is_transition_os_compatible(tr, "linux")
-        bkey = (str(tr.get("pre_state", "")), str(tr.get("tactic", "")), has_t, linux_ok)
+        bkey = (pre_s, tac_s, has_t, linux_ok)
         cnt = bucket_counts.get(bkey, 0)
-        if cnt < 15 or tr.get("source") == "seed_core":
+        if cnt < 15 or is_seed:
             stratified_pool.append(tr)
             bucket_counts[bkey] = cnt + 1
 
@@ -1611,10 +1639,12 @@ def run_mdp_tactical_reasoning(
     target_ip: str = "",
     secondary_target_ip: str = "",
     observed_evidence: Optional[Dict[str, bool]] = None,
-    has_serial_oob: bool = True,
+    has_serial_oob: Optional[bool] = None,
     bayesian_top_hypothesis: str = "",
     dempster_shafer_ignorance: float = 0.0,
     somatic_valence: float = 0.0,
+    rl_stage: str = "",
+    causal_lift_delta: float = 0.0,
     save_to_vault: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -1630,6 +1660,8 @@ def run_mdp_tactical_reasoning(
         explicit_target=target_ip,
         explicit_secondary=secondary_target_ip,
     )
+    if has_serial_oob is None:
+        has_serial_oob = bool(ctx.get("has_serial_oob"))
     resolved_target = ctx["target_ip"]
     resolved_secondary = ctx["secondary_target_ip"] or resolved_target
     remote_subnet = ctx["remote_subnet"]
@@ -1646,6 +1678,7 @@ def run_mdp_tactical_reasoning(
         problem=problem,
         observed_evidence=observed_evidence,
         has_serial_oob=has_serial_oob,
+        rl_stage=rl_stage,
     )
 
     prob_low = (problem or "").lower()
@@ -1673,8 +1706,14 @@ def run_mdp_tactical_reasoning(
                 pomdp_bonus += 24.0
             elif tactic == "Active_Enum":
                 pomdp_bonus += 12.0
-        elif not has_serial_oob and (tactic == "Out-of-Band_Access" or tr.get("tool") == "tio"):
-            pomdp_bonus -= 80.0
+        elif not has_serial_oob and (
+            tactic == "Out-of-Band_Access"
+            or tr.get("tool") == "tio"
+            or "tio " in cmd_tmpl.lower()
+            or "/dev/ttyusb" in cmd_tmpl.lower()
+            or "/dev/ttyacm" in cmd_tmpl.lower()
+        ):
+            continue
         if has_route_kw and tactic in ("Lateral_Movement_Routing_Pivot", "Passive_Enum", "Active_Enum"):
             pomdp_bonus += 22.0
         if has_privesc_kw and tactic == "Privilege_Escalation":
@@ -1695,6 +1734,12 @@ def run_mdp_tactical_reasoning(
                 "Protocol_Chaining",
             ):
                 pomdp_bonus += 10.0
+        if causal_lift_delta > 0.25 and tactic in (
+            "Out-of-Band_Access",
+            "Lateral_Movement_Routing_Pivot",
+            "Defense_Evasion_Firewall",
+        ):
+            pomdp_bonus += round(6.0 * min(1.0, float(causal_lift_delta)), 2)
 
         adj_q = round(float(tr["q_star_value"]) + pomdp_bonus, 2)
         scored_raw.append((adj_q, tr))
