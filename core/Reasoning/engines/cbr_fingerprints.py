@@ -111,7 +111,7 @@ def extract_executable_cbr_command(case: Dict[str, Any], ctx: Optional[Dict[str,
         fmap = SEED_EXECUTABLE_FIX_MAP[cid]
         if target_os == "windows":
             tpl = fmap.get("windows", "")
-        elif cid == "CBR-005" and c.get("has_serial_oob"):
+        elif cid == "CBR-005" and c.get("has_serial_oob") and bool(re.search(r"\b(?:tio|ttyusb\d*|ttyacm\d*|serial\s+console)\b", str(c.get("problem") or ""), re.I)):
             tpl = fmap.get("linux_serial", fmap.get("linux", ""))
         else:
             tpl = fmap.get("linux", "")
@@ -168,7 +168,7 @@ DEFAULT_SEED_CASES: List[Dict[str, Any]] = [
         "case_id": "CBR-003",
         "binary": "tio",
         "exit_code": 1,
-        "error_pattern": "unexpected symbol|syntax error|attempt to call|import ",
+        "error_pattern": r"(?:tio|ttyusb|ttyacm|--script).*(?:unexpected symbol|syntax error|attempt to call|import )",
         "symptom": "tio --script fails with Lua syntax error or hangs on Python syntax",
         "root_cause": "`tio --script` uses Lua inside tio, NOT Python! Passing `import time` or Python code breaks tio.",
         "verified_fix": "Use valid Lua syntax inside `tio --script`: e.g. `expect('login: ', 5000); write('root\\r\\n'); expect('# ', 5000); write('ip addr\\r\\n'); sleep(1); exit()` or use `python3 -c 'import serial...'` instead.",
@@ -605,15 +605,23 @@ def run_cbr_reasoning(
     compiled_cases = _CBR_RAM_CACHE.get("compiled") or []
     for case, pat_re, bin_re, case_words in compiled_cases:
         score = 0.0
+        case_bin = str(case.get("binary", "any")).lower()
+        bin_matched = bool(bin_re is not None and bin_re.search(combined))
+        if case_bin == "tio" and (not bin_matched or not ctx.get("has_serial_oob")):
+            continue
+        if case_bin != "any" and not bin_matched:
+            # Do not match a specific binary's error signature unless that binary or its explicit error pattern is present
+            if pat_re is None or not pat_re.search(combined):
+                continue
         if pat_re is not None and pat_re.search(combined):
             score += 0.65
-        if bin_re is not None and bin_re.search(combined):
+        if bin_matched:
             score += 0.30
-        if words and case_words:
+        if words and case_words and (bin_matched or case_bin == "any"):
             overlap = len(words & case_words)
             score += min(0.35, overlap * 0.06)
 
-        if score >= 0.35:
+        if score >= 0.45:
             item = dict(case)
             item["relevance_score"] = round(min(1.0, score), 3)
             exec_cmd = extract_executable_cbr_command(item, ctx)

@@ -28,7 +28,10 @@ isolation (0 MB GPU VRAM) and Guardrail 4 (Executive Consensus Arbiter + Compact
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
+
+_PIPELINE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cora_engine_wave")
 
 from .associative import infer_team_role_from_query, run_associative_vault_reasoning
 from .bayesian import run_bayesian_abduction
@@ -221,11 +224,31 @@ def _auto_infer_observed_evidence(
         ev.setdefault("target_outside_local_24_cidr", True)
 
     # Detect local exploit / reverse-shell callback IP mismatch in Projects/<active_proj>/Files/
-    if any(
-        k in p_low
-        for k in (
-            "callback", "call back", "reverse shell", "lhost", "lport",
-            "python script", "files directory", "in the files", "exploit",
+    # Only trigger when debugging/fixing/analyzing an exploit, callback, or existing script failure,
+    # NOT when the operator is simply asking to create/write a new utility or scanner script.
+    is_new_script_creation = bool(
+        re.search(r"\b(?:create|write|make|build|generate|code)\b", p_low)
+        and re.search(r"\b(?:script|file|scanner|tool|\.py|\.sh|\.ps1)\b", p_low)
+        and not re.search(
+            r"\b(?:callback|call\s+back|reverse\s+shell|lhost|lport|fix|debug|repair|not\s+working|didn'?t\s+work|fail(?:ed|ing|ure)?|why)\b",
+            p_low,
+        )
+    )
+    has_failure_or_exploit_context = bool(
+        any(
+            k in p_low
+            for k in (
+                "callback", "call back", "reverse shell", "lhost", "lport",
+                "did not receive", "not working", "didn't work", "failed", "failure",
+                "exploit", "cve-", "fix", "debug", "verify", "why", "analyze", "review",
+            )
+        )
+    )
+    if not is_new_script_creation and (
+        any(k in p_low for k in ("callback", "call back", "reverse shell", "lhost", "lport"))
+        or (
+            has_failure_or_exploit_context
+            and any(k in p_low for k in ("python script", "files directory", "in the files", "script", ".py", "exploit"))
         )
     ):
         try:
@@ -244,7 +267,7 @@ def _auto_infer_observed_evidence(
                             if not ip.startswith(("127.", "0.", "255."))
                         ]
                         if script_ips and host_ips and not any(sip in host_ips for sip in script_ips):
-                            if any( sip != resolved_target for sip in script_ips):
+                            if any(sip != resolved_target for sip in script_ips):
                                 ev.setdefault("lhost_mismatch_detected_in_script", True)
                                 break
         except Exception:
@@ -261,13 +284,36 @@ def _auto_select_profile_and_dag(
     if bayesian_profile and bayesian_profile != "http_api_unreachable":
         return bayesian_profile, causal_dag
     p_low = (problem or "").lower()
-    if any(
-        k in p_low
-        for k in (
-            "callback", "call back", "reverse shell", "lhost", "lport",
-            "python script", "files directory", "in the files", "did not receive a call",
+    is_new_script_creation = bool(
+        re.search(r"\b(?:create|write|make|build|generate|code)\b", p_low)
+        and re.search(r"\b(?:script|file|scanner|tool|\.py|\.sh|\.ps1)\b", p_low)
+        and not re.search(
+            r"\b(?:callback|call\s+back|reverse\s+shell|lhost|lport|fix|debug|repair|not\s+working|didn'?t\s+work|fail(?:ed|ing|ure)?|why)\b",
+            p_low,
         )
-    ) or ("exploit" in p_low and ("script" in p_low or "files" in p_low or ".py" in p_low)):
+    )
+    has_failure_or_exploit_context = bool(
+        any(
+            k in p_low
+            for k in (
+                "callback", "call back", "reverse shell", "lhost", "lport",
+                "did not receive a call", "did not receive", "not working", "didn't work",
+                "failed", "failure", "exploit", "cve-", "fix", "debug", "verify", "why",
+            )
+        )
+    )
+    if not is_new_script_creation and (
+        any(
+            k in p_low
+            for k in (
+                "callback", "call back", "reverse shell", "lhost", "lport", "did not receive a call",
+            )
+        )
+        or (
+            has_failure_or_exploit_context
+            and any(k in p_low for k in ("python script", "files directory", "in the files", "script", "files", ".py"))
+        )
+    ):
         return "exploit_callback_or_script_failure", causal_dag
     if any(
         k in p_low
@@ -334,12 +380,24 @@ def run_neuro_symbolic_pipeline(
             or re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|com[1-9]\d*|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low)
         )
 
-    # Pre-run Stage 13 (SyGuS) and Stage 7 (Temporal Fluents) so their extracted facts feed downstream engines
-    sygus_res = _safe_stage(
+    # =========================================================================
+    # WAVE 0: Parallel Perception, Temporal Fluents & Geometric Grounding
+    # =========================================================================
+    fut_sygus = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "sygus_extractor",
         lambda: run_sygus_reasoning(problem=problem, export_to_vault=False),
         {"extracted": {}, "markdown": ""},
     )
+    fut_temporal = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
+        "temporal_fluents",
+        lambda: run_temporal_fluent_reasoning(problem=problem, export_to_vault=False),
+        {"holding_count": 0, "stale_count": 0, "l1_register": {}, "markdown": ""},
+    )
+    sygus_res = fut_sygus.result()
+    temporal_res = fut_temporal.result()
+
     sygus_ext = sygus_res.get("extracted") or {}
     for iface in sygus_ext.get("interfaces", []):
         cidrs = list(iface.get("ipv4") or [])
@@ -349,38 +407,10 @@ def run_neuro_symbolic_pipeline(
             if "/" in cidr and cidr not in resolved_subnets:
                 resolved_subnets.append(cidr)
 
-    temporal_res = _safe_stage(
-        "temporal_fluents",
-        lambda: run_temporal_fluent_reasoning(problem=problem, export_to_vault=False),
-        {"holding_count": 0, "stale_count": 0, "l1_register": {}, "markdown": ""},
-    )
-
     target_ips = [t for t in [resolved_target, resolved_secondary] if t]
     hw_limits = get_hardware_reasoning_limits()
 
-    # STAGE 1: Associative Spreading Activation & Bipartite Obsidian Vault Graph
-    assoc_seeds = [
-        c
-        for c in [
-            resolved_target if resolved_target != "<TARGET_IP>" else "",
-            resolved_secondary if resolved_secondary != "<REMOTE_HOST>" else "",
-            bayesian_profile,
-            ctx.get("target_os", ""),
-            "tio" if has_serial_oob else "",
-        ]
-        if c
-    ]
-    assoc_res = _safe_stage(
-        "associative",
-        lambda: run_associative_vault_reasoning(
-            query=f"{problem} {resolved_target} {resolved_secondary or ''}",
-            seed_concepts=assoc_seeds,
-            save_to_vault=False,
-        ),
-        {"activated_notes": [], "bridge_concepts": [], "num_graph_nodes": 0, "markdown_report": ""},
-    )
-
-    # STAGE 2: Geometric & Topological Constraint Reasoning
+    # STAGE 2: Geometric & Topological Constraint Reasoning (establishes L2/L3 containment for Wave 1)
     geo_res = _safe_stage(
         "geometric",
         lambda: run_geometric_reasoning(
@@ -417,11 +447,13 @@ def run_neuro_symbolic_pipeline(
         f"arp -a {resolved_target}" if is_windows else f"ip neigh show {resolved_target}"
     )
 
-    # Prepare STAGE 6 (Causal DAG) inputs before parallel Layer 2 fan-out
+    # Prepare STAGE 6 (Causal DAG) inputs before parallel Wave 1 fan-out
     causal_obs: Dict[str, float] = {}
     if not primary_in_local:
         causal_obs["Local_Subnet_IP_Route"] = 0.25
         causal_obs["Local_Static_Route"] = 0.25
+    if not has_serial_oob:
+        causal_obs["Serial_Console_OOB"] = 0.0
 
     auto_interventions = dict(do_interventions or {})
     if not auto_interventions:
@@ -442,6 +474,18 @@ def run_neuro_symbolic_pipeline(
             }
         else:
             auto_interventions = {"Valid_Auth_Context": 1.0}
+
+    assoc_seeds = [
+        c
+        for c in [
+            resolved_target if resolved_target != "<TARGET_IP>" else "",
+            resolved_secondary if resolved_secondary != "<REMOTE_HOST>" else "",
+            bayesian_profile,
+            ctx.get("target_os", ""),
+            "tio" if has_serial_oob else "",
+        ]
+        if c
+    ]
 
     def _invoke_bayesian() -> Dict[str, Any]:
         try:
@@ -474,8 +518,22 @@ def run_neuro_symbolic_pipeline(
         except TypeError:
             return run_cbr_reasoning(problem=problem, export_to_vault=False)
 
-    # LAYER 2 EPISTEMIC & DIAGNOSTIC ENGINES (executed deterministically without thread-lock contention on _VAULT_IO_LOCK):
-    bayes_res = _safe_stage(
+    # =========================================================================
+    # WAVE 1: Parallel Fan-Out Across Independent Epistemic, Associative,
+    #         Somatic & RL World-Model Engines (7 Engines + 2 State Monitors)
+    # =========================================================================
+    fut_assoc = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
+        "associative",
+        lambda: run_associative_vault_reasoning(
+            query=f"{problem} {resolved_target} {resolved_secondary or ''}",
+            seed_concepts=assoc_seeds,
+            save_to_vault=False,
+        ),
+        {"activated_notes": [], "bridge_concepts": [], "num_graph_nodes": 0, "markdown_report": ""},
+    )
+    fut_bayes = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "bayesian",
         _invoke_bayesian,
         {
@@ -486,7 +544,8 @@ def run_neuro_symbolic_pipeline(
             "markdown_report": "",
         },
     )
-    dst_res = _safe_stage(
+    fut_dst = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "dempster_shafer",
         lambda: run_dempster_shafer_reasoning(
             problem=problem,
@@ -501,7 +560,8 @@ def run_neuro_symbolic_pipeline(
             "markdown": "",
         },
     )
-    causal_res = _safe_stage(
+    fut_causal = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "causal",
         lambda: run_causal_reasoning(
             dag_name=causal_dag,
@@ -517,20 +577,81 @@ def run_neuro_symbolic_pipeline(
             "markdown_report": "",
         },
     )
-    cbr_res = _safe_stage(
+    fut_cbr = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "cbr_fingerprints",
         _invoke_cbr,
         {"library_size": 0, "matched_cases": [], "markdown": ""},
     )
-    vsa_res = _safe_stage(
+    fut_vsa = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "vsa",
         lambda: run_vsa_conceptual_leap(problem=problem, save_to_vault=False),
         {"top_archetype": "N/A", "projected_leaps": [], "somatic_gut_valence": 0.0, "somatic_state": "SOMATIC_NEUTRAL", "markdown_report": ""},
     )
+    fut_rl = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
+        "rl_network_policy",
+        lambda: run_rl_network_policy_reasoning(
+            problem=problem,
+            target_ip=resolved_target,
+            secondary_target_ip=resolved_secondary,
+            observed_evidence=observed_evidence,
+            sense_topology=save_to_vault,
+            export_to_vault=False,
+        ),
+        {
+            "state_key": "C0_LOCAL_LAN_DISCOVERY::STAGE_0_UNMAPPED_LOCAL_NET",
+            "cluster_id": "C0_LOCAL_LAN_DISCOVERY",
+            "stage": "STAGE_0_UNMAPPED_LOCAL_NET",
+            "bits_12": [0] * 12,
+            "feature_vector": [0.0] * 12,
+            "live_topology": {},
+            "immediate_action": {"command": default_probe_cmd, "q_star": 15.0, "action_title": "Probe"},
+            "rollout_steps": [],
+            "episodes_trained": 400,
+            "markdown": "",
+        },
+    )
+    fut_continual = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
+        "continual_learner",
+        lambda: run_continual_learning_reasoning(problem=problem, export_to_vault=False),
+        {"mode": "AUTO", "online_commands_observed": 0, "online_cbr_rules_learned": 0, "markdown": ""},
+    )
+    fut_meta = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
+        "meta_learner",
+        lambda: run_meta_learning_reasoning(problem=problem, export_to_vault=False),
+        {"rolling_brier_score": 0.102, "expected_calibration_error_pct": 4.2, "top_weighted_engine": "mdp_tactical", "markdown": ""},
+    )
 
-    # STAGE 15: Hierarchical Tactical Markov Decision Process (H-MDP / POMDP Bellman Policy + Optimal Stopping)
+    assoc_res = fut_assoc.result()
+    bayes_res = fut_bayes.result()
+    dst_res = fut_dst.result()
+    causal_res = fut_causal.result()
+    cbr_res = fut_cbr.result()
+    vsa_res = fut_vsa.result()
+    rl_res = fut_rl.result()
+    continual_res = fut_continual.result()
+    meta_res = fut_meta.result()
+    meta_weights = get_meta_arbiter_weights()
+
+    # =========================================================================
+    # WAVE 2: Cross-Pollinated Complementary Synthesis (Parallel)
+    #   - Engine 15 (H-MDP) receives Bayesian top hypothesis, DST ignorance,
+    #     Somatic valence, Causal lift delta, AND RL symbolic OSI stage.
+    #   - Engine 20 (Spectral PCA / K-Means++) receives continuous 12-D
+    #     feature_vector and live_topology from Engine 19 (RL World-Model).
+    # =========================================================================
     somatic_valence = float(vsa_res.get("somatic_gut_valence", 0.0))
-    mdp_res = _safe_stage(
+    causal_lift = float(causal_res.get("causal_lift_delta", 0.0))
+    rl_stage_str = str(rl_res.get("stage", ""))
+    rl_feature_vec = rl_res.get("feature_vector") or rl_res.get("bits_12")
+    rl_live_topo = rl_res.get("live_topology") if isinstance(rl_res.get("live_topology"), dict) else None
+
+    fut_mdp = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "mdp_tactical",
         lambda: run_mdp_tactical_reasoning(
             problem=problem,
@@ -541,6 +662,8 @@ def run_neuro_symbolic_pipeline(
             bayesian_top_hypothesis=str(bayes_res.get("top_hypothesis", "")),
             dempster_shafer_ignorance=float(dst_res.get("epistemic_ignorance", 0.0)),
             somatic_valence=somatic_valence,
+            rl_stage=rl_stage_str,
+            causal_lift_delta=causal_lift,
             save_to_vault=False,
         ),
         {
@@ -558,42 +681,16 @@ def run_neuro_symbolic_pipeline(
             "markdown_report": "",
         },
     )
-    if mdp_res.get("speculative_branch_forecast"):
-        update_speculative_branch_cache(mdp_res["speculative_branch_forecast"])
-
-    # STAGE 19: Trajectory Reinforcement Learning (TD(lambda) + UCB1) & Live Network World-Model
-    rl_res = _safe_stage(
-        "rl_network_policy",
-        lambda: run_rl_network_policy_reasoning(
-            problem=problem,
-            target_ip=resolved_target,
-            secondary_target_ip=resolved_secondary,
-            observed_evidence=observed_evidence,
-            sense_topology=save_to_vault,
-            export_to_vault=False,
-        ),
-        {
-            "state_key": "C0_LOCAL_LAN_DISCOVERY::STAGE_0_UNMAPPED_LOCAL_NET",
-            "cluster_id": "C0_LOCAL_LAN_DISCOVERY",
-            "stage": "STAGE_0_UNMAPPED_LOCAL_NET",
-            "bits_12": [0] * 12,
-            "live_topology": {},
-            "immediate_action": {"command": default_probe_cmd, "q_star": 15.0, "action_title": "Probe"},
-            "rollout_steps": [],
-            "episodes_trained": 400,
-            "markdown": "",
-        },
-    )
-
-    # STAGE 20: SVD Principal Component Analysis (PCA), K-Means++ Clustering & Spectral Laplacian
-    pca_res = _safe_stage(
+    fut_pca = _PIPELINE_EXECUTOR.submit(
+        _safe_stage,
         "spectral_manifold_pca",
         lambda: run_spectral_pca_reasoning(
             problem=problem,
             target_ip=resolved_target,
             secondary_target_ip=resolved_secondary,
             observed_evidence=observed_evidence,
-            live_net_bits=rl_res.get("bits_12"),
+            live_net_bits=rl_feature_vec,
+            live_topology=rl_live_topo,
             export_to_vault=False,
         ),
         {
@@ -607,10 +704,18 @@ def run_neuro_symbolic_pipeline(
         },
     )
 
+    mdp_res = fut_mdp.result()
+    pca_res = fut_pca.result()
+
+    if mdp_res.get("speculative_branch_forecast"):
+        update_speculative_branch_cache(mdp_res["speculative_branch_forecast"])
+
     pca_cluster_pre = pca_res.get("cluster_assignment") or {}
     mahalanobis_veto_pre = bool(pca_cluster_pre.get("mahalanobis_outlier_veto", False))
 
-    # LAYER 1 HARD PRE-EXECUTION VERIFIER: CEGAR verifies candidate commands from Bayesian/MDP/RL/CBR
+    # =========================================================================
+    # WAVE 3: Hard Pre-Execution CEGAR Verifier & Calibrated Consensus Arbiter
+    # =========================================================================
     top_probe = (
         bayes_res["recommended_next_probes"][0]
         if bayes_res.get("recommended_next_probes")
@@ -640,33 +745,33 @@ def run_neuro_symbolic_pipeline(
         {"verifications": [], "markdown": ""},
     )
 
-    # STAGE 16: Continual Learning & Plasticity State
-    continual_res = _safe_stage(
-        "continual_learner",
-        lambda: run_continual_learning_reasoning(problem=problem, export_to_vault=False),
-        {"mode": "AUTO", "online_commands_observed": 0, "online_cbr_rules_learned": 0, "markdown": ""},
-    )
-
-    # STAGE 17: Multiplicative-Weights Hedge Meta-Learner & Calibration Auditor
-    meta_res = _safe_stage(
-        "meta_learner",
-        lambda: run_meta_learning_reasoning(problem=problem, export_to_vault=False),
-        {"rolling_brier_score": 0.102, "expected_calibration_error_pct": 4.2, "top_weighted_engine": "mdp_tactical", "markdown": ""},
-    )
-    meta_weights = get_meta_arbiter_weights()
-
     # -------------------------------------------------------------------------
     # LAYER 5: Lexical Priority Consensus Arbiter (Hedge-Weighted + Pass-2 + Layer 1 Post-Gate)
     # -------------------------------------------------------------------------
     conflict_k = float(dst_res.get("conflict_mass_k", 0.0))
     ignorance_m = float(dst_res.get("epistemic_ignorance", 0.0))
-    cbr_matches = cbr_res.get("matched_cases", [])
+    cbr_matches = [
+        cm
+        for cm in cbr_res.get("matched_cases", [])
+        if not (
+            (cm.get("binary") == "tio" or cm.get("case_id") in ("CBR-003", "CBR-012"))
+            and not has_serial_oob
+        )
+    ]
+    cbr_top_cmd = ""
+    if cbr_matches:
+        cbr_top_cmd = str(cbr_matches[0].get("executable_fix_command") or extract_executable_cbr_command(cbr_matches[0], ctx))
     cbr_is_specific_syntax_fix = bool(
         cbr_matches
         and cbr_matches[0].get("relevance_score", 0.0) >= 0.72
         and not (
-            cbr_matches[0].get("case_id") in ("CBR-003", "CBR-004")
-            and (has_serial_oob or bool(resolved_secondary))
+            cbr_matches[0].get("case_id") == "CBR-004"
+            and bool(resolved_secondary)
+        )
+        and (
+            has_serial_oob
+            if (cbr_matches[0].get("binary") == "tio" or cbr_matches[0].get("case_id") in ("CBR-003", "CBR-012"))
+            else True
         )
     )
 
@@ -706,9 +811,26 @@ def run_neuro_symbolic_pipeline(
         raw_mdp_q = float(mdp_res.get("optimal_q_star", 0.0))
         raw_rl_q_lcb = float(rl_imm_dict.get("q_lcb", rl_imm_dict.get("q_star", 15.0)))
         raw_eig_bits = float(top_probe.get("eig_bits", 0.0))
-        mdp_q = min(100.0, max(0.0, (raw_mdp_q / 150.0) * 100.0)) * float(meta_weights.get("mdp_tactical", 1.0))
+        mdp_q = min(100.0, max(0.0, (raw_mdp_q / 320.0) * 100.0)) * float(meta_weights.get("mdp_tactical", 1.0))
         rl_q_lcb = min(100.0, max(0.0, (raw_rl_q_lcb / 25.0) * 100.0)) * float(meta_weights.get("rl_network_policy", 1.0))
         eig_score = min(100.0, max(0.0, (raw_eig_bits / 1.0) * 100.0)) * float(meta_weights.get("bayesian_eig", 1.0))
+
+        # Cross-Engine Agreement Boost: reward candidates whose primary tool is independently recommended by >=2 engines
+        def _primary_tool(cmd_s: str) -> str:
+            toks = [t for t in (cmd_s or "").strip().split() if t and t not in ("sudo", "doas", "time", "env")]
+            return toks[0].lower() if toks else ""
+
+        _tool_votes: Dict[str, int] = {}
+        for _cand_c in (mdp_cmd, rl_cmd_cand, str(top_probe.get("probe_cmd") or ""), cbr_top_cmd):
+            _pt = _primary_tool(_cand_c)
+            if _pt:
+                _tool_votes[_pt] = _tool_votes.get(_pt, 0) + 1
+        if _tool_votes.get(_primary_tool(mdp_cmd), 0) >= 2:
+            mdp_q = min(100.0, mdp_q + 8.0)
+        if _tool_votes.get(_primary_tool(rl_cmd_cand), 0) >= 2:
+            rl_q_lcb = min(100.0, rl_q_lcb + 8.0)
+        if _tool_votes.get(_primary_tool(str(top_probe.get("probe_cmd") or "")), 0) >= 2:
+            eig_score = min(100.0, eig_score + 8.0)
         cbr_hint_suffix = (
             f" | [CBR Hint {cbr_matches[0]['case_id']}: `{cbr_top_cmd}`]"
             if (cbr_matches and cbr_top_cmd)
@@ -787,6 +909,41 @@ def run_neuro_symbolic_pipeline(
         consensus_rationale = f"{consensus_rationale} | {meta_res.get('meta_pacing_directive')}"
     elif pacing_note:
         consensus_rationale = f"{consensus_rationale} | {pacing_note}"
+
+    # When no concrete target IP has been discovered yet (`<TARGET_IP>` placeholder remains) and no explicit
+    # network/system command was requested, do NOT emit a hardcoded/placeholder command probe.
+    p_low_check = (problem or "").lower()
+    is_standalone_script_create = bool(
+        re.search(r"\b(?:create|write|make|build|generate|code)\b", p_low_check)
+        and re.search(r"\b(?:script|file|scanner|tool|\.py|\.sh|\.ps1)\b", p_low_check)
+        and not re.search(
+            r"\b(?:callback|call\s+back|reverse\s+shell|lhost|lport|fix|debug|repair|not\s+working|didn'?t\s+work|fail(?:ed|ing|ure)?|why)\b",
+            p_low_check,
+        )
+        and not re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", p_low_check)
+    )
+    has_explicit_probe_intent = bool(
+        not is_standalone_script_create
+        and (
+            ctx.get("has_concrete_primary_ip")
+            or has_serial_oob
+            or re.search(
+                r"\b(?:scan|probe|ping|nmap|curl|route|subnet|interface|nic|arp|neigh|port|firewall|iptables|netstat|ss|tcpdump|tshark|discover|enumerate|check\s+network)\b",
+                p_low_check,
+            )
+        )
+    )
+    if is_standalone_script_create:
+        consensus_action = ""
+        consensus_rationale = "Local script/file creation requested; write the requested file directly to `Projects/<project>/Files/` without running network probes first."
+    elif (
+        "<TARGET_IP>" in consensus_action
+        or "<REMOTE_HOST>" in consensus_action
+        or "<REMOTE_SUBNET>" in consensus_action
+        or (not has_explicit_probe_intent and not ctx.get("has_concrete_primary_ip"))
+    ):
+        consensus_action = ""
+        consensus_rationale = "No target IP or hardware endpoint discovered in this project yet; awaiting operator target or scope."
 
     top_assoc_notes = [f"`[[{n['wiki_link']}]]`" for n in assoc_res.get("activated_notes", [])[:3]]
     active_team_role = infer_team_role_from_query(problem)

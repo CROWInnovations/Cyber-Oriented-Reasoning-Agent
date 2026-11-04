@@ -14,11 +14,14 @@ Capabilities:
 """
 from datetime import datetime
 import json
+import os
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
 from .vault_bridge import (
     DATA_DIR,
+    PROJECTS_DIR,
     ensure_directories,
     get_hardware_reasoning_limits,
     load_json_state,
@@ -27,22 +30,34 @@ from .vault_bridge import (
     save_json_state,
     save_reasoning_to_vault,
     slugify,
+    slugify_project_name,
 )
 
 FLUENT_STATE_FILE = DATA_DIR / "temporal_fluents" / "live_fluents.json"
 
 
-def _load_fluent_store() -> Dict[str, Any]:
+def _get_active_fluent_file(project_slug: str = "") -> Path:
+    """Resolve the isolated per-project `live_fluents.json` path so projects never leak fluents."""
     ensure_directories()
-    data = load_json_state(str(FLUENT_STATE_FILE), {"turn_counter": 0, "fluents": {}, "events_log": []})
+    slug = slugify_project_name(project_slug or os.environ.get("CORA_ACTIVE_PROJECT", ""))
+    if slug and (PROJECTS_DIR / slug).is_dir():
+        proj_reasoning_dir = PROJECTS_DIR / slug / "reasoning"
+        proj_reasoning_dir.mkdir(parents=True, exist_ok=True)
+        return proj_reasoning_dir / "live_fluents.json"
+    return FLUENT_STATE_FILE
+
+
+def _load_fluent_store(project_slug: str = "") -> Dict[str, Any]:
+    target_file = _get_active_fluent_file(project_slug)
+    data = load_json_state(str(target_file), {"turn_counter": 0, "fluents": {}, "events_log": []})
     if isinstance(data, dict) and "fluents" in data:
         return data
     return {"turn_counter": 0, "fluents": {}, "events_log": []}
 
 
-def load_fluent_state() -> Dict[str, Any]:
-    """Public accessor for current Event-Calculus fluent store."""
-    return _load_fluent_store()
+def load_fluent_state(project_slug: str = "") -> Dict[str, Any]:
+    """Public accessor for current Event-Calculus fluent store (scoped to active project when set)."""
+    return _load_fluent_store(project_slug)
 
 
 def get_l1_state_summary_line() -> str:
@@ -61,9 +76,9 @@ def get_l1_state_summary_line() -> str:
     return "[L1 Symbolic State Register] " + (" || ".join(parts) if parts else "Ready")
 
 
-def _save_fluent_store(store: Dict[str, Any]) -> None:
-    ensure_directories()
-    save_json_state(str(FLUENT_STATE_FILE), store)
+def _save_fluent_store(store: Dict[str, Any], project_slug: str = "") -> None:
+    target_file = _get_active_fluent_file(project_slug)
+    save_json_state(str(target_file), store)
 
 
 def record_command_event(command: str, output: str, returncode: int = 0) -> Dict[str, Any]:
@@ -442,7 +457,7 @@ def run_temporal_fluent_reasoning(
                     "updated_turn": 1,
                 }
             }
-            if "/dev/tty" in prob_low or "com" in prob_low or "serial" in prob_low:
+            if bool(re.search(r"(/dev/tty(?:usb|acm|s)\d+|\bcom\d+\b|\bserial\s+(?:port|console|cable|oob|uart)\b)", prob_low)) and ctx.get("serial_port"):
                 ser = ctx["serial_port"]
                 fluents[f"serial:{ser}"] = {
                     "entity": ser,

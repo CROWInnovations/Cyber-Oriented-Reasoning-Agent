@@ -55,13 +55,13 @@ DEFAULT_CYBER_PROFILES: Dict[str, Any] = {
                 "prior": 0.16,
                 "alpha_count": 4.0,
                 "description": "Target firewall (iptables/nftables) actively sends TCP RST (curl exit 7) or drops packets from non-management IPs.",
-                "remediation": "Inspect target firewall rules via out-of-band serial console (`/dev/ttyUSB0`) or probe from allowed management IP.",
+                "remediation": "Inspect target firewall rules or probe alternate ports (`nmap -Pn -sT <target_ip>`) from an allowed management subnet.",
             },
             "api_daemon_stopped_or_bound_loopback": {
                 "prior": 0.12,
                 "alpha_count": 3.0,
                 "description": "API service on the target has crashed or is bound solely to `127.0.0.1` instead of `0.0.0.0`.",
-                "remediation": "Access target via serial console (`/dev/ttyUSB0` with `tio`) and check `ss -tulpn` / `systemctl`.",
+                "remediation": "Check listening sockets (`ss -tulpn` / `netstat -ano`) and service status (`systemctl`), or forward via SSH `-L` if bound to loopback.",
             },
         },
         "evidence_likelihoods": {
@@ -472,17 +472,28 @@ def compute_posteriors(
     evidence_likelihoods: Dict[str, Dict[str, Any]],
     observed_evidence: Dict[str, bool],
 ) -> Dict[str, float]:
-    """Compute exact Bayesian posteriors P(H | E) given True/False observed evidence."""
+    """
+    Compute exact Bayesian posteriors P(H | E) given True/False observed evidence,
+    with correlated-sensor likelihood tempering when >= 3 co-triggered observations
+    are active simultaneously so posterior entropy H(P) and EIG do not collapse to 0.
+    """
     unnormalized: Dict[str, float] = {}
     total_prior = sum(max(1e-6, float(v)) for v in priors.values())
+    active_ev_keys = [k for k in observed_evidence if k in evidence_likelihoods]
+    k_ev = len(active_ev_keys)
+    # Monotonic power-likelihood tempering preserves exact MAP hypothesis ordering
+    # while preventing naive-independence overconfidence when multiple implied keys fire together.
+    temper_exp = (1.0 / math.sqrt(0.45 * float(k_ev))) if k_ev >= 3 else 1.0
+
     for h, p0 in priors.items():
         prob = max(1e-6, float(p0)) / total_prior
-        for ev_key, is_present in observed_evidence.items():
-            if ev_key not in evidence_likelihoods:
-                continue
+        for ev_key in active_ev_keys:
+            is_present = observed_evidence[ev_key]
             p_e_given_h = float(evidence_likelihoods[ev_key].get("p_given_h", {}).get(h, 0.5))
             p_e_given_h = min(0.999, max(0.001, p_e_given_h))
             likelihood = p_e_given_h if is_present else (1.0 - p_e_given_h)
+            if temper_exp < 1.0:
+                likelihood = likelihood ** temper_exp
             prob *= likelihood
         unnormalized[h] = prob
 
@@ -642,6 +653,14 @@ def run_bayesian_abduction(
         secondary_ip=secondary_target_ip or "",
         local_subnets=local_subnets,
     )
+    if not ctx.get("has_serial_oob"):
+        next_probes = [
+            p
+            for p in next_probes
+            if p.get("evidence_key") != "serial_ss_shows_127_0_0_1_only"
+            and "tio " not in str(p.get("probe_cmd") or "")
+            and "/dev/ttyUSB" not in str(p.get("probe_cmd") or "")
+        ]
     target_str = ctx["primary_ip"] if ctx["has_concrete_primary_ip"] else (target or "<TARGET_IP>")
     for p in next_probes:
         rendered_cmd = _render_bayesian_text(p.get("probe_cmd", ""), ctx)

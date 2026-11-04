@@ -1,10 +1,10 @@
 {
   "major_cli": 5,
-  "engine_rev": 22,
-  "patch_rev": 20,
-  "version": "5.22.20",
-  "updated_at": "2026-11-01 18:55:00",
-  "engine_tree_sha256": "34a3a5fa623e8bb7c852a11b7abbc8dd55a9ec571664143898689476e1b15ba8",
-  "patch_tree_sha256": "a52e305f6e8d4d2c312b71bb79c6d40ef47f6e780c8ab18f2ea3bb66af1257e2",
-  "last_update_reason": "v5.22.20: Route workspace directories (targets, notes, downloads, artifacts, assets, Files) properly, auto-persist scripts, and sanitize private network data"
+  "engine_rev": 23,
+  "patch_rev": 21,
+  "version": "5.23.21",
+  "updated_at": "2026-11-04 00:06:10",
+  "engine_tree_sha256": "86c86c37912f43634dbae01d0a0c718084419df593852fd3abd54e119a533c12",
+  "patch_tree_sha256": "64321daff439db59e4ed93e1a2cabdb0f26b25160ce81d2c083be2d4425d561c",
+  "last_update_reason": "Parallel 4-Wave DAG engine execution, local Files/ script creation & context compaction safeguards"
 }

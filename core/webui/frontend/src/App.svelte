@@ -819,6 +819,9 @@
       projectFilesPayload = data.files || projectFilesPayload;
       attachedFiles = [];
       messages = [];
+      commandToExecute = '';
+      queryInput = '';
+      syncInputHistories([], systemTools);
       activeGoal = newProjectGoalInput.trim();
       showCreateProjectModal = false;
       showToast(`Created & activated Projects/${activeProject}/ (with Projects/${activeProject}/Files/)`);
@@ -1609,14 +1612,15 @@
     }
   }
 
-  // --- Up/Down History Navigation & Shaded Word/Command Autocomplete Engine ---
-  function syncInputHistories(msgs: ChatMessage[], toolsInv: SystemToolsInventory | null) {
+  // --- Up/Down History Navigation & Shaded Word/Command Autocomplete Engine (Scoped Per-Project, Zero Hardcoded Commands) ---
+  function syncInputHistories(msgs: ChatMessage[], _toolsInv: SystemToolsInventory | null) {
     let savedQueries: string[] = [];
     let savedCmds: string[] = [];
+    const projKey = (activeProject || 'default').toLowerCase();
     try {
-      const rawQ = localStorage.getItem('cora_query_history');
+      const rawQ = localStorage.getItem(`cora_query_history_${projKey}`);
       if (rawQ) savedQueries = JSON.parse(rawQ);
-      const rawC = localStorage.getItem('cora_cmd_history');
+      const rawC = localStorage.getItem(`cora_cmd_history_${projKey}`);
       if (rawC) savedCmds = JSON.parse(rawC);
     } catch {
       // ignore storage errors
@@ -1632,12 +1636,14 @@
       if (m.command_executed && m.command_executed.trim()) {
         msgCmds.push(m.command_executed.trim());
       }
-      if (m.reasoning?.consensus_immediate_action) {
+      if (
+        m.reasoning?.consensus_immediate_action &&
+        !m.reasoning.consensus_immediate_action.includes('<TARGET_IP>') &&
+        !m.reasoning.consensus_immediate_action.includes('<REMOTE_HOST>')
+      ) {
         msgCmds.push(m.reasoning.consensus_immediate_action.trim());
       }
     }
-
-    const defaultCmdSeeds = (toolsInv?.tools || []).slice(0, 6).map((t) => t.resolved_safe_command || t.resolved_command);
 
     const dedupeKeepRecent = (arr: string[], limit = 100): string[] => {
       const seen = new Set<string>();
@@ -1657,7 +1663,7 @@
 
     queryHistory = dedupeKeepRecent([...savedQueries, ...msgQueries], 100);
     commandHistory = dedupeKeepRecent(
-      [...defaultCmdSeeds, ...savedCmds, ...msgCmds].map((c) => c.replace(/\barp\s+-accepteula\b/gi, 'arp -a')),
+      [...savedCmds, ...msgCmds].map((c) => c.replace(/\barp\s+-accepteula\b/gi, 'arp -a')),
       100
     );
     queryHistoryCursor = -1;
@@ -1667,9 +1673,10 @@
   function pushQueryHistory(q: string) {
     const clean = q.trim();
     if (!clean) return;
+    const projKey = (activeProject || 'default').toLowerCase();
     queryHistory = [...queryHistory.filter((x) => x.toLowerCase() !== clean.toLowerCase()), clean].slice(-100);
     try {
-      localStorage.setItem('cora_query_history', JSON.stringify(queryHistory));
+      localStorage.setItem(`cora_query_history_${projKey}`, JSON.stringify(queryHistory));
     } catch {
       // ignore
     }
@@ -1678,9 +1685,10 @@
   function pushCommandHistory(c: string) {
     const clean = c.trim();
     if (!clean) return;
+    const projKey = (activeProject || 'default').toLowerCase();
     commandHistory = [...commandHistory.filter((x) => x.toLowerCase() !== clean.toLowerCase()), clean].slice(-100);
     try {
-      localStorage.setItem('cora_cmd_history', JSON.stringify(commandHistory));
+      localStorage.setItem(`cora_cmd_history_${projKey}`, JSON.stringify(commandHistory));
     } catch {
       // ignore
     }
@@ -2916,8 +2924,8 @@
                 {parsedMsg.cleanContent}
               </div>
 
-              <!-- Actionable Consensus Command Pill (If present) -->
-              {#if msg.reasoning && msg.reasoning.consensus_immediate_action}
+              <!-- Actionable Consensus Command Pill (If present and concrete) -->
+              {#if msg.reasoning && msg.reasoning.consensus_immediate_action && !msg.reasoning.consensus_immediate_action.includes('<TARGET_IP>') && !msg.reasoning.consensus_immediate_action.includes('<REMOTE_HOST>')}
                 <div
                   class="mt-1 pt-2 border-t flex flex-wrap items-center justify-between gap-2 text-xs font-mono {isDark
                     ? 'border-slate-600/60'

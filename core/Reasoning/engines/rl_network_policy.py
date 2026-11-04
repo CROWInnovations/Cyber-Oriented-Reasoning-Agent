@@ -459,8 +459,10 @@ def encode_symbolic_rl_state(
         if not ctx.get("has_concrete_secondary_ip") and not ev.get("icmp_ping_fails") and not ev.get("curl_exit_28_timeout"):
             f_vec[3] = 1.0
             f_vec[4] = 0.0
-    if topo.get("serial_devices") and ctx.get("has_serial_oob", True) and (f_vec[7] >= 0.5 or bool(re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low))):
+    if topo.get("serial_devices") and ctx.get("has_serial_oob", False) and (f_vec[7] >= 0.5 or bool(re.search(r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b", p_low))):
         f_vec[9] = 1.0
+    elif not ctx.get("has_serial_oob", False):
+        f_vec[9] = 0.0
 
     cluster_info = quantize_state_to_cluster(f_vec)
     cluster_id = cluster_info["cluster_id"]
@@ -939,10 +941,13 @@ def predict_rl_next_step_rollout(
     cur_stage = state_info["stage"]
     rollout: List[Dict[str, Any]] = []
 
+    has_serial_oob = bool(ctx.get("has_serial_oob", False))
     visited_stages = set()
     for step_num in range(1, horizon + 1):
         if cur_stage == "STAGE_7_GOAL_ACHIEVED" or cur_stage in visited_stages:
             break
+        if cur_stage == "STAGE_2_OOB_SERIAL_UNLOCK" and not has_serial_oob:
+            cur_stage = "STAGE_4_BYPASS_ICMP_PORT_SCAN"
         visited_stages.add(cur_stage)
         s_key = f"{cur_cluster}::{cur_stage}"
         q_row = q_table.get(s_key, {})
@@ -951,16 +956,25 @@ def predict_rl_next_step_rollout(
         if q_row:
             scored_acts = []
             for a_id, q_val in q_row.items():
+                if a_id == "A2_OOB_SERIAL_LUA_PROBE" and not has_serial_oob:
+                    continue
                 var_a = max(0.25, float(v_row.get(a_id, 2.5)))
                 n_a = max(1, int(n_row.get(a_id, 2)))
                 q_lcb = float(q_val) - kappa_lcb * (math.sqrt(var_a) / math.sqrt(n_a + 1.0))
                 scored_acts.append((a_id, float(q_val), q_lcb))
             scored_acts.sort(key=lambda item: item[2], reverse=True)
-            best_act_id, best_q, best_q_lcb = scored_acts[0]
+            if scored_acts:
+                best_act_id, best_q, best_q_lcb = scored_acts[0]
+            else:
+                best_act_id, _ = RL_STAGES_OPTIMAL_MAP.get(cur_stage, ("A0_ENUM_IFACES_AND_ARP", "STAGE_1_L2_NEIGHBOR_DISCOVERY"))
+                best_q = 15.0
+                best_q_lcb = 14.2
         else:
             best_act_id, _ = RL_STAGES_OPTIMAL_MAP.get(cur_stage, ("A0_ENUM_IFACES_AND_ARP", "STAGE_1_L2_NEIGHBOR_DISCOVERY"))
             best_q = 15.0
             best_q_lcb = 14.2
+        if best_act_id == "A2_OOB_SERIAL_LUA_PROBE" and not has_serial_oob:
+            best_act_id = "A4_NMAP_NOPING_TCP_SCAN"
 
         act_meta = RL_ACTIONS.get(best_act_id, RL_ACTIONS["A0_ENUM_IFACES_AND_ARP"])
         raw_tmpl = act_meta["windows_template"] if is_windows else act_meta["linux_template"]
@@ -970,7 +984,7 @@ def predict_rl_next_step_rollout(
             next_stage = "STAGE_5_L7_AUTH_OR_HEADER_BYPASS"
         elif cur_cluster == "C2_CROSS_SUBNET_L3_PIVOT" and cur_stage == "STAGE_1_L2_NEIGHBOR_DISCOVERY":
             next_stage = "STAGE_3_CROSS_SUBNET_L3_ROUTE"
-        elif cur_cluster == "C1_OOB_SERIAL_LOOPBACK_APPLIANCE" and cur_stage == "STAGE_1_L2_NEIGHBOR_DISCOVERY":
+        elif cur_cluster == "C1_OOB_SERIAL_LOOPBACK_APPLIANCE" and cur_stage == "STAGE_1_L2_NEIGHBOR_DISCOVERY" and has_serial_oob:
             next_stage = "STAGE_2_OOB_SERIAL_UNLOCK"
 
         rollout.append(
@@ -1209,6 +1223,7 @@ def run_rl_network_policy_reasoning(
         "stage": st_info["stage"],
         "current_stage": st_info["stage"],
         "bits_12": st_info["bits_12"],
+        "feature_vector": st_info.get("feature_vector", st_info["bits_12"]),
         "live_topology": topo,
         "immediate_action": imm,
         "optimal_action_id": imm["action_id"],

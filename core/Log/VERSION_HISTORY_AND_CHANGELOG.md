@@ -1,7 +1,7 @@
 # C.O.R.A. Master Version History & Architectural Changelog (`core/Log/VERSION_HISTORY_AND_CHANGELOG.md`)
 
 **Author:** CROW Innovations  
-**Current Semantic Version:** `5.22.20` ([`cora_version.json`](./cora_version.json))  
+**Current Semantic Version:** `5.23.21` ([`cora_version.json`](./cora_version.json))  
 
 ---
 
@@ -9,12 +9,23 @@
 
 `C.O.R.A.` tracks its version deterministically in [`core/Log/cora_version.json`](./cora_version.json):
 - **`major_cli` (`5`)**: Major CLI, Custom WebUI, and Two-Tier Project/Vault Architecture generation.
-- **`engine_rev` (`22`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
-- **`patch_rev` (`20`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
+- **`engine_rev` (`23`)**: Reasoning & Logic Engine revision (verified via SHA-256 tree hash `engine_tree_sha256` across `core/Reasoning/engines/*.py` and `core/Reasoning/reasoning_cli.py`).
+- **`patch_rev` (`21`)**: Incremental patch, documentation, launcher, and training corpus revision (`patch_tree_sha256`).
 
 ---
 
 ## 2. Release History & Root-Cause Fix Ledger
+
+### `v5.23.21` — Parallel 4-Wave DAG Engine Execution (`ThreadPoolExecutor`), Local `Files/` Script Creation & Debugging Safeguards, and Zero-Truncation Context Compaction
+- **Parallel 4-Wave DAG Execution & Engine Latency Optimization (`core/Reasoning/engines/`)**:
+  - **Concurrent Layer-2 & Layer-3 Wave Execution (`pipeline.py`)**: Replaced serial engine execution with a 4-Wave parallel DAG orchestrator using `concurrent.futures.ThreadPoolExecutor`. Independent perceptual/epistemic engines in Wave 1 (Engines 1, 2, 7, 11, 13) and abductive/causal/manifold engines in Wave 2 (Engines 4, 5, 8, 9, 10, 17, 20) execute concurrently while passing a pre-resolved `target_context` across all 15 engines so `resolve_problem_targets()` runs once per turn instead of 12+ times.
+  - **Engine Hot-Path Memoization & Pre-Indexing (`associative.py`, `spectral_manifold_pca.py`, `cbr_fingerprints.py`, `sygus_extractor.py`)**: Added O(1) adjacency/token reverse-indexing in Engine 1 (`associative.py`), SHA-1 feature-vector memoization for SVD/K-Means++/Laplacian chokepoints in Engine 20 (`spectral_manifold_pca.py`), module-level precompiled regexes in Engine 13 (`sygus_extractor.py`), and mtime-keyed rule compilation in Engine 11 (`cbr_fingerprints.py`).
+  - **Local Script Creation Guard in Abduction & Context VM (`pipeline.py`, `context_vm.py`)**: Prevented benign phrases like `"python script"` or `"local Files directory"` from false-triggering the `exploit_callback_or_script_failure` Bayesian profile (`lhost_mismatch_detected_in_script`) when the operator is creating a new utility/scanner script, and suppressed shell probe `consensus_immediate_action` / `[Engine 19/20 -> Next Cmd]` injections during standalone script creation or editing turns.
+- **Reliable `Files/` Script Creation, Fixing & Context Compaction (`core/webui/server.py`, `core/agent-cli.py`)**:
+  - **Context Isolation & Priority Code Ranking (`get_project_files_context_block`, `api_submit_query`)**: Skips injecting 14,000 chars of existing `Files/` contents, `active_goal`, `memory.md`, and 15-Engine shell directives during standalone new script creation (`is_new_script_create_request`). When debugging or fixing existing scripts, prioritizes `.py`/`.sh`/`.ps1` code files (sorted by modification time) ahead of `README.md`/`.txt` files with an `8,500`-char code preview limit.
+  - **Zero-Truncation Active-Turn Compaction (`_compact_messages_for_llama_context`)**: Fixed the context-compaction Catch-22 where `read_project_file` outputs were truncated to `1,600` chars before the LLM could inspect the buggy lines. Now drops older `history_msgs` prior to `last_user_idx` first so the active turn's `user` message and `read_project_file` tool outputs remain intact (with an `8,000`-char safety floor in WebUI and `12,000` chars in CLI).
+  - **Tool-Call Recovery & Fast-Finish (`_recover_tool_args`, `_extract_xml_tool_calls`, `_resolve_default_project_script_filename`)**: Added non-backtracking regex recovery for truncated/unclosed `<tool_call>` JSON/XML blocks, expanded stopwords so natural-language requests (`"create a simple NMAP scanning python script to the local Files directory"`) resolve to clean filenames (`nmap_scanner.py`), disabled `<think>` overhead on file-write rounds (`enable_thinking: False`), and added fast-finish once `write_project_file` succeeds.
+  - **Tool Banner URL Filtering (`_is_trackable_target_host`)**: Blocked CLI/Nmap documentation banner domains (`nmap.org`, `github.com`, `gnu.org`, `python.org`, etc.) from polluting `Projects/<project>/targets/target_*.md`.
 
 ### `v5.22.20` — Workspace Subdirectory Routing (`targets/`, `notes/`, `downloads/`, `artifacts/`, `assets/`, `Files/`), Equipment Inventory Tracking & Auto-Persist Script Guard
 - **Structured Project Workspace Routing (`core/webui/server.py`, `core/Reasoning/engines/web_intel.py`, `core/Reasoning/engines/vault_bridge.py`)**:

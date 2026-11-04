@@ -3254,13 +3254,17 @@ def get_cli_project_files_block(proj_dir: Path, query_text: str = "") -> str:
     if not preview_list and len(all_files) <= 3:
         preview_list = all_files[:3]
 
+    preview_chars_used = 0
     for f in preview_list[:3]:
+        if preview_chars_used >= 2400:
+            break
         try:
             if f.stat().st_size <= 80000:
                 raw_b = f.read_bytes()[:1024]
                 if b"\x00" not in raw_b:
                     rel = f.relative_to(files_dir).as_posix()
-                    txt_snip = f.read_text(encoding="utf-8", errors="replace")[:3500]
+                    txt_snip = f.read_text(encoding="utf-8", errors="replace")[:1000]
+                    preview_chars_used += len(txt_snip)
                     lines.append(
                         f"\n  [Preview of `Projects/{slug}/Files/{rel}`]:\n```text\n{txt_snip}\n```"
                     )
@@ -3334,7 +3338,7 @@ def build_system_prompt(force_refresh_hw: bool = False) -> str:
         "- Check the Obsidian Memory Index and Active Project Memory below first! If a target, playbook, reasoning synthesis, or project is already indexed, read it "
         "with `vault_read_note` instead of guessing.\n"
         f"- When downloading files with `curl -o`, `wget -O`, or creating test scripts/files for the current project, store them in `{active_proj_dir / 'downloads'}` or `{active_proj_dir}`.\n"
-        "- For `/dev/ttyUSB0` serial console: NEVER use Python scripts or `import ...` inside `tio --script`, and NEVER bombard the console with chained commands (`cmd1; cmd2; cmd3`) or rapid back-to-back calls (which overruns the UART RX buffer and drops the connection). Always use hardware character/line pacing `-o 15 -O 120` and send ONLY 1 command per `tio` invocation (`tio -b 115200 -o 15 -O 120 --mute --script-run once --script 'write(\"\\r\"); msleep(500); write(\"cmd\\r\"); while read(4096, 600) > 0 do end; exit(0)' /dev/ttyUSB0`). Read `[[commands/tio_serial_playbook]]` with `vault_read_note` before running `tio`.\n"
+        "- If and ONLY if a physical `/dev/ttyUSB*` serial console cable is explicitly in use: use Lua syntax inside `tio --script` with `-o 15 -O 120` pacing (`[[commands/tio_serial_playbook]]`). Do NOT invoke `tio` for IP/network targets.\n"
         f"- Keep `run_shell_command` arguments concise and focused on a single {shell_label} command.\n"
         "- When debugging connection failures (e.g. curl exit 7), multi-hop L2/L3 routing, or API auth rejections, call "
         "`neuro_symbolic_reason` to compute the 15-Engine 5-Layer Lexical Hedge-weighted consensus action, Damasio Somatic Gut Valence, Optimal Stopping decision, "
@@ -4108,7 +4112,7 @@ def execute_tool(name: str, args: dict) -> str:
             scan_out = perform_target_scan(target)
             status = "FAIL" if "(Header probe failed:" in scan_out and "(Body fetch failed:" in scan_out else "OK"
             _record_attempt("scan_target", target, status, scan_out)
-            return scan_out
+            return compact_text(scan_out, MAX_TOOL_OUTPUT_CHARS)
 
         elif name == "web_search":
             from Reasoning.engines.web_intel import execute_tier1_web_search
@@ -4133,7 +4137,7 @@ def execute_tool(name: str, args: dict) -> str:
             out_txt = str(ws_res.get("output") or ws_res.get("reason") or "")
             status = "BLOCKED" if ws_res.get("blocked") else ("OK" if ws_res.get("exit_code") == 0 else "FAIL")
             _record_attempt("web_search", f"{q_val} {site_val}".strip(), status, out_txt)
-            return out_txt
+            return compact_text(out_txt, MAX_TOOL_OUTPUT_CHARS)
 
         elif name == "fetch_webpage":
             from Reasoning.engines.web_intel import execute_tier1_fetch_webpage
@@ -4150,14 +4154,14 @@ def execute_tool(name: str, args: dict) -> str:
             fw_res = execute_tier1_fetch_webpage(
                 url=u_val,
                 query_filter=qf_val,
-                max_chars=7500,
+                max_chars=max(3500, MAX_TOOL_OUTPUT_CHARS),
                 posture=ACTIVE_POSTURE,
                 project_slug=get_active_project_slug(),
             )
             out_txt = str(fw_res.get("output") or fw_res.get("reason") or "")
             status = "BLOCKED" if fw_res.get("blocked") else ("OK" if fw_res.get("exit_code") == 0 else "FAIL")
             _record_attempt("fetch_webpage", u_val, status, out_txt)
-            return out_txt
+            return compact_text(out_txt, MAX_TOOL_OUTPUT_CHARS)
 
         elif name == "vault_save_note":
             cat = args.get("category", "knowledge")
@@ -4178,7 +4182,7 @@ def execute_tool(name: str, args: dict) -> str:
             print(f"\n\033[1;36m[Obsidian Vault -> search]\033[0m '{query}'", flush=True)
             out = search_vault(query)
             _record_attempt("vault_search", query, "OK", out)
-            return out
+            return compact_text(out, MAX_TOOL_OUTPUT_CHARS)
 
         elif name == "vault_read_note":
             note_ref = args.get("note", "")
@@ -4456,15 +4460,16 @@ def execute_tool(name: str, args: dict) -> str:
             except Exception:
                 return compact_text(output, MAX_TOOL_OUTPUT_CHARS)
 
-        elif name == "write_file":
-            raw_path = (args.get("path") or "").strip()
-            if not raw_path:
-                return "Error: `path` argument is required for `write_file`."
-            content = args.get("content", "")
+        elif name in ("write_file", "write_project_file"):
+            raw_path = (args.get("path") or args.get("filename") or args.get("file") or "").strip()
+            content = args.get("content") or args.get("code") or args.get("text") or ""
             proj_ws = ensure_project_workspace()
+            if not raw_path:
+                raw_path = "Files/nmap_scanner.py" if "nmap" in str(content).lower() else "Files/cora_script.py"
             p = resolve_cli_project_file_path(raw_path, for_write=True)
             if p.exists() and p.is_dir():
-                return f"Error: Cannot write file because `{p}` is an existing directory."
+                default_name = "nmap_scanner.py" if "nmap" in str(content).lower() else "cora_script.py"
+                p = (p / default_name).resolve()
             print(f"\n\033[1;32m[Agent Tool -> write_file]\033[0m {p} ({len(content)} bytes)", flush=True)
             if not confirm_action(f"writing {len(content)} bytes to `{p}`"):
                 print("  \033[1;31m-> Denied by user.\033[0m", flush=True)
@@ -4482,7 +4487,7 @@ def execute_tool(name: str, args: dict) -> str:
             return f"Successfully wrote {len(content)} bytes to {p}"
 
         elif name == "edit_file":
-            raw_path = (args.get("path") or "").strip()
+            raw_path = (args.get("path") or args.get("filename") or args.get("file") or "").strip()
             if not raw_path:
                 return "Error: `path` argument is required for `edit_file`."
             old_text = args.get("old_text", "")
@@ -4503,8 +4508,8 @@ def execute_tool(name: str, args: dict) -> str:
             _record_attempt("edit_file", str(p), "OK", "Updated file")
             return f"Successfully updated {p}"
 
-        elif name == "read_file":
-            raw_path = (args.get("path") or "").strip()
+        elif name in ("read_file", "read_project_file"):
+            raw_path = (args.get("path") or args.get("filename") or args.get("file") or "").strip()
             if not raw_path:
                 return "Error: `path` argument is required for `read_file`."
             p = resolve_cli_project_file_path(raw_path, for_write=False)
@@ -4517,10 +4522,12 @@ def execute_tool(name: str, args: dict) -> str:
                 return f"Error: `{p}` is a directory; use `list_directory` instead."
             content = p.read_text(encoding="utf-8", errors="replace")
             _record_attempt("read_file", str(p), "OK", content[:160])
-            return compact_text(content, MAX_TOOL_OUTPUT_CHARS)
+            return compact_text(content, max(MAX_TOOL_OUTPUT_CHARS, 12000))
 
-        elif name == "list_directory":
-            raw_path = (args.get("path") or ".").strip() or "."
+        elif name in ("list_directory", "list_project_files"):
+            raw_path = (args.get("path") or args.get("filename") or ".").strip() or "."
+            if name == "list_project_files" and raw_path == ".":
+                raw_path = "Files"
             p = Path.cwd().resolve() if raw_path == "." else resolve_cli_project_file_path(raw_path, for_write=False)
             print(f"\n\033[1;36m[Agent Tool -> list_directory]\033[0m {p}", flush=True)
             if not p.exists():
@@ -4590,14 +4597,17 @@ def execute_tool(name: str, args: dict) -> str:
 
 def sanitize_messages(messages: list) -> None:
     """
-    Validate and repair message history so `llama-server` never fails JSON parsing
-    or raises `Jinja Exception: No user query found in messages.` (HTTP 500).
+    Validate and repair message history so `llama-server` never fails JSON parsing,
+    never receives orphaned `tool` messages without a preceding `assistant` `tool_calls` message,
+    and never raises `Jinja Exception: No user query found in messages.` (HTTP 500).
     """
     cleaned = []
     idx = 0
+    in_valid_tool_group = False
     while idx < len(messages):
         m = messages[idx]
-        if m.get("role") == "assistant" and m.get("tool_calls"):
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
             valid_tcs = []
             for tc in m["tool_calls"]:
                 fn = tc.get("function") or {}
@@ -4612,12 +4622,34 @@ def sanitize_messages(messages: list) -> None:
                 tc["function"] = fn
                 valid_tcs.append(tc)
             m["tool_calls"] = valid_tcs
-        if m.get("role") == "user":
-            content_str = str(m.get("content") or "").strip()
-            if not content_str:
-                m["content"] = f"Active Goal: {ACTIVE_GOAL}" if ACTIVE_GOAL else "Continue analysis."
-        cleaned.append(m)
+            in_valid_tool_group = bool(valid_tcs)
+            cleaned.append(m)
+        elif role == "tool":
+            if in_valid_tool_group:
+                cleaned.append(m)
+            # Drop orphaned `tool` messages whose parent `assistant` `tool_calls` turn was trimmed
+        else:
+            in_valid_tool_group = False
+            if role == "user":
+                content_str = str(m.get("content") or "").strip()
+                if not content_str:
+                    m["content"] = f"Active Goal: {ACTIVE_GOAL}" if ACTIVE_GOAL else "Continue analysis."
+            cleaned.append(m)
         idx += 1
+
+    # Also strip any `assistant` message with `tool_calls` that has zero following `tool` responses
+    # (unless it is the very last message before tool execution)
+    repaired = []
+    for i, m in enumerate(cleaned):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            has_next_tool = (i + 1 < len(cleaned)) and cleaned[i + 1].get("role") == "tool"
+            if not has_next_tool:
+                if m.get("content"):
+                    m_copy = {k: v for k, v in m.items() if k != "tool_calls"}
+                    repaired.append(m_copy)
+                continue
+        repaired.append(m)
+    cleaned = repaired
 
     # Qwen3/Qwen3.8 Jinja chat template strictly requires at least one `role == "user"` message
     # in `messages` or it throws HTTP 500: `Jinja Exception: No user query found in messages.`
@@ -4647,17 +4679,33 @@ def _resolve_default_max_history_tokens() -> int:
     ctx_env = os.environ.get("CTX_SIZE", "").strip()
     if ctx_env.isdigit() and int(ctx_env) >= 4096:
         return max(2048, int(ctx_env) - 2048)
-    # Default safe budget that fits inside an 8192-token context window with 2048 max_tokens generation headroom
-    return 6144
+    # Default safe budget when server n_ctx has not been queried yet
+    return 12288
 
 
 MAX_HISTORY_TOKENS = _resolve_default_max_history_tokens()
-_TOKENIZE_ENDPOINT_STATE = {"checked_ts": 0.0, "available": False, "server_n_ctx": 0}
+_TOKENIZE_ENDPOINT_STATE = {"checked_ts": 0.0, "available": False, "server_n_ctx": 0, "tools_tokens": 0}
+
+
+def _estimate_tools_and_wire_overhead_tokens() -> int:
+    """
+    Estimate the token overhead added by `TOOLS` JSON schema definitions rendered into the
+    Qwen Jinja chat template plus `_build_wire_messages_with_personality_prefix` (`[PRE-EMPTIVE ...]`
+    and `[15-Engine L1 Guidance]`).
+    """
+    cached_t = int(_TOKENIZE_ENDPOINT_STATE.get("tools_tokens") or 0)
+    if cached_t <= 0:
+        tools_json = json.dumps(TOOLS)
+        # Jinja tool schema rendering + special tokens takes ~2.2 chars/token + ~350 framing tokens
+        cached_t = int(len(tools_json) / 2.2) + 350
+        _TOKENIZE_ENDPOINT_STATE["tools_tokens"] = cached_t
+    # Reserve ~550 tokens for dynamic L1 guidance block + personality turn prefix injected on wire
+    return cached_t + 550
 
 
 def _estimate_message_tokens(msg: dict, allow_remote: bool = False) -> int:
     """
-    Improvement #3: Exact Token-Budget Governor with per-message memoization.
+    Improvement #3: Exact Token-Budget Governor with per-message content-hash memoization.
     Uses a fast (< 0.05 ms) symbol/hex/JSON-density calibrated estimator by default during hot-path
     context trimming so `llama-server` is never blocked on synchronous HTTP `/tokenize` calls while generating.
     """
@@ -4665,7 +4713,12 @@ def _estimate_message_tokens(msg: dict, allow_remote: bool = False) -> int:
     tc_str = json.dumps(msg.get("tool_calls")) if msg.get("tool_calls") else ""
     raw_text = f"{content}\n{tc_str}" if tc_str else content
     cur_len = len(raw_text)
-    if msg.get("_cached_content_len") == cur_len and isinstance(msg.get("_cached_tokens"), int):
+    cur_hash = hash(raw_text)
+    if (
+        msg.get("_cached_content_len") == cur_len
+        and msg.get("_cached_content_hash") == cur_hash
+        and isinstance(msg.get("_cached_tokens"), int)
+    ):
         return int(msg["_cached_tokens"])
 
     tok_count = 0
@@ -4698,24 +4751,51 @@ def _estimate_message_tokens(msg: dict, allow_remote: bool = False) -> int:
                 with urllib.request.urlopen(req, timeout=0.20) as resp:
                     data = json.loads(resp.read().decode("utf-8", errors="replace"))
                     if isinstance(data, dict) and isinstance(data.get("tokens"), list):
-                        tok_count = len(data["tokens"]) + 6
+                        tok_count = len(data["tokens"]) + 8
             except Exception:
                 _TOKENIZE_ENDPOINT_STATE["available"] = False
 
     if tok_count <= 0:
-        # Density-aware fallback: JSON/hex/tables/punctuation tokenize at ~2.2 chars/tok; prose at ~3.5 chars/tok
+        # Conservative BPE density calibration: JSON/hex/tables/code/paths tokenize at ~2.0 chars/tok;
+        # technical Markdown/prose with URLs & identifiers tokenizes at ~2.6 chars/tok
         punct_and_digits = sum(1 for ch in raw_text if not ch.isalpha() and not ch.isspace())
         density_ratio = punct_and_digits / max(1, cur_len)
-        chars_per_tok = 2.2 if density_ratio > 0.28 else 3.5
-        tok_count = int(cur_len / chars_per_tok) + 6
+        chars_per_tok = 2.0 if density_ratio > 0.22 else 2.6
+        tok_count = int(cur_len / chars_per_tok) + 8
 
     msg["_cached_content_len"] = cur_len
+    msg["_cached_content_hash"] = cur_hash
     msg["_cached_tokens"] = tok_count
     return tok_count
 
 
-def _total_conversation_tokens(messages: list) -> int:
-    return sum(_estimate_message_tokens(m) for m in messages if isinstance(m, dict))
+def _total_conversation_tokens(messages: list, include_tools_overhead: bool = True) -> int:
+    msg_toks = sum(_estimate_message_tokens(m) for m in messages if isinstance(m, dict))
+    if include_tools_overhead:
+        msg_toks += _estimate_tools_and_wire_overhead_tokens()
+    return msg_toks
+
+
+def _archive_and_compact_message_content(msg: dict, target_chars: int) -> None:
+    """Losslessly archive a message's content to `shadow_archive/` before compacting it in-place."""
+    if not isinstance(msg, dict) or not isinstance(msg.get("content"), str):
+        return
+    cur = msg["content"]
+    if len(cur) <= target_chars:
+        return
+    if msg.get("role") == "tool" and "[Full lossless raw output archived at `" not in cur:
+        try:
+            from Reasoning.engines.context_vm import archive_to_shadow_store
+
+            shadow_path = archive_to_shadow_store(msg.get("name", "tool_output"), cur)
+            msg["content"] = (
+                compact_text(cur, max(400, target_chars - 120))
+                + f"\n[Full lossless raw output archived at `{shadow_path}`]"
+            )
+            return
+        except Exception:
+            pass
+    msg["content"] = compact_text(cur, target_chars)
 
 
 def trim_messages_to_fit(
@@ -4726,10 +4806,12 @@ def trim_messages_to_fit(
     """
     Zero-Loss Context Virtual Memory (Part 1 & Guardrail 3 + Improvement #3 Token Budget Governor):
     - Keeps `messages[0]["content"]` static across turns so `llama-server` preserves 100% KV-cache hits
-      on the system prompt prefix (only rebuilding `messages[0]` if it's empty).
+      on the system prompt prefix (only rebuilding `messages[0]` if it's empty, or compacting it as a last resort).
     - Archives any older tool outputs > 2,500 chars losslessly to `Reasoning/data/shadow_archive/`
       before compacting them in-context.
-    - Enforces BOTH character (`max_chars`) and exact/density-calibrated token (`max_tokens`) budgets.
+    - Enforces BOTH character (`max_chars`) and exact/density-calibrated token (`max_tokens`) budgets,
+      accounting for `TOOLS` schema tokens and wire L1/personality prefix tokens.
+    - Preserves multi-tool `(assistant, tool1, tool2, ...)` group atomicity so `tool` messages are never orphaned.
     - NEVER pops the last remaining `role == "user"` message (prevents Qwen Jinja HTTP 500
       `No user query found in messages` during deep multi-step tool chains).
     """
@@ -4738,65 +4820,95 @@ def trim_messages_to_fit(
         messages[0]["content"] = build_system_prompt()
 
     # Dynamically cap max_tokens against live llama-server n_ctx if queried via /props
-    if not os.environ.get("MAX_HISTORY_TOKENS"):
-        srv_ctx = int(_TOKENIZE_ENDPOINT_STATE.get("server_n_ctx") or 0)
-        if srv_ctx <= 0:
-            try:
-                props_url = API_URL.split("/v1/")[0].rstrip("/") + "/props"
-                with urllib.request.urlopen(props_url, timeout=0.15) as resp_p:
-                    if resp_p.status == 200:
-                        pdata = json.loads(resp_p.read().decode("utf-8", errors="replace"))
-                        n_ctx_val = int(
-                            (pdata.get("default_generation_settings") or {}).get("n_ctx")
-                            or pdata.get("n_ctx")
-                            or 0
-                        )
-                        if n_ctx_val >= 2048:
-                            _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = n_ctx_val
-                            srv_ctx = n_ctx_val
-            except Exception:
-                _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = int(os.environ.get("CTX_SIZE", "8192") or 8192)
-                srv_ctx = _TOKENIZE_ENDPOINT_STATE["server_n_ctx"]
-        if srv_ctx >= 4096:
-            max_tokens = min(max_tokens, max(2048, srv_ctx - 2048))
+    srv_ctx = int(_TOKENIZE_ENDPOINT_STATE.get("server_n_ctx") or 0)
+    if srv_ctx <= 0:
+        try:
+            props_url = API_URL.split("/v1/")[0].rstrip("/") + "/props"
+            with urllib.request.urlopen(props_url, timeout=0.15) as resp_p:
+                if resp_p.status == 200:
+                    pdata = json.loads(resp_p.read().decode("utf-8", errors="replace"))
+                    n_ctx_val = int(
+                        (pdata.get("default_generation_settings") or {}).get("n_ctx")
+                        or pdata.get("n_ctx")
+                        or 0
+                    )
+                    if n_ctx_val >= 2048:
+                        _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = n_ctx_val
+                        srv_ctx = n_ctx_val
+        except Exception:
+            _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = int(os.environ.get("CTX_SIZE", "16384") or 16384)
+            srv_ctx = _TOKENIZE_ENDPOINT_STATE["server_n_ctx"]
 
+    if not os.environ.get("MAX_HISTORY_TOKENS") and srv_ctx >= 4096:
+        # Leave 2048 tokens for max_tokens generation + 512 tokens safety margin
+        safe_srv_budget = max(2048, srv_ctx - 2560)
+        max_tokens = min(max_tokens, safe_srv_budget)
+
+    # Archive and compact older tool outputs (> 2500 chars) before the latest tool group
     for m in messages[1:-2]:
         if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 2500:
-            try:
-                from Reasoning.engines.context_vm import archive_to_shadow_store
+            _archive_and_compact_message_content(m, 1400)
 
-                shadow_path = archive_to_shadow_store(m.get("name", "tool_output"), m["content"])
-                m["content"] = (
-                    compact_text(m["content"], 1400)
-                    + f"\n[Full lossless raw output archived at `{shadow_path}`]"
-                )
-            except Exception:
-                m["content"] = compact_text(m["content"], 1400)
+    # Also ensure no single recent tool output exceeds MAX_TOOL_OUTPUT_CHARS
+    for m in messages[-2:]:
+        if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > MAX_TOOL_OUTPUT_CHARS:
+            _archive_and_compact_message_content(m, MAX_TOOL_OUTPUT_CHARS)
 
-    # Phase 1: Drop older turns BEFORE the last `role == "user"` message first when either char or token budget is exceeded
-    while len(messages) > 3 and (
-        len(json.dumps(messages)) > max_chars or _total_conversation_tokens(messages) > max_tokens
-    ):
+    def _over_budget() -> bool:
+        clean_dump_len = sum(
+            len(str(m.get("content") or "")) + (len(json.dumps(m.get("tool_calls"))) if m.get("tool_calls") else 0)
+            for m in messages
+            if isinstance(m, dict)
+        )
+        return clean_dump_len > max_chars or _total_conversation_tokens(messages) > max_tokens
+
+    # Phase 1: Drop older turns BEFORE the last `role == "user"` message, then older `(assistant, tool...)` groups
+    while len(messages) > 2 and _over_budget():
         user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
         last_user_idx = user_indices[-1] if user_indices else -1
         if last_user_idx > 1:
-            # Safe to pop messages[1] because there is a newer `user` message at `last_user_idx`
+            # Safe to pop messages[1] (and its contiguous tool responses if it was an assistant tool_call turn)
+            # because there is a newer `user` message at `last_user_idx`
             messages.pop(1)
             while len(messages) > 2 and messages[1].get("role") == "tool":
                 messages.pop(1)
-        else:
-            # The ONLY `user` message is at index 1 (or 0). NEVER pop it!
-            # Instead, pop the oldest `(assistant, tool...)` step AFTER the user message (at index 2).
-            if len(messages) > 4:
-                messages.pop(2)
-                while len(messages) > 3 and messages[2].get("role") == "tool":
-                    messages.pop(2)
-            else:
-                # Compact remaining large tool/user contents in-place if only [system, user, assistant, tool] remain
-                for m in messages[1:]:
-                    if isinstance(m.get("content"), str) and len(m["content"]) > 1800:
-                        m["content"] = compact_text(m["content"], 1400)
+            continue
+
+        # The ONLY `user` message is at index 1 (or 0). NEVER pop it!
+        # Check if there are multiple `(assistant, tool...)` groups after the user message at index 1.
+        # Group 1 starts at index 2; find where Group 1 ends:
+        if len(messages) > 3 and messages[2].get("role") == "assistant":
+            grp_end = 3
+            while grp_end < len(messages) and messages[grp_end].get("role") == "tool":
+                grp_end += 1
+            if grp_end < len(messages):
+                # There is a newer turn after this `(assistant, tool...)` group — pop this entire group atomically!
+                del messages[2:grp_end]
+                continue
+
+        # Phase 2: Only `[system, user]` or `[system, user, assistant, tool1..toolN]` remain.
+        # Progressively compact tool and user message contents in-place across tightening tiers.
+        compacted_any = False
+        for tier_limit in (2200, 1400, 900, 600, 400):
+            if not _over_budget():
                 break
+            for m in messages[1:]:
+                if isinstance(m.get("content"), str) and len(m["content"]) > tier_limit:
+                    _archive_and_compact_message_content(m, tier_limit)
+                    compacted_any = True
+
+        # Phase 3 (Guardrail 3 KV-Cache Prefix Preservation): Only if STILL over budget on a tiny n_ctx,
+        # truncate the tail of `messages[0]["content"]` (preserving 100% of the static prefix for KV cache hits).
+        if _over_budget() and messages and messages[0].get("role") == "system":
+            sys_c = str(messages[0].get("content") or "")
+            for sys_limit in (9000, 6000, 4200):
+                if _over_budget() and len(sys_c) > sys_limit:
+                    messages[0]["content"] = sys_c[:sys_limit]
+                    sys_c = messages[0]["content"]
+                    compacted_any = True
+
+        if not compacted_any:
+            break
 
     sanitize_messages(messages)
 
@@ -4907,9 +5019,9 @@ def _build_wire_messages_with_personality_prefix(messages: list) -> list[dict]:
             l1_block = ""
             if len(cur_c) >= 12 and not cur_c.startswith("[System Note]") and "[15-Engine L1 Guidance]" not in cur_c:
                 try:
-                    from Reasoning.engines.context_vm import build_dynamic_l1_state_block
+                    from Reasoning.engines.context_vm import GLOBAL_SPECULATIVE_CACHE
 
-                    l1_snip = build_dynamic_l1_state_block(problem=cur_c[:300])
+                    l1_snip = GLOBAL_SPECULATIVE_CACHE.pause_and_get_cached_l1(user_query=cur_c[:300])
                     if l1_snip:
                         l1_block = f"\n\n[15-Engine L1 Guidance]\n{l1_snip}"
                 except Exception:
@@ -4954,6 +5066,13 @@ def chat_step(messages: list) -> dict:
     trim_messages_to_fit(messages)
     wire_messages = _build_wire_messages_with_personality_prefix(messages)
 
+    srv_ctx = int(_TOKENIZE_ENDPOINT_STATE.get("server_n_ctx") or 16384)
+    est_wire_toks = _total_conversation_tokens(wire_messages, include_tools_overhead=True)
+    safe_max_toks = 2800
+    if srv_ctx >= 4096 and est_wire_toks + safe_max_toks > srv_ctx - 256:
+        safe_max_toks = max(1024, min(2800, srv_ctx - est_wire_toks - 256))
+
+    cli_think_enabled = bool(os.environ.get("LLM_THINKING", "0") == "1" or SHOW_THINKING_EXPANDED_CLI)
     payload = {
         "model": MODEL_NAME,
         "messages": wire_messages,
@@ -4961,8 +5080,9 @@ def chat_step(messages: list) -> dict:
         "tool_choice": "auto",
         "stream": True,
         "temperature": 0.6,
-        "max_tokens": 2048,
+        "max_tokens": safe_max_toks,
         "repeat_penalty": 1.0,
+        "chat_template_kwargs": {"enable_thinking": cli_think_enabled},
     }
     req = urllib.request.Request(
         API_URL,
@@ -5027,16 +5147,29 @@ def chat_step(messages: list) -> dict:
                     resp_ctx = urllib.request.urlopen(req, timeout=300)
                 else:
                     raise urllib.error.HTTPError(err.url, err.code, body, err.headers, None)
-            elif ("exceeds the available context size" in body and len(messages) > 3) or (
-                "No user query found in messages" in body
+            elif (
+                "exceeds the available context size" in body
+                or "exceed_context_size" in body
+                or "No user query found in messages" in body
             ):
                 print("\n\033[1;33m[Auto-Compacting & Healing Context Window and Retrying...]\033[0m", flush=True)
+                m_ctx = re.search(r'"n_ctx"\s*:\s*(\d+)|available context size\s*\((\d+)\s*tokens\)', body)
+                if m_ctx:
+                    det_ctx = int(m_ctx.group(1) or m_ctx.group(2) or 0)
+                    if det_ctx >= 2048:
+                        _TOKENIZE_ENDPOINT_STATE["server_n_ctx"] = det_ctx
+                eff_ctx = int(_TOKENIZE_ENDPOINT_STATE.get("server_n_ctx") or 8192)
+                retry_max_toks = max(2048, int(eff_ctx * 0.55))
                 sanitize_messages(messages)
-                trim_messages_to_fit(messages, max_chars=MAX_HISTORY_CHARS // 2)
+                trim_messages_to_fit(
+                    messages,
+                    max_chars=max(8000, MAX_HISTORY_CHARS // 2),
+                    max_tokens=retry_max_toks,
+                )
                 retry_wire = _build_wire_messages_with_personality_prefix(messages)
                 req = urllib.request.Request(
                     API_URL,
-                    data=json.dumps({**payload, "messages": retry_wire}).encode("utf-8"),
+                    data=json.dumps({**payload, "messages": retry_wire, "max_tokens": 1280}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
@@ -5169,10 +5302,81 @@ def chat_step(messages: list) -> dict:
         LAST_THINKING_TRACE = m_final_th.group(1).strip()
     clean_joined = re.sub(r"<think>[\s\S]*?</think>", "", raw_joined, flags=re.I).strip()
 
+    if not tool_calls_by_index and "<tool_call>" in clean_joined:
+        blocks = re.findall(r"(?is)<tool_call>\s*(.*?)\s*</tool_call>", clean_joined)
+        if not blocks:
+            m_unclosed = re.search(r"(?is)<tool_call>\s*(\{[\s\S]+)$", clean_joined)
+            if m_unclosed:
+                blocks = [m_unclosed.group(1).strip()]
+        for idx_x, blk in enumerate(blocks):
+            inner = re.sub(r"^```(?:json)?\s*|\s*```$", "", blk.strip(), flags=re.I).strip()
+            try:
+                obj = json.loads(inner)
+                if isinstance(obj, dict) and obj.get("name"):
+                    args_v = obj.get("arguments") or obj.get("parameters") or {}
+                    tool_calls_by_index[idx_x] = {
+                        "id": f"call_xml_{idx_x}",
+                        "type": "function",
+                        "function": {
+                            "name": str(obj["name"]),
+                            "arguments": json.dumps(args_v) if isinstance(args_v, dict) else str(args_v),
+                        },
+                    }
+                    continue
+            except Exception:
+                pass
+            m_n = re.search(r'"name"\s*:\s*"([^"]+)"', inner)
+            if m_n:
+                m_a = re.search(r'"(?:arguments|parameters)"\s*:\s*(\{[\s\S]*)', inner)
+                raw_a_str = m_a.group(1).strip() if m_a else inner
+                tool_calls_by_index[idx_x] = {
+                    "id": f"call_xml_{idx_x}",
+                    "type": "function",
+                    "function": {"name": m_n.group(1).strip(), "arguments": raw_a_str},
+                }
+        clean_joined = re.sub(r"(?is)<tool_call>[\s\S]*?(?:</tool_call>|$)", "", clean_joined).strip()
+
     msg = {"role": "assistant", "content": clean_joined or raw_joined or None}
     if tool_calls_by_index:
         msg["tool_calls"] = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
     return msg
+
+
+def _recover_cli_tool_args(fn_name: str, raw_args: str) -> dict:
+    """Recover tool call arguments even when the LLM outputs unescaped multiline code or truncated JSON."""
+    s = str(raw_args or "").strip()
+    if s:
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    out: dict = {}
+    if fn_name in ("write_file", "write_project_file", "edit_file", "read_file", "read_project_file", "list_directory", "list_project_files"):
+        m_fn = re.search(r'"(?:path|filename|file|target)"\s*:\s*"([^"]+)"', s)
+        if m_fn:
+            out["path"] = m_fn.group(1).strip()
+        if fn_name in ("write_file", "write_project_file"):
+            m_c = re.search(r'"(?:content|code|text)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', s, flags=re.S)
+            if m_c:
+                raw_c = m_c.group(1)
+            else:
+                m_open = re.search(r'"(?:content|code|text)"\s*:\s*"([\s\S]+)$', s)
+                raw_c = re.sub(r'"\s*\}?\s*\}?\s*$', "", m_open.group(1)) if m_open else ""
+            if raw_c:
+                out["content"] = (
+                    raw_c.replace("\\r\\n", "\n")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace('\\"', '"')
+                    .replace("\\\\", "\\")
+                )
+    elif fn_name == "run_shell_command":
+        m_cmd = re.search(r'"command"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', s, flags=re.S)
+        if m_cmd:
+            out["command"] = m_cmd.group(1).replace('\\"', '"').replace("\\\\", "\\").strip()
+    return out
 
 
 def _heal_truncated_ips_in_args(args: dict, messages: list) -> None:
@@ -5252,12 +5456,7 @@ def run_turn(messages: list, max_steps: int = 14) -> str:
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
                 raw_args = tc["function"]["arguments"] or "{}"
-                try:
-                    args = json.loads(raw_args)
-                    if not isinstance(args, dict):
-                        args = {}
-                except json.JSONDecodeError:
-                    args = {}
+                args = _recover_cli_tool_args(fn_name, raw_args)
                 _heal_truncated_ips_in_args(args, messages)
                 # Always normalize stored arguments to valid JSON so subsequent turns never 500
                 tc["function"]["arguments"] = json.dumps(args)
@@ -5658,13 +5857,13 @@ def run_relentless_loop(messages: list, max_waves: int | None = None) -> None:
                 )
             elif pmode_now == "BERSERKER":
                 mode_wave_rule = (
-                    f"3. BERSERKER AGGRESSIVE MODE: Aggressively pursue the target goal with ALL available tools (`run_shell_command`, `scan_target`, `vault_read_note`, `vault_search`, `neuro_symbolic_reason`, `read_file`, `write_file`) across `{', '.join(untried_vecs) if untried_vecs else 'multi-step chain / alternate ports / credentials / OOB serial / routing pivot'}`.\n"
-                    f"   - Immediately chain active probes across Layer-1/2/3/4/7 (`ip -4 addr`, `ip route`, `ip neigh`, `arping`, `nmap -Pn`, `curl`, `[[commands/tio_serial_playbook]]`, `/dev/ttyUSB0`, and `[[projects/{ACTIVE_PROJECT or get_active_project_slug()}]]`).\n"
+                    f"3. BERSERKER AGGRESSIVE MODE: Aggressively pursue the target goal with ALL available tools (`run_shell_command`, `scan_target`, `vault_read_note`, `vault_search`, `neuro_symbolic_reason`, `read_file`, `write_file`) across `{', '.join(untried_vecs) if untried_vecs else 'multi-step chain / alternate ports / credentials / routing pivot'}`.\n"
+                    f"   - Immediately chain active probes across Layer-2/3/4/7 (`ip -4 addr`, `ip route`, `ip neigh`, `arping`, `nmap -Pn`, `curl`, `[[commands/linux_master_command_playbook]]`, `[[commands/curl_playbook]]`, and `[[projects/{ACTIVE_PROJECT or get_active_project_slug()}]]`).\n"
                 )
             else:
                 mode_wave_rule = (
-                    f"3. TRY UNEXPLORED METHODS & TOOLS NOW: You must immediately invoke your tools (`run_shell_command`, `scan_target`, `vault_read_note`, `vault_search`, `neuro_symbolic_reason`, `read_file`, `write_file`) to test an untried method or capability vector (`{', '.join(untried_vecs) if untried_vecs else 'multi-step chain / alternate ports / credentials / OOB serial / routing pivot'}`).\n"
-                    f"   - If direct HTTP/TCP fails, check Layer-2/Layer-3 (`ip -4 addr`, `ip route`, `ip neigh`, `arping` on Linux or `ipconfig /all`, `route print -4`, `arp -a` on Windows), check alternate ports (`nmap -Pn` or `Test-NetConnection`), check Obsidian Vault playbooks (`[[commands/tio_serial_playbook]]`, `[[commands/curl_playbook]]`, `[[projects/{ACTIVE_PROJECT or get_active_project_slug()}]]`), or check serial OOB (`/dev/ttyUSB0`).\n"
+                    f"3. TRY UNEXPLORED METHODS & TOOLS NOW: You must immediately invoke your tools (`run_shell_command`, `scan_target`, `vault_read_note`, `vault_search`, `neuro_symbolic_reason`, `read_file`, `write_file`) to test an untried method or capability vector (`{', '.join(untried_vecs) if untried_vecs else 'multi-step chain / alternate ports / credentials / routing pivot'}`).\n"
+                    f"   - If direct HTTP/TCP fails, check Layer-2/Layer-3 (`ip -4 addr`, `ip route`, `ip neigh`, `arping` on Linux or `ipconfig /all`, `route print -4`, `arp -a` on Windows), check alternate ports (`nmap -Pn` or `Test-NetConnection`), or check Obsidian Vault playbooks (`[[commands/linux_master_command_playbook]]`, `[[commands/windows_master_command_playbook]]`, `[[commands/curl_playbook]]`, `[[projects/{ACTIVE_PROJECT or get_active_project_slug()}]]`).\n"
                 )
 
             wave_directive = (
@@ -7497,9 +7696,9 @@ def main() -> None:
 
     speculative_cache = None
     try:
-        from Reasoning.engines.context_vm import SpeculativeLookaheadCache
+        from Reasoning.engines.context_vm import GLOBAL_SPECULATIVE_CACHE
 
-        speculative_cache = SpeculativeLookaheadCache()
+        speculative_cache = GLOBAL_SPECULATIVE_CACHE
         _SPECULATIVE_CACHE_REF = speculative_cache
     except Exception:
         pass

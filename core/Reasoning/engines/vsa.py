@@ -272,8 +272,8 @@ def compute_somatic_gut_valence(
     empirical experiential markers recorded in `somatic_markers.json`.
     """
     prob_low = (problem or "").lower()
-    symptom = observed_roles.get("symptom", "tcp_connection_refused_exit_7")
-    channel = observed_roles.get("control_channel", "serial_uart_ttyusb0_tio")
+    symptom = observed_roles.get("symptom", "http_401_403_405_api_rejection")
+    channel = observed_roles.get("control_channel", "http_header_injection_and_options_probe")
 
     # Prototype 1: Validated Multi-Layer Breakthrough (+1.0 Valence)
     proto_breakthrough = encode_scenario_hv(
@@ -468,7 +468,15 @@ def run_vsa_conceptual_leap(
         # Automatically infer observed role-fillers from problem text if not explicitly passed
         obs = dict(observed_roles or {})
         if not obs:
-            if any(
+            if bool(
+                re.search(
+                    r"\b(?:ttyusb\d*|ttyacm\d*|tio|uart|oob|out-of-band|baud|minicom|serial\s+(?:port|console|cable|line|device|oob|uart))\b",
+                    prob_low,
+                )
+            ):
+                obs["symptom"] = "tcp_connection_refused_exit_7"
+                obs["control_channel"] = "serial_uart_ttyusb0_tio"
+            elif any(
                 k in prob_low
                 for k in (
                     "route", "subnet", "forward", "l2", "l3", "pivot", "disjoint",
@@ -477,22 +485,9 @@ def run_vsa_conceptual_leap(
             ):
                 obs["symptom"] = "cross_subnet_packet_blackhole_disjoint_l2"
                 obs["control_channel"] = "dual_homed_pivot_gateway_node"
-            elif any(
-                k in prob_low
-                for k in (
-                    "401", "403", "405", "auth", "token", "header", "forbidden", "mtls",
-                    "client.crt", "https://", "http://", "api", "endpoint", "injection",
-                    "443", "8443", "8080", "login", "portal", "web", "cve", "version",
-                    "firmware", "fortinet", "fortigate", "admin", "ssl", "tls", "cert",
-                    "active directory", "ldap", "smb", "suid", "sudoers", "capabilities",
-                    "privesc", "privilege",
-                )
-            ):
+            else:
                 obs["symptom"] = "http_401_403_405_api_rejection"
                 obs["control_channel"] = "http_header_injection_and_options_probe"
-            else:
-                obs["symptom"] = "tcp_connection_refused_exit_7"
-                obs["control_channel"] = "serial_uart_ttyusb0_tio"
 
         missing_roles = query_missing_roles or ["obstacle", "diagnostic_action", "unlock_mechanism", "credential_source"]
 
