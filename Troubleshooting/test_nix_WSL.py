@@ -8,7 +8,7 @@ menus, Ctrl+O thought-process toggle, and slash commands) and validates the Linu
 WebGUI backend (`core/webui/server.py`) inside WSL / Linux.
 
 Usage (from Windows PowerShell):
-    wsl -d Ubuntu -- python3 /mnt/c/CODEX/NeuralNet/CORA_GITHUB/Troubleshooting/test_nix_WSL.py
+    wsl -d Ubuntu -- python3 /mnt/c/Projects/CORA/Troubleshooting/test_nix_WSL.py
 Usage (from Linux / WSL Bash):
     python3 Troubleshooting/test_nix_WSL.py
 """

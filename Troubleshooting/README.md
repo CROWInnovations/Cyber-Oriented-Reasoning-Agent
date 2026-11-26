@@ -71,7 +71,7 @@ python .\Troubleshooting\test_webgui_WIN.py
 python .\Troubleshooting\test_cli_WIN.py
 
 # 8. Run automated WSL Linux CLI (PTY + SIGWINCH resize) & Linux WebGUI test suite:
-wsl -d Ubuntu -- python3 /mnt/c/CODEX/NeuralNet/CORA_GITHUB/Troubleshooting/test_nix_WSL.py
+wsl -d Ubuntu -- python3 /mnt/c/Projects/CORA/Troubleshooting/test_nix_WSL.py
 ```
 
 ---
